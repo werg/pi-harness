@@ -376,6 +376,11 @@ export class SessionImpl implements Session {
 	}
 
 	/** Runs after close seals admission and before the line closes Storage; must not reject. */
+	/** Kernel-owned derivations join the same atomic batch, after the caller stages its changes. */
+	protected prepareCommit(_tx: Transaction, _context: Context): Promise<void> {
+		return Promise.resolve();
+	}
+
 	protected beforeClose(): Promise<void> {
 		return Promise.resolve();
 	}
@@ -412,6 +417,8 @@ export class SessionImpl implements Session {
 		let result: T;
 		try {
 			result = await change(tx);
+			tx.assertCallbackSettled();
+			await this.prepareCommit(tx, context);
 		} catch (error) {
 			await tx.settleFailure();
 			throw error;

@@ -3,44 +3,94 @@ import { awaitWithContext } from "@earendil-works/chord/context";
 import { overlap } from "@earendil-works/chord/delta";
 import type { ImageContent, TextContent, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
-import { AssistantEntry, ToolResultEntry } from "../entries.ts";
+import { defineDoc } from "../documents.ts";
+import { AssistantEntry, DirectToolCallEntry, DirectToolResultEntry, ToolResultEntry } from "../entries.ts";
 import { defineTask } from "../tasks.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, utf8ByteLength } from "../truncate.ts";
 import type {
 	ConversationId,
 	EntryId,
 	JsonObject,
+	RunningTask,
 	Task,
 	TaskId,
 	TaskOptions,
+	TaskOutcomeError,
 	TaskRuntime,
 	Tx,
 	TypedEntry,
 } from "../types.ts";
-import { assignJson } from "./json.ts";
+import { toolMatches } from "./define.ts";
+import { assignJson, snapshotError } from "./json.ts";
 import { clearProgress, finishSlot, LiveDoc, type ToolSlot, toolSlot } from "./live.ts";
-import { boundOutput, OutputBuffer, type OutputLimits, Progress } from "./output.ts";
+import { boundOutput, OutputBuffer, type OutputCheckpoint, type OutputLimits, Progress } from "./output.ts";
 import type {
+	ToolBinding,
 	ToolControl,
 	ToolDiagnostic,
 	ToolExecutionApi,
 	ToolExecutionResult,
+	ToolExecutionWait,
 	ToolHooks,
 	ToolRegistration,
 } from "./types.ts";
 import { recordUsage } from "./usage.ts";
 
-export type ToolTaskInput = { assistant: EntryId; callId: string };
+export type DirectToolCall = { readonly id: string; readonly name: string; readonly arguments: JsonObject };
+export type ToolTaskInput = {
+	source: { kind: "assistant" | "direct"; entryId: EntryId };
+	callId: string;
+	binding: ToolBinding;
+};
+
+/** Commit real direct-call source and its ordinary ToolTask atomically with product admission. */
+export async function createDirectToolTask(
+	tx: Tx,
+	conversationId: ConversationId,
+	call: DirectToolCall,
+	binding: ToolBinding,
+	options: Omit<TaskOptions, "conversationId">,
+): Promise<TaskId<ToolTaskResult>> {
+	if (!call.id || !call.name || call.name !== binding.name)
+		throw new Error("Direct tool call conflicts with its selected definition");
+	const source = await tx.appendEntry(DirectToolCallEntry, conversationId, { data: { call } });
+	return tx.createTask(
+		ToolTask,
+		{ source: { kind: "direct" as const, entryId: source.id }, callId: call.id, binding },
+		{ ...options, conversationId },
+	);
+}
 
 export type ToolTaskCheckpoint =
 	| { phase: "call" }
 	/** Durable intent: the final arguments and the replay policy recorded before execution. */
-	| { phase: "execute"; arguments: JsonObject; replay: "safe" | "unsafe" };
+	| {
+			phase: "execute";
+			arguments: JsonObject;
+			replay: "safe" | "unsafe";
+			continuation?: JsonValue;
+			output?: OutputCheckpoint;
+	  };
 
 export type ToolTaskResult = { entryId: EntryId; control?: ToolControl };
 
 type Runtime = TaskRuntime<ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, ToolHooks>;
 type Content = (TextContent | ImageContent)[];
+
+/** Canonical progress owned by the actual task; generation's live slot is its presentation projection. */
+export const ToolProgressDoc = defineDoc<{
+	output: OutputCheckpoint | null;
+	droppedBytes: number;
+	droppedLines: number;
+	details?: JsonValue;
+	diagnostics: ToolDiagnostic[];
+}>({
+	kind: "pi.tool-progress",
+	version: 1,
+	scope: "task",
+	initial: () => ({ output: null, droppedBytes: 0, droppedLines: 0, diagnostics: [] }),
+	checkpointWhen: () => true,
+});
 
 /**
  * Built-in tool task: resolves the called tool among its phase agent's tools, validates, runs `beforeTool`, records intent,
@@ -49,7 +99,7 @@ type Content = (TextContent | ImageContent)[];
  */
 export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, ToolHooks>({
 	name: "pi.tool",
-	version: 1,
+	version: 2,
 	initial: () => ({ phase: "call" }),
 	phases: {
 		call: async (task, runtime, context) => {
@@ -59,6 +109,8 @@ export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskRe
 				const error = harnessError("tool_unavailable", `Tool ${call.name} is not available`);
 				return settle(runtime, call, COMPLETED, () => error, context);
 			}
+			if (!toolMatches(tool, task.input.binding))
+				return parkBinding(runtime, task.state.checkpoint, task.input.binding, tool, context);
 			const prepared = prepare(tool, call.arguments as JsonObject);
 			const checked = "error" in prepared ? prepared : validate(tool, call, prepared.args);
 			if ("error" in checked) return settle(runtime, call, COMPLETED, () => invalid(checked.error), context);
@@ -83,43 +135,117 @@ export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskRe
 			if ("error" in validated) return settle(runtime, call, COMPLETED, () => invalid(validated.error), context);
 			const final = validated.args;
 			await runtime.commit(async (tx) => {
+				await tx.doc(ToolProgressDoc, runtime.taskId);
 				const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
 				if (slot !== undefined) slot.status = "running";
 				const intent = { phase: "execute", arguments: final, replay: tool.replay ?? "unsafe" } as const;
 				return { status: "running", checkpoint: intent };
 			}, context);
-			await run(runtime, call, tool, final, context);
+			await run(runtime, call, tool, final, task.input.binding, context);
 		},
 		/** Recovery after intent: rerun only when the stored and the current policy both say `safe`. */
 		execute: async (task, runtime, context) => {
-			const { arguments: args, replay } = task.state.checkpoint;
-			const call = await readCall(runtime, task.input, context);
-			const tool = (await runtime.agent(context)).tools.find((each) => each.name === call.name);
-			if (replay === "safe" && tool?.replay === "safe") {
-				// The rerun reports from scratch; clear what the interrupted attempt published.
-				await runtime.commit(async (tx) => {
-					const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
-					if (slot !== undefined) clearProgress(slot);
-					return undefined;
-				}, context);
-				return run(runtime, call, tool, args, context);
+			const { arguments: args, replay, continuation, output } = task.state.checkpoint;
+			try {
+				const call = await readCall(runtime, task.input, context);
+				const tool = (await runtime.agent(context)).tools.find((each) => each.name === call.name);
+				// An unsafe interrupted invocation cannot rerun, regardless of which code is now installed.
+				if (continuation === undefined && (replay !== "safe" || tool?.replay !== "safe")) {
+					const message = `Tool ${call.name} was interrupted and may have partially run`;
+					await settle(
+						runtime,
+						call,
+						{ status: "failed", error: { message } },
+						(slot) => fromSlot(slot, "interrupted", message),
+						context,
+					);
+					return;
+				}
+				if (!toolMatches(tool, task.input.binding))
+					return await parkBinding(runtime, task.state.checkpoint, task.input.binding, tool, context);
+				// A replay-safe invocation starts reporting from scratch; an owned continuation keeps its output.
+				if (continuation === undefined)
+					await runtime.commit(async (tx) => {
+						const progress = await tx.doc(ToolProgressDoc, runtime.taskId);
+						progress.output = null;
+						delete progress.details;
+						progress.diagnostics = [];
+						progress.droppedBytes = 0;
+						progress.droppedLines = 0;
+						const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
+						if (slot !== undefined) clearProgress(slot);
+						return undefined;
+					}, context);
+				await run(runtime, call, tool, args, task.input.binding, context, continuation, false, output);
+			} catch (error) {
+				if (continuation === undefined || runtime.signal.aborted) throw error;
+				// Selection, restoration and rejected result commits also leave the admitted operation owned.
+				await runtime.parkFailure(error, context);
 			}
-			const message = `Tool ${call.name} was interrupted and may have partially run`;
-			// `failed` records cancellation intent, so the call's owned conversations, left unsupervised, are aborted.
-			const ending = { status: "failed", message } as const;
-			await settle(runtime, call, ending, (slot) => fromSlot(slot, "interrupted", message), context);
 		},
 	},
 	abort: async (task, runtime, context) => {
 		const call = await readCall(runtime, task.input, context);
+		const checkpoint = task.state.checkpoint;
+		const tool = (await runtime.agent(context)).tools.find((each) => each.name === call.name);
+		if (checkpoint.phase === "execute" && !toolMatches(tool, task.input.binding))
+			return parkBinding(runtime, checkpoint, task.input.binding, tool, context);
+		if (checkpoint.phase === "execute" && tool?.cancel !== undefined) {
+			return run(
+				runtime,
+				call,
+				tool,
+				checkpoint.arguments,
+				task.input.binding,
+				context,
+				checkpoint.continuation,
+				true,
+				checkpoint.output,
+			);
+		}
 		const message = `Tool ${call.name} was aborted`;
 		await settle(runtime, call, { status: "aborted" }, (slot) => fromSlot(slot, "aborted", message), context);
 	},
 });
 
-/** The tool call `callId` of the assistant entry. */
+/** Keep the canonical operation and cleanup debt live; changed code never claims its outcome. */
+async function parkBinding(
+	runtime: Runtime,
+	checkpoint: ToolTaskCheckpoint,
+	expected: ToolBinding,
+	tool: ToolRegistration | undefined,
+	context: Context,
+): Promise<void> {
+	const after = runtime.registry.revision;
+	await runtime.commit(
+		() => ({
+			status: "waiting",
+			checkpoint,
+			condition: {
+				kind: "registry",
+				after,
+				reason: {
+					code: "incompatible_tool",
+					name: expected.name,
+					expectedVersion: expected.version,
+					currentVersion: tool?.version ?? (tool === undefined ? null : 1),
+				},
+			},
+		}),
+		context,
+	);
+}
+
+/** Resolve the exact original source; direct calls never claim provider authorship. */
 async function readCall(runtime: Runtime, input: ToolTaskInput, context: Context): Promise<ToolCall> {
-	const entry = await runtime.entry(AssistantEntry, input.assistant, context);
+	if (input.source.kind === "direct") {
+		const entry = await runtime.entry(DirectToolCallEntry, input.source.entryId, context);
+		const call = entry?.data?.call;
+		if (!call || call.id !== input.callId || entry.model !== undefined)
+			throw new Error(`Entry ${input.source.entryId} has no original direct tool call ${input.callId}`);
+		return { type: "toolCall", ...call };
+	}
+	const entry = await runtime.entry(AssistantEntry, input.source.entryId, context);
 	const message = entry?.model?.[0];
 	const call =
 		message?.role === "assistant"
@@ -127,7 +253,7 @@ async function readCall(runtime: Runtime, input: ToolTaskInput, context: Context
 					(content): content is ToolCall => content.type === "toolCall" && content.id === input.callId,
 				)
 			: undefined;
-	if (call === undefined) throw new Error(`Entry ${input.assistant} has no tool call ${input.callId}`);
+	if (call === undefined) throw new Error(`Entry ${input.source.entryId} has no tool call ${input.callId}`);
 	return call;
 }
 
@@ -171,15 +297,31 @@ async function run(
 	call: ToolCall,
 	tool: ToolRegistration,
 	args: JsonObject,
+	binding: ToolBinding,
 	context: Context,
+	continuation?: JsonValue,
+	cancelling = false,
+	output?: OutputCheckpoint,
 ): Promise<void> {
 	const limits: OutputLimits = {
 		maxBytes: tool.outputLimits?.maxBytes ?? DEFAULT_MAX_BYTES,
 		maxLines: tool.outputLimits?.maxLines ?? DEFAULT_MAX_LINES,
 		retain: tool.outputLimits?.retain ?? "head",
 	};
-	const reported: Reported = { output: new OutputBuffer(limits), limits, diagnostics: [], details: undefined };
+	const retained =
+		continuation === undefined ? undefined : await runtime.snapshot(ToolProgressDoc, runtime.taskId, context);
+	const reported: Reported = {
+		output: new OutputBuffer(limits, retained?.output ?? output),
+		limits,
+		diagnostics: [],
+		details: undefined,
+	};
+	if (continuation !== undefined) {
+		reported.details = retained?.details === undefined ? undefined : copyJson(retained.details);
+		if (retained?.diagnostics) reported.diagnostics.push(...(copyJson(retained.diagnostics) as ToolDiagnostic[]));
+	}
 	const progress = publishProgress(runtime, reported, context);
+	let retainedContinuation = continuation;
 	let ended = false;
 	const assertLive = (): void => {
 		if (ended) throw new Error(`Tool call ${call.id} has settled`);
@@ -188,6 +330,10 @@ async function run(
 		taskId: runtime.taskId,
 		conversationId: runtime.conversationId,
 		callId: call.id,
+		get executionData() {
+			return binding.data === undefined ? undefined : immutableData(copyJson(binding.data));
+		},
+		continuation,
 		registry: runtime.registry,
 		agent: runtime.agent,
 		output: (chunk) => {
@@ -216,6 +362,17 @@ async function run(
 			}, commitContext);
 			return result as Awaited<ReturnType<typeof change>>;
 		},
+		retainContinuation: async (candidate, change, commitContext) => {
+			assertLive();
+			if (tool.cancel === undefined) throw new Error(`External tool ${call.name} has no cancellation contract`);
+			const retained = copyJson(candidate);
+			await runtime.commit(async (tx, current) => {
+				await change(tx);
+				const checkpoint = await checkpointProgress(runtime, tx, current, reported);
+				return { status: "running", checkpoint: { ...checkpoint, continuation: retained } };
+			}, commitContext);
+			retainedContinuation = retained;
+		},
 		memo: runtime.memo,
 		createTask: async <I, S extends { phase: string }, R, H extends object>(
 			task: Task<I, S, R, H>,
@@ -238,22 +395,72 @@ async function run(
 		watchDoc: runtime.watchDoc,
 	};
 
-	let result: ToolExecutionResult;
+	let result: ToolExecutionResult | ToolExecutionWait;
 	let ending = COMPLETED;
 	try {
 		// Built for this call, so a rerun after recovery gets the conversation's environment at that time.
 		const env = await runtime.env(context);
-		result = await tool.execute(args, { ...api, env }, context);
+		result = await (cancelling ? tool.cancel! : tool.execute)(
+			args,
+			{
+				...api,
+				env,
+				get executionData() {
+					return binding.data === undefined ? undefined : immutableData(copyJson(binding.data));
+				},
+			},
+			context,
+		);
+		if ("wait" in result && tool.cancel === undefined)
+			throw new Error(`External tool ${call.name} has no cancellation contract`);
 	} catch (error) {
-		if (runtime.signal.aborted) {
+		// A failed observation or cleanup does not establish the admitted operation's terminal outcome.
+		if (cancelling || retainedContinuation !== undefined || runtime.signal.aborted) {
 			ended = true;
-			for (const waiter of await progress.stop()) waiter.reject(error);
-			throw error;
+			reported.output.end();
+			const pending = await progress.stop();
+			try {
+				if (runtime.signal.aborted) throw error;
+				await runtime.parkFailure(error, context, (tx, current) =>
+					checkpointProgress(runtime, tx, current, reported),
+				);
+			} catch (failure) {
+				for (const waiter of pending) waiter.reject(failure);
+				throw failure;
+			}
+			for (const waiter of pending) waiter.reject(error);
+			return;
 		}
 		result = { isError: true, diagnostics: [toolDiagnostic("tool_error", errorText(error))] };
-		// A throw, from `execute()` or from building the environment, ends the task `failed`, which cancels what the call owned; it no longer supervises it. The error text
-		// is already in the result entry.
-		ending = { status: "failed", message: `Tool ${call.name} threw` };
+		// No external continuation was admitted. End failed with the original durable diagnostic.
+		ending = { status: "failed", error: snapshotError(error) };
+	}
+	if ("wait" in result) {
+		ended = true;
+		reported.output.end();
+		const pending = await progress.stop();
+		try {
+			const waiting = result;
+			await runtime.commit(async (tx, current) => {
+				const checkpoint = await checkpointProgress(runtime, tx, current, reported);
+				return {
+					status: "waiting",
+					checkpoint: { ...checkpoint, continuation: waiting.continuation },
+					condition: waiting.wait,
+				};
+			}, context);
+			for (const waiter of pending) waiter.resolve();
+		} catch (error) {
+			for (const waiter of pending) waiter.reject(error);
+			if (retainedContinuation !== undefined && !runtime.signal.aborted) {
+				await runtime.parkFailure(error, context, (tx, current) =>
+					checkpointProgress(runtime, tx, current, reported),
+				);
+				return;
+			}
+			throw error;
+		}
+		return;
 	}
 	ended = true;
 	reported.output.end();
@@ -261,12 +468,43 @@ async function run(
 	const pending = await progress.stop();
 	try {
 		const settled = await finalResult(runtime, call, result, reported, context);
-		await settle(runtime, call, ending, () => settled, context);
+		await settle(runtime, call, cancelling ? { status: "aborted" } : ending, () => settled, context);
 	} catch (error) {
 		for (const waiter of pending) waiter.reject(error);
+		if (retainedContinuation !== undefined && !runtime.signal.aborted) {
+			await runtime.parkFailure(error, context, (tx, current) => checkpointProgress(runtime, tx, current, reported));
+			return;
+		}
 		throw error;
 	}
 	for (const waiter of pending) waiter.resolve();
+}
+
+/** The continuation's output counters and visible progress advance in the same transaction as its wait. */
+async function checkpointProgress(
+	runtime: Runtime,
+	tx: Tx,
+	current: RunningTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult>,
+	reported: Reported,
+): Promise<Extract<ToolTaskCheckpoint, { phase: "execute" }>> {
+	const checkpoint = current.state.checkpoint;
+	if (checkpoint.phase !== "execute") throw new Error("Tool continuation has no committed intent");
+	const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
+	const output = reported.output.snapshot();
+	const progress = await tx.doc(ToolProgressDoc, runtime.taskId);
+	progress.output = reported.output.checkpoint();
+	progress.droppedBytes = output.droppedBytes;
+	progress.droppedLines = output.droppedLines;
+	if (reported.details !== undefined) progress.details = reported.details;
+	progress.diagnostics = [...reported.diagnostics];
+	if (slot !== undefined) {
+		slot.output = output.text;
+		slot.droppedBytes = output.droppedBytes;
+		slot.droppedLines = output.droppedLines;
+		if (reported.details !== undefined) slot.details = reported.details;
+		if (reported.diagnostics.length) slot.diagnostics = [...reported.diagnostics];
+	}
+	return { ...checkpoint, output: reported.output.checkpoint() };
 }
 
 /**
@@ -274,11 +512,12 @@ async function run(
  * last one.
  */
 function publishProgress(runtime: Runtime, reported: Reported, context: Context): Progress {
-	let written = { text: "", details: undefined as JsonValue | undefined, diagnostics: 0 };
+	let written = { text: "", details: reported.details, diagnostics: reported.diagnostics.length };
 	return new Progress(
 		async () => {
 			// Capture everything synchronously: the tool keeps reporting while the commit is in flight.
 			const snapshot = reported.output.snapshot();
+			const outputCheckpoint = reported.output.snapshotCheckpoint();
 			const current = { text: snapshot.text, details: reported.details, diagnostics: reported.diagnostics.length };
 			const added = reported.diagnostics.slice(written.diagnostics, current.diagnostics);
 			const detailsChanged = current.details !== written.details;
@@ -294,6 +533,13 @@ function publishProgress(runtime: Runtime, reported: Reported, context: Context)
 			if (detailsChanged) bytes += utf8ByteLength(JSON.stringify(current.details ?? null));
 			if (added.length > 0) bytes += utf8ByteLength(JSON.stringify(added));
 			await runtime.commit(async (tx) => {
+				const progress = await tx.doc(ToolProgressDoc, runtime.taskId);
+				assignJson(progress as unknown as Record<string, JsonValue>, "output", outputCheckpoint);
+				progress.droppedBytes = snapshot.droppedBytes;
+				progress.droppedLines = snapshot.droppedLines;
+				if (detailsChanged && current.details !== undefined)
+					assignJson(progress as unknown as Record<string, JsonValue>, "details", current.details);
+				for (const diagnostic of added) progress.diagnostics.push(diagnostic);
 				const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
 				if (slot === undefined) return undefined;
 				// REMINDER: assign `output` as one string field. Chord then diffs it into an append, or a trim plus an
@@ -368,15 +614,31 @@ async function settle(
 ): Promise<void> {
 	await runtime.commit(async (tx) => {
 		const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
-		const result = build(slot);
-		const entry = await appendToolResult(tx, runtime.conversationId, call, result, runtime.now());
+		const progress = await tx.doc(ToolProgressDoc, runtime.taskId);
+		const result = build({
+			callId: call.id,
+			name: call.name,
+			taskId: runtime.taskId,
+			status: "running",
+			output: progress.output?.text ?? "",
+			droppedBytes: progress.droppedBytes,
+			droppedLines: progress.droppedLines,
+			...(progress.details === undefined ? {} : { details: progress.details }),
+			diagnostics: progress.diagnostics,
+		});
+		const task = await tx.task(runtime.taskId);
+		if (!task) throw new Error("Tool settlement has no original task");
+		const input = task.input as ToolTaskInput;
+		const entry =
+			input.source.kind === "direct"
+				? await appendDirectToolResult(tx, runtime.conversationId, input.source.entryId, call, result)
+				: await appendToolResult(tx, runtime.conversationId, call, result, runtime.now());
 		if (slot !== undefined) finishSlot(slot, entry.id);
 		const entryId = entry.id;
 		if (ending.status === "aborted")
 			return { status: "terminal", outcome: { status: "aborted", result: { entryId } } };
 		if (ending.status === "failed") {
-			const error = { message: ending.message };
-			return { status: "terminal", outcome: { status: "failed", error, result: { entryId } } };
+			return { status: "terminal", outcome: { status: "failed", error: ending.error, result: { entryId } } };
 		}
 		// Tools build control objects freely; drop keys set to undefined so the task result is strict JSON.
 		const control =
@@ -391,7 +653,9 @@ async function settle(
  * How a tool task ends; the result entry is appended either way. `failed` (execution threw or was interrupted)
  * records cancellation intent for the conversations the call owns; a result with `isError` still completes.
  */
-type Ending = { readonly status: "completed" | "aborted" } | { readonly status: "failed"; readonly message: string };
+type Ending =
+	| { readonly status: "completed" | "aborted" }
+	| { readonly status: "failed"; readonly error: TaskOutcomeError };
 
 const COMPLETED: Ending = { status: "completed" };
 
@@ -459,6 +723,25 @@ export async function appendToolResult(
 	return tx.appendEntry(ToolResultEntry, conversationId, { model: [message], data: { diagnostics } });
 }
 
+/** Direct results preserve full structured output without manufacturing provider context. */
+async function appendDirectToolResult(
+	tx: Tx,
+	conversationId: ConversationId,
+	sourceEntryId: EntryId,
+	call: ToolCall,
+	result: ToolExecutionResult,
+) {
+	if (result.usage !== undefined) await recordUsage(tx, conversationId, "tools", call.name, result.usage);
+	return tx.appendEntry(DirectToolResultEntry, conversationId, {
+		data: {
+			sourceEntryId,
+			callId: call.id,
+			name: call.name,
+			result: copyJson(result as JsonValue, { omitUndefinedProperties: true }),
+		},
+	});
+}
+
 function renderDiagnostics(diagnostics: readonly ToolDiagnostic[]): string {
 	return `<harness>\n${diagnostics.map((diagnostic) => `[${diagnostic.severity}] ${diagnostic.message}`).join("\n")}\n</harness>`;
 }
@@ -485,4 +768,13 @@ function boundContent(
 
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/** A detached offer observation stays immutable even when an authoring wrapper spreads the API. */
+function immutableData(value: JsonValue): JsonValue {
+	if (value !== null && typeof value === "object") {
+		for (const child of Object.values(value)) immutableData(child);
+		Object.freeze(value);
+	}
+	return value;
 }

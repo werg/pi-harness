@@ -6,11 +6,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { idFromNumber } from "../src/ids.ts";
 import {
 	applySqliteMigrations,
+	applySqliteMigrationsInTransaction,
 	CURRENT_SQLITE_SCHEMA_VERSION,
 	SQLITE_MIGRATIONS,
 	type SqliteMigration,
 } from "../src/storage/sqlite/index.ts";
 import { openNodeSqliteDatabase, openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import { readJsonRow } from "../src/storage/sqlite/payload.ts";
 import { type EntryId, ROOT_CONVERSATION_ID } from "../src/types.ts";
 
 const directories = new Set<string>();
@@ -27,6 +29,45 @@ afterEach(async () => {
 });
 
 describe("durable SQLite migrations", () => {
+	it("rejects the pre-release inline-payload baseline without modifying its state", async () => {
+		const path = await databasePath();
+		const database = await openNodeSqliteDatabase(path);
+		await database.exec("CREATE TABLE durable_schema (singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL)");
+		await database.run("INSERT INTO durable_schema VALUES (1, 1)");
+		await database.exec("CREATE TABLE pre_release_data (value TEXT)");
+		await database.run("INSERT INTO pre_release_data VALUES ('untouched')");
+		await expect(applySqliteMigrations(database)).rejects.toThrow("predates the supported fresh-state baseline");
+		expect(await database.get("SELECT version FROM durable_schema")).toEqual({ version: 1 });
+		expect(await database.get("SELECT value FROM pre_release_data")).toEqual({ value: "untouched" });
+		await database.close();
+	});
+
+	it("composes platform, Pi and domain initialization in one rollback boundary", async () => {
+		const database = await openNodeSqliteDatabase(await databasePath());
+		try {
+			const failure = new Error("domain initialization failed");
+			await expect(
+				database.transaction(async (transaction) => {
+					await transaction.exec("CREATE TABLE platform_state (key TEXT PRIMARY KEY)");
+					await applySqliteMigrationsInTransaction(transaction);
+					await transaction.exec("CREATE TABLE domain_cards (id TEXT PRIMARY KEY)");
+					throw failure;
+				}),
+			).rejects.toBe(failure);
+			expect(await database.all("SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'")).toEqual([]);
+			await database.transaction(async (transaction) => {
+				await transaction.exec("CREATE TABLE platform_state (key TEXT PRIMARY KEY)");
+				await applySqliteMigrationsInTransaction(transaction);
+				await transaction.exec("CREATE TABLE domain_cards (id TEXT PRIMARY KEY)");
+			});
+			expect(await database.get("SELECT version FROM durable_schema")).toEqual({
+				version: CURRENT_SQLITE_SCHEMA_VERSION,
+			});
+		} finally {
+			await database.close();
+		}
+	});
+
 	it("creates the current schema and can be applied repeatedly", async () => {
 		const database = await openNodeSqliteDatabase(await databasePath());
 		try {
@@ -142,7 +183,8 @@ describe("durable SQLite migrations", () => {
 		expect(await database.get("SELECT version FROM durable_schema WHERE singleton = 1")).toEqual({
 			version: nextVersion,
 		});
-		expect(await database.get("SELECT record, commit_seq FROM entries WHERE id = 2")).toEqual({
+		expect(await readJsonRow(database, "SELECT id, commit_seq FROM entries WHERE id = 2", [])).toEqual({
+			id: 2,
 			record: JSON.stringify({
 				id: 2,
 				conversationId: ROOT_CONVERSATION_ID,

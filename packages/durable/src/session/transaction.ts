@@ -12,6 +12,7 @@ import {
 	resolveAddress,
 } from "../documents.ts";
 import { ReadAfterWrite } from "../errors.ts";
+import { InboxDoc } from "../harness/inbox.ts";
 import type {
 	ConversationDocFamilyToken,
 	ConversationDocToken,
@@ -32,6 +33,8 @@ import type {
 	EntryQuery,
 	EntryRecord,
 	JsonObject,
+	QueuedInputRevision,
+	QueuedInputRevisionResult,
 	Seq,
 	SessionDocFamilyToken,
 	SessionDocToken,
@@ -208,6 +211,7 @@ export class Transaction implements Tx {
 	readonly #submissions = new Map<SubmissionId, SubmissionRecord>();
 	/** Submission settlements and placements in staging order; resolved against the latest candidate record during assembly. */
 	readonly #submissionChanges: { readonly id: SubmissionId; readonly change: SubmissionChange }[] = [];
+	#resolvedSubmissionChanges = 0;
 
 	/** Write and publication plans of every staged incarnation, built during assembly. */
 	readonly #plans: DocumentPlan[] = [];
@@ -446,6 +450,31 @@ export class Transaction implements Tx {
 		this.#submissionChanges.push({ id, change: copyJson(settlement) as SubmissionSettlement });
 	}
 
+	/** Correct native inbox content without changing the original request/admission identity. */
+	reviseQueuedInput(id: SubmissionId, revision: QueuedInputRevision): Promise<QueuedInputRevisionResult> {
+		const immutable = copyJson(revision, TABLE_JSON_COPY_OPTIONS) as QueuedInputRevision;
+		return this.#write(async () => {
+			await this.#resolveSubmissionChanges();
+			const current = this.#submissions.get(id) ?? (await this.#host.storage.submission(id, this.#context));
+			if (current === undefined) return "not_found";
+			if (current.type !== "input") throw new Error(`Submission ${id} is not an input`);
+			if (current.entry !== undefined) return "already_placed";
+			if (current.status !== "queued") return "settled";
+			const inbox = await this.doc(InboxDoc, current.conversationId);
+			const index = inbox.items.findIndex((item) => item.id === id);
+			const item = inbox.items[index];
+			if (index < 0 || item === undefined || item.mode === "write")
+				throw new Error(`Queued input ${id} has no native inbox item`);
+			if (immutable.kind === "replace") {
+				item.content = immutable.content;
+				return "updated";
+			}
+			this.settleSubmission(id, { status: "unanswered", reason: "aborted" });
+			inbox.items.splice(index, 1);
+			return "withdrawn";
+		});
+	}
+
 	/** Place a queued submission at `entry`; resolved during assembly like `settleSubmission()`. */
 	placeSubmission(id: SubmissionId, entry: EntryId): void {
 		this.#assertOpen();
@@ -478,6 +507,17 @@ export class Transaction implements Tx {
 		return records;
 	}
 
+	/** Internal: complete submission candidates, including placement/settlement, before product preparation. */
+	async stagedSubmissions(): Promise<SubmissionRecord[]> {
+		await this.#resolveSubmissionChanges();
+		return [...this.#submissions.values()];
+	}
+
+	/** Internal: entries appended by this transaction, including those eligible to release an input wait. */
+	stagedEntries(): EntryRecord[] {
+		return this.#writes.flatMap((write) => (write.type === "entry" ? [write.value] : []));
+	}
+
 	/** Internal: conversations this transaction created or forked so far. */
 	stagedConversations(): ConversationRecord[] {
 		const records: ConversationRecord[] = [];
@@ -486,6 +526,20 @@ export class Transaction implements Tx {
 	}
 
 	// ─── Documents ──────────────────────────────────────────────────────────
+	/** Internal preparation read: acquire a session singleton only if it already exists. */
+	async docIfPresent<T extends JsonObject>(token: SessionDocToken<T>): Promise<Draft<T> | undefined> {
+		this.#assertOpen();
+		const resolved = resolveAddress(token.definition, []);
+		const staged = this.#latestDocumentByAddress.get(resolved.id);
+		if (staged?.retireOnCommit) return undefined;
+		if (
+			staged === undefined &&
+			(await this.#host.load(token.definition, resolved.id, resolved.address, this.#context)) === undefined
+		)
+			return undefined;
+		return this.doc(token);
+	}
+
 	doc<T extends JsonObject>(token: SessionDocToken<T>): Promise<Draft<T>>;
 	doc<T extends JsonObject>(token: ConversationDocToken<T>, conversationId: ConversationId): Promise<Draft<T>>;
 	doc<T extends JsonObject>(token: TaskDocToken<T>, taskId: TaskId): Promise<Draft<T>>;
@@ -506,6 +560,7 @@ export class Transaction implements Tx {
 		key: string,
 		seed: I,
 	): Promise<Draft<T>>;
+
 	doc(token: AnyDocToken, ...args: readonly unknown[]): Promise<Draft<JsonObject>> {
 		try {
 			this.#assertOpen();
@@ -657,6 +712,12 @@ export class Transaction implements Tx {
 	}
 
 	// ─── Settlement ─────────────────────────────────────────────────────────
+
+	/** Check caller work before asynchronous internal preparation can let it finish late. */
+	assertCallbackSettled(): void {
+		if (this.#pendingOperations.size > 0)
+			throw new Error("Session commit callback settled before its pending Tx operations");
+	}
 
 	/** Seal after callback failure: abort every change and observe every pending operation. */
 	async settleFailure(): Promise<void> {
@@ -816,12 +877,7 @@ export class Transaction implements Tx {
 			plan.conversationId = task.publicationConversationId;
 		}
 
-		for (const { id, change } of this.#submissionChanges) {
-			const current = this.#submissions.get(id) ?? (await storage.submission(id, this.#context));
-			if (current === undefined) throw new Error(`Submission ${id} does not exist`);
-			const next = applySubmissionChange(current, change);
-			if (next !== current) this.#submissions.set(id, next);
-		}
+		await this.#resolveSubmissionChanges();
 
 		const writes = this.#writes;
 		for (const value of this.#submissions.values()) writes.push({ type: "submission", value });
@@ -842,6 +898,17 @@ export class Transaction implements Tx {
 			if (plan.retire) writes.push({ type: "document.retire", id: plan.record.id });
 		}
 		return writes;
+	}
+
+	async #resolveSubmissionChanges(): Promise<void> {
+		while (this.#resolvedSubmissionChanges < this.#submissionChanges.length) {
+			const { id, change } = this.#submissionChanges[this.#resolvedSubmissionChanges]!;
+			const current = this.#submissions.get(id) ?? (await this.#host.storage.submission(id, this.#context));
+			if (current === undefined) throw new Error(`Submission ${id} does not exist`);
+			const next = applySubmissionChange(current, change);
+			if (next !== current) this.#submissions.set(id, next);
+			this.#resolvedSubmissionChanges++;
+		}
 	}
 
 	// ─── Helpers ────────────────────────────────────────────────────────────

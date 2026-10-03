@@ -48,7 +48,11 @@ describe("Harness.inspect()", () => {
 				wait: async (_task, runtime, ctx) => {
 					const checkpoint = { phase: "done" } as const;
 					await runtime.commit(
-						() => ({ status: "waiting", checkpoint, on: [gateId!], policy: "allSettled" }),
+						() => ({
+							status: "waiting",
+							checkpoint,
+							condition: { kind: "tasks", on: [gateId!], policy: "allSettled" },
+						}),
 						ctx,
 					);
 				},

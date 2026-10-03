@@ -78,7 +78,14 @@ const Waiter = defineTask<{ on: TaskId[] }, { phase: "wait" } | { phase: "done" 
 	phases: {
 		wait: async (task, runtime, ctx) => {
 			const checkpoint = { phase: "done" } as const;
-			await runtime.commit(() => ({ status: "waiting", checkpoint, on: task.input.on, policy: "allSettled" }), ctx);
+			await runtime.commit(
+				() => ({
+					status: "waiting",
+					checkpoint,
+					condition: { kind: "tasks", on: task.input.on, policy: "allSettled" },
+				}),
+				ctx,
+			);
 		},
 		done: async (_task, runtime, ctx) =>
 			runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), ctx),
@@ -87,13 +94,13 @@ const Waiter = defineTask<{ on: TaskId[] }, { phase: "wait" } | { phase: "done" 
 		runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
 });
 
-/** Never registered: aborting it can only orphan it. */
+/** Initially unavailable: its cancellation must retain ownership until this definition is registered. */
 const Unregistered = defineTask<{ name: string }, { phase: "hold" }, null>({
 	name: "test.unregistered",
 	version: 1,
 	initial: () => ({ phase: "hold" }),
 	phases: { hold: async () => {} },
-	abort: async () => {},
+	abort: (_task, runtime, ctx) => runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
 });
 
 function open(name: string, ending: Ending): void {
@@ -432,8 +439,8 @@ describe("ownership", () => {
 		await opened.harness.close(context);
 	});
 
-	it("cascades from an owner the scheduler orphans", async () => {
-		const { harness, root } = await openHarness();
+	it("cascades from an unavailable owner and retains it until compatible cleanup is registered", async () => {
+		const { harness, root, registry } = await openHarness();
 		const { owner, inner } = await root.commit(async (tx) => {
 			const owner = await tx.createTask(
 				Unregistered,
@@ -451,11 +458,20 @@ describe("ownership", () => {
 			};
 		}, context);
 		expect(await harness.abortTask(owner, context)).toBe("marked");
-		expect((await harness.waitForTask(owner, context)).state.outcome).toEqual({
-			status: "orphaned",
-			reason: "missing_task",
-		});
 		expect((await harness.waitForTask(inner, context)).state.outcome.status).toBe("aborted");
+		await harness.runPass(context);
+		expect(await harness.getTask(owner, context)).toMatchObject({
+			abortRequested: true,
+			state: { status: "waiting", mode: "abort", checkpoint: { phase: "hold" }, condition: { kind: "registry" } },
+		});
+		const idle = root.waitForIdle(context);
+		expect(await settled(idle)).toBe(false);
+		addTask(registry, Unregistered);
+		await harness.runPass(context);
+		expect((await harness.waitForTask(owner, context)).state.outcome).toEqual({
+			status: "aborted",
+		});
+		await idle;
 		await harness.close(context);
 	});
 

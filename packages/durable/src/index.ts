@@ -2,6 +2,8 @@ export { defineDoc, defineDocFamily } from "./documents.ts";
 export {
 	AssistantEntry,
 	CompactionEntry,
+	DirectToolCallEntry,
+	DirectToolResultEntry,
 	defineEntry,
 	ResetEntry,
 	SystemEntry,
@@ -21,7 +23,7 @@ export {
 	CompactionTask,
 	type SummaryRequest,
 } from "./harness/compaction.ts";
-export { defineExtension, defineTool, hook, section, wrapSection, wrapTool } from "./harness/define.ts";
+export { bindTool, defineExtension, defineTool, hook, section, wrapSection, wrapTool } from "./harness/define.ts";
 export {
 	type AgentEvent,
 	type AgentEventStream,
@@ -37,10 +39,29 @@ export {
 } from "./harness/generation.ts";
 export { Harness } from "./harness/harness.ts";
 export { InboxDoc, type InboxItem, type InboxState } from "./harness/inbox.ts";
-export { type CompactionStatus, LiveDoc, type LiveState, type ToolSlot } from "./harness/live.ts";
+export type { PinnedMessages, PinnedModel } from "./harness/json.ts";
+export {
+	acceptReceipt,
+	bindReceipt,
+	type CompactionStatus,
+	LiveDoc,
+	type LiveState,
+	ReceiptDoc,
+	type ToolSlot,
+	WakeDoc,
+	type WakeSchedule,
+} from "./harness/live.ts";
 export { createRegistry } from "./harness/registry.ts";
 export type { TaskGraph, TaskGraphNode, TaskGraphState, TaskGraphWatch } from "./harness/task-graph.ts";
-export { ToolTask, type ToolTaskCheckpoint, type ToolTaskInput, type ToolTaskResult } from "./harness/tool.ts";
+export {
+	createDirectToolTask,
+	type DirectToolCall,
+	ToolProgressDoc,
+	ToolTask,
+	type ToolTaskCheckpoint,
+	type ToolTaskInput,
+	type ToolTaskResult,
+} from "./harness/tool.ts";
 export type {
 	Agent,
 	AgentChange,
@@ -55,6 +76,10 @@ export type {
 	ConversationAbortOptions,
 	ConversationCreateOptions,
 	ConversationHandle,
+	ConversationHistory,
+	ConversationHistoryEntry,
+	ConversationHistoryEntryMap,
+	ConversationHistoryImportOptions,
 	ConversationInit,
 	ConversationRetryPolicy,
 	ConversationStreamOptions,
@@ -62,6 +87,9 @@ export type {
 	EnvTarget,
 	Extension,
 	GenerationHooks,
+	GenerationResponseRequest,
+	GenerationRetrySelection,
+	HarnessCommit,
 	HarnessInspection,
 	HarnessOptions,
 	HarnessSettings,
@@ -71,6 +99,14 @@ export type {
 	HooksOf,
 	InputSubmissionDraft,
 	ModelRef,
+	ModelRequestApi,
+	ModelRequestCapabilities,
+	ModelRequestConnection,
+	ModelRequestInput,
+	ModelRequestPort,
+	ModelRequestResult,
+	ModelRequestTarget,
+	ModelRequestWait,
 	PromptInput,
 	PromptSection,
 	QueueMode,
@@ -82,12 +118,14 @@ export type {
 	SettledTask,
 	Submission,
 	SubmissionDraft,
+	SubmissionPrepare,
 	TaskInspection,
 	ToolControl,
 	ToolDiagnostic,
 	ToolExecutionApi,
 	ToolExecutionMode,
 	ToolExecutionResult,
+	ToolExecutionWait,
 	ToolHooks,
 	ToolRegistration,
 	UserInput,
@@ -142,6 +180,8 @@ export type {
 	NextTaskState,
 	Page,
 	PhaseHandler,
+	QueuedInputRevision,
+	QueuedInputRevisionResult,
 	RewindableConversationDocFamilyToken,
 	RewindableConversationDocToken,
 	RewindableConversationSemantics,
@@ -172,6 +212,7 @@ export type {
 	TaskRecord,
 	TaskRuntime,
 	TaskState,
+	TaskWaitCondition,
 	Tx,
 	TypedEntry,
 	TypedEntryDraft,

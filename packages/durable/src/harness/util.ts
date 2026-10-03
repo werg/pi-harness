@@ -1,7 +1,7 @@
 import type { Context } from "@earendil-works/chord";
 import type { Cursor, Page } from "../types.ts";
 
-/** Pending waits by key. Each settles once: through `resolve`, `rejectAll`, or cancellation of its context. */
+/** Pending waits by key. Each settles once through resolution, rejection, or caller cancellation. */
 export class Waiters<K, T> {
 	readonly #sets = new Map<K, Set<PromiseWithResolvers<T>>>();
 
@@ -32,6 +32,12 @@ export class Waiters<K, T> {
 		const set = this.#sets.get(key);
 		this.#sets.delete(key);
 		for (const waiter of set ?? []) waiter.resolve(value);
+	}
+
+	reject(key: K, error: unknown): void {
+		const set = this.#sets.get(key);
+		this.#sets.delete(key);
+		for (const waiter of set ?? []) waiter.reject(error);
 	}
 
 	rejectAll(error: unknown): void {

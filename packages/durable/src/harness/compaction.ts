@@ -15,6 +15,7 @@ import type {
 	Tx,
 } from "../types.ts";
 import { orderToolResults } from "./context.ts";
+import { type PinnedMessages, type PinnedModel, pinMessages, pinModel } from "./json.ts";
 import { addCompactionStatus, compactionStatus, LiveDoc, type LiveState, removeCompactionStatus } from "./live.ts";
 import { admitSubmission } from "./submissions.ts";
 import type {
@@ -32,7 +33,8 @@ export type CompactionInput = { reason: CompactionReason; instructions?: string 
 /** The pinned summarization request. */
 export type SummaryRequest = {
 	attempt: number;
-	model: ModelRef;
+	model: PinnedModel;
+	messages: PinnedMessages;
 	thinkingLevel: ModelThinkingLevel;
 	streamOptions: ConversationStreamOptions;
 	maxTokens: number;
@@ -101,7 +103,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
  */
 export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, CompactionResult, CompactionHooks>({
 	name: "pi.compaction",
-	version: 1,
+	version: 2,
 	initial: () => ({ phase: "select" }),
 	phases: {
 		select: async (task, runtime, context) => {
@@ -111,6 +113,7 @@ export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, 
 			const ref = agent.model;
 			const model = ref === undefined ? undefined : runtime.models.getModel(ref.provider, ref.modelId);
 			if (ref === undefined || model === undefined) return failNoModel(runtime, ref, context);
+			const descriptor = pinModel(model);
 			const policy = settings.compaction;
 			const view = await runtime.context(conversationId, context);
 			const cut = selectCut(view, policy.keepRecentTokens);
@@ -130,14 +133,24 @@ export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, 
 			});
 			if (decision !== undefined && "decline" in decision) return complete(runtime, context);
 			if (decision !== undefined) return place(runtime, firstKept, decision.summary, context);
+			const now = runtime.now();
+			const messages = pinMessages([
+				{ role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
+				{
+					role: "user",
+					content: [{ type: "text", text: summaryPrompt(compaction.messages, instructions) }],
+					timestamp: now,
+				},
+			]);
 			const request: SummaryRequest = {
 				attempt: 1,
-				model: ref,
+				model: descriptor,
+				messages,
 				thinkingLevel: agent.thinkingLevel,
-				streamOptions: settings.stream,
+				streamOptions: agent.stream,
 				maxTokens: Math.min(
 					Math.floor(0.8 * policy.reserveTokens),
-					model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
+					descriptor.maxTokens > 0 ? descriptor.maxTokens : Number.POSITIVE_INFINITY,
 				),
 				tail: view.entries.reduce((tail, entry) => (entry.id > tail ? entry.id : tail), firstKept),
 				firstKept,
@@ -146,30 +159,30 @@ export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, 
 		},
 		summarize: async (task, runtime, context) => {
 			const { phase: _, ...request } = task.state.checkpoint;
-			const { model: ref, thinkingLevel, streamOptions, maxTokens, tail, firstKept, attempt } = request;
-			const model = runtime.models.getModel(ref.provider, ref.modelId);
-			if (model === undefined) return failNoModel(runtime, ref, context);
-			// The context at `tail` is immutable, so this is the range `select` chose.
-			const view = await runtime.context(runtime.conversationId, context, tail);
-			const cut = view.entries.findIndex((entry) => entry.id === firstKept);
-			const now = runtime.now();
-			const messages: Message[] = [
-				{ role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
-				{
-					role: "user",
-					content: [{ type: "text", text: summaryPrompt(summarizedMessages(view, cut), task.input.instructions) }],
-					timestamp: now,
-				},
-			];
+			const { model, messages, thinkingLevel, streamOptions, maxTokens, firstKept, attempt } = request;
+			if (runtime.models.getProvider(model.provider) === undefined)
+				return failNoModel(runtime, { provider: model.provider, modelId: model.id }, context);
 			const { deferred: _deferred, ...forwarded } = streamOptions;
-			const options: SimpleStreamOptions = {
+			const options = {
 				...forwarded,
 				cacheRetention: "none",
 				maxTokens,
-				signal: runtime.signal,
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
-			};
-			const message = await runtime.models.completeSimple(model, { messages }, options);
+			} satisfies SimpleStreamOptions;
+			const response = await runtime.withModelRequest(
+				{ purpose: "compaction", operation: "complete", attempt, model, messages, cutoff: request.tail, options },
+				(capabilities, signal, prepared) =>
+					runtime.models.completeSimple(prepared.model, { messages }, { ...options, ...capabilities, signal }),
+				context,
+			);
+			if (response.status === "waiting") {
+				await runtime.commit(
+					() => ({ status: "waiting", checkpoint: task.state.checkpoint, condition: response.condition }),
+					context,
+				);
+				return;
+			}
+			const message = response.result;
 			// An abort mark or close: the abort invocation or the reopened task handles the committed state.
 			runtime.signal.throwIfAborted();
 			const summary = summaryText(message);
@@ -205,7 +218,13 @@ export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, 
 		},
 		retry: async (task, runtime, context) => {
 			const { phase: _, until, ...request } = task.state.checkpoint;
-			await runtime.sleep(until, context);
+			if (runtime.now() < until) {
+				await runtime.commit(
+					() => ({ status: "waiting", checkpoint: task.state.checkpoint, condition: { kind: "time", until } }),
+					context,
+				);
+				return;
+			}
 			const attempt = request.attempt + 1;
 			await runtime.commit(async (tx) => {
 				const status = compactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);

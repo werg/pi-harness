@@ -1,6 +1,7 @@
 import { type Context, copyJson, type JsonValue } from "@earendil-works/chord";
-import { awaitWithContext, withAbortSignal } from "@earendil-works/chord/context";
+import { awaitWithContext, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
+import { defineEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
 import type { SessionImpl } from "../session/session.ts";
 import type { Transaction } from "../session/transaction.ts";
@@ -21,14 +22,24 @@ import type {
 	TaskRecord,
 	TaskRuntime,
 	TaskState,
+	Tx,
 } from "../types.ts";
 import { agentHooks } from "./agent.ts";
 import { readContext } from "./context.ts";
+import { jsonEqual, pinJson, snapshotError } from "./json.ts";
+import { ReceiptDoc, WakeDoc, type WakeSchedule } from "./live.ts";
+import { admitModelRequest, prepareModelRequest } from "./model-request.ts";
 import type {
 	Agent,
 	AnyTask,
 	ConversationHandle,
 	HarnessInspection,
+	ModelRequestApi,
+	ModelRequestCapabilities,
+	ModelRequestInput,
+	ModelRequestPort,
+	ModelRequestResult,
+	ModelRequestTarget,
 	RegistryReader,
 	RegistrySnapshot,
 	Settings,
@@ -52,6 +63,7 @@ const SCAN_PAGE_SIZE = 256;
 /** Longest delay `setTimeout` supports; longer sleeps wait in several steps. */
 const MAX_TIMER_DELAY = 2_147_483_647;
 const LIVE_STATUSES = ["pending", "running", "waiting", "completing"] as const;
+const FailureEntry = defineEntry<{ taskId: TaskId; error: { message: string; detail?: JsonValue } }>("pi.failure");
 
 /** Why a pending task cannot be reserved under a registry snapshot. Derived, never persisted. */
 type BlockedReason = "missing_task" | "task_too_old" | "migration_failed";
@@ -75,6 +87,8 @@ type Invocation = {
 	readonly context: Context;
 	/** Watches acquired through the runtime; stopped at invocation end. */
 	readonly watches: Set<DocumentWatch<JsonObject>>;
+	/** Acquisitions, dispatches and cleanup joined before the task can be reserved again. */
+	readonly modelRequests: Set<Promise<unknown>>;
 	ended: boolean;
 	readonly done: Promise<void>;
 	readonly finish: () => void;
@@ -100,7 +114,14 @@ type ReportedTask = { readonly task: AnyTask | undefined } | undefined;
 type PhaseResult = { readonly checkpoint: Checkpoint; readonly failure?: { readonly error: unknown } };
 
 /** Step decision: continue with the next phase, end the invocation, or end it by writing `faulted`. */
-type Decision = boolean | { readonly fault: unknown };
+type FailureDecision = {
+	readonly park: unknown;
+	readonly change?: (
+		tx: Tx,
+		current: ErasedRunningTask,
+	) => Checkpoint | void | Promise<Checkpoint | undefined> | Promise<void>;
+};
+type Decision = boolean | { readonly fault: unknown } | FailureDecision;
 
 /** Terminal outcomes the scheduler writes without running task code. */
 export type SchedulerOutcome = Extract<TaskOutcome<JsonValue>, { readonly status: "faulted" | "orphaned" }>;
@@ -134,6 +155,7 @@ export type TaskSchedulerOptions = {
 	readonly storage: Storage;
 	readonly registry: RegistryReader;
 	readonly models: Models;
+	readonly modelRequests?: ModelRequestPort;
 	/** Resolve a conversation's agent against a snapshot; the runtime calls it at most once per phase. */
 	readonly agent: (conversationId: ConversationId, snapshot: RegistrySnapshot, context: Context) => Promise<Agent>;
 	/** Resolve the settings; read at each access. */
@@ -142,6 +164,7 @@ export type TaskSchedulerOptions = {
 	readonly env: (conversationId: ConversationId, context: Context) => Promise<ExecutionEnv | undefined>;
 	readonly now: () => number;
 	readonly report: (error: unknown) => void;
+	readonly publishWake?: (schedule: WakeSchedule) => Promise<void>;
 	/** Harness cleanup staged in the commit that makes an outcome the scheduler wrote itself terminal. */
 	readonly settleOutcome: (tx: Transaction, record: AnyTaskRecord, outcome: SchedulerOutcome) => Promise<void>;
 	/** Withdraw a conversation's queued inputs, for conversation abort and abort cascades. */
@@ -176,6 +199,7 @@ export class TaskScheduler {
 	readonly #storage: Storage;
 	readonly #registry: RegistryReader;
 	readonly #models: Models;
+	readonly #modelRequests: ModelRequestPort;
 	readonly #agent: TaskSchedulerOptions["agent"];
 	readonly #settings: TaskSchedulerOptions["settings"];
 	readonly #env: TaskSchedulerOptions["env"];
@@ -190,7 +214,10 @@ export class TaskScheduler {
 	readonly #taskWaiters = new Waiters<TaskId, SettledTask<JsonValue>>();
 	/** Idle waiters by conversation; `undefined` waits for the whole Harness. */
 	readonly #idleWaiters = new Waiters<ConversationId | undefined, void>();
+	/** Original activation-local failures; snapshots and incident identity remain in durable task/history. */
+	readonly #failureErrors = new Map<EntryId, unknown>();
 	/** Definition whose migration failed per task; retried only once the registry resolves another definition. */
+	readonly #blocked = new Set<TaskId>();
 	readonly #failedMigrations = new Map<TaskId, { readonly task: AnyTask; readonly error: unknown }>();
 	/** Owner task of each loaded conversation, `null` when ownerless. */
 	readonly #edges = new Map<ConversationId, TaskId | null>();
@@ -208,19 +235,27 @@ export class TaskScheduler {
 	#unsubscribeRegistry: () => void = () => {};
 	#enabled = false;
 	#closing = false;
+	#closeReason: unknown = closedError();
 	#dirty = false;
 	#draining = false;
+	#remainingStarts = 0;
+	#wakeTimer: ReturnType<typeof setTimeout> | undefined;
+	#publication: Promise<void> = Promise.resolve();
+	readonly #publishWake: TaskSchedulerOptions["publishWake"];
 
 	constructor(options: TaskSchedulerOptions) {
 		this.#session = options.session;
 		this.#storage = options.storage;
 		this.#registry = options.registry;
 		this.#models = options.models;
+		this.#modelRequests =
+			options.modelRequests ?? (async () => ({ status: "ready", options: {}, close: async () => {} }));
 		this.#agent = options.agent;
 		this.#settings = options.settings;
 		this.#env = options.env;
 		this.#now = options.now;
 		this.#report = options.report;
+		this.#publishWake = options.publishWake;
 		this.#settleOutcome = options.settleOutcome;
 		this.#withdrawInputs = options.withdrawInputs;
 		this.#conversation = options.conversation;
@@ -231,7 +266,10 @@ export class TaskScheduler {
 	async open(context: Context): Promise<void> {
 		this.#session.subscribeCommits((publication) => this.#observe(publication));
 		this.#session.subscribeClose(() => this.#seal());
-		this.#unsubscribeRegistry = this.#registry.subscribe(() => this.#kick());
+		this.#unsubscribeRegistry = this.#registry.subscribe(() => {
+			this.#blocked.clear();
+			this.#kick();
+		});
 		await this.#session.commitWith(async (tx) => {
 			// Every table read before the first write.
 			const scans = [];
@@ -244,7 +282,11 @@ export class TaskScheduler {
 					if (record.state.status === "running") {
 						tx.setTask(withState(record, { status: "pending", checkpoint: record.state.checkpoint }));
 					}
-					if (record.state.status === "waiting" && record.state.policy === "failFast") {
+					if (
+						record.state.status === "waiting" &&
+						record.state.condition.kind === "tasks" &&
+						record.state.condition.policy === "failFast"
+					) {
 						this.#failFastChecks.add(record.id);
 					}
 				}
@@ -258,7 +300,131 @@ export class TaskScheduler {
 	/** Enable scheduling. Idempotent; the kick does nothing once closing. */
 	resume(): void {
 		this.#enabled = true;
+		this.#remainingStarts = SCAN_PAGE_SIZE;
 		this.#kick();
+	}
+
+	/** Derive the schedule from the final task/input/receipt candidates on the Session line. */
+	async prepare(tx: Transaction): Promise<void> {
+		const live = new Map(this.#live);
+		for (const record of tx.stagedTasks()) {
+			if (record.state.status === "terminal") live.delete(record.id);
+			else live.set(record.id, record);
+		}
+		const overlay = overlayOf(tx);
+		await this.#loadScopes(false);
+		for (const record of tx.stagedTasks()) await this.#loadChain(parentOf(record), overlay);
+		const owned = this.#ownedLive(overlay);
+		let wakeAt: number | null = null;
+		for (const record of live.values()) {
+			const state = record.state;
+			if (state.status === "completing") continue;
+			if (record.abortRequested && owned.has(record.id)) continue;
+			if (!record.abortRequested && this.#blocked.has(record.id)) continue;
+			let at: number | null = null;
+			if (record.abortRequested && !(state.status === "waiting" && state.mode === "abort")) at = 0;
+			else if (state.status !== "waiting") at = 0;
+			else
+				switch (state.condition.kind) {
+					case "failure":
+						break;
+					case "registry":
+						if (state.condition.after !== this.#registry.snapshot().revision) at = 0;
+						break;
+					case "time":
+						at = state.condition.until;
+						break;
+					case "tasks":
+						if (state.condition.on.every((id) => !live.has(id))) at = 0;
+						break;
+					case "receipt": {
+						const receipt = await tx.doc(ReceiptDoc, state.condition.key, null);
+						if (receipt.admitted && receipt.binding === state.condition.binding && receipt.result !== undefined)
+							at = 0;
+						break;
+					}
+					case "input": {
+						const condition = state.condition;
+						if (
+							tx
+								.stagedEntries()
+								.some(
+									(entry) =>
+										entry.conversationId === condition.conversationId &&
+										entry.id > condition.after &&
+										condition.kinds.includes(entry.kind),
+								) ||
+							(await this.#conditionReady(tx, record))
+						)
+							at = 0;
+						break;
+					}
+				}
+			if (at !== null && (wakeAt === null || at < wakeAt)) wakeAt = at;
+		}
+		const existing = await tx.docIfPresent(WakeDoc);
+		if (existing === undefined && wakeAt === null) return;
+		const schedule = existing ?? (await tx.doc(WakeDoc));
+		if (schedule.wakeAt !== wakeAt) {
+			if (!Number.isSafeInteger(schedule.revision + 1)) throw new Error("Wake revision exhausted");
+			schedule.revision++;
+			schedule.wakeAt = wakeAt;
+		}
+	}
+
+	/** Serialized transport outside the mutation line; failures leave the publication durably pending. */
+	async flushWake(context: Context): Promise<WakeSchedule> {
+		const perform = async () => {
+			const schedule = await this.#session.snapshot(WakeDoc, context);
+			const projection = { revision: schedule?.revision ?? 0, wakeAt: schedule?.wakeAt ?? null };
+			if (this.#closing || (!this.#publishWake && !this.#enabled)) return projection;
+			if (this.#publishWake) await this.#publishWake(projection);
+			else {
+				if (this.#wakeTimer !== undefined) clearTimeout(this.#wakeTimer);
+				this.#wakeTimer = undefined;
+				if (
+					this.#enabled &&
+					projection.wakeAt !== null &&
+					(projection.wakeAt !== 0 || this.#remainingStarts === 0)
+				) {
+					const until = projection.wakeAt;
+					const wake = (): void => {
+						const remaining = until - this.#now();
+						if (remaining > 0) this.#wakeTimer = setTimeout(wake, Math.min(MAX_TIMER_DELAY, remaining));
+						else {
+							this.#wakeTimer = undefined;
+							this.resume();
+						}
+					};
+					this.#wakeTimer = setTimeout(wake, Math.max(0, Math.min(MAX_TIMER_DELAY, until - this.#now())));
+				}
+			}
+			if (this.#closing) return projection;
+			if (schedule === undefined) return projection;
+			await this.#session.commitWith(async (tx) => {
+				const current = await tx.doc(WakeDoc);
+				if (current.revision === projection.revision) current.publishedRevision = projection.revision;
+			}, context);
+			return projection;
+		};
+		const result = this.#publication.then(perform);
+		this.#publication = result.then(
+			() => {},
+			() => {},
+		);
+		return result;
+	}
+
+	async runPass(context: Context): Promise<WakeSchedule> {
+		this.resume();
+		for (;;) {
+			context.abortSignal?.throwIfAborted();
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			await Promise.all([...this.#invocations.values()].map((invocation) => invocation.done));
+			if (this.#closing) throw this.#closeReason;
+			if (!this.#draining && this.#invocations.size === 0 && (!this.#dirty || this.#remainingStarts === 0)) break;
+		}
+		return this.flushWake(context);
 	}
 
 	/** Wait for every invocation signalled by `#seal()`. Writes nothing. */
@@ -267,9 +433,8 @@ export class TaskScheduler {
 	}
 
 	/**
-	 * Commit the abort mark, or settle a task that no registered definition can take as `orphaned` when nothing it owns
-	 * is live, then join the run invocation seen on the line; the commit listener signalled it. The abort invocation
-	 * starts once the task's ordinary owned work is gone. A `completing` task is only marked.
+	 * Commit the abort mark and join the active run. Missing cleanup code and failed cleanup remain owned; a repeat
+	 * cancellation is not permission to retry a failed attempt. Cleanup starts after ordinary owned work drains.
 	 */
 	async abort(id: TaskId, context: Context): Promise<"marked" | "terminal"> {
 		const marked = await this.#session.commitWith(async (tx) => {
@@ -277,16 +442,6 @@ export class TaskScheduler {
 			if (current === undefined) throw new Error(`Task ${id} does not exist`);
 			if (current.state.status === "terminal") return { result: "terminal" as const };
 			const invocation = this.#invocations.get(id);
-			if (invocation === undefined && current.state.status !== "completing") {
-				await this.#loadScopes(false);
-				if (!this.#ownedLive().has(id)) {
-					const resolution = this.#resolve(current as RunnableTaskRecord, this.#registry.snapshot());
-					if (resolution.kind === "blocked") {
-						await this.#terminate(tx, current, { status: "orphaned", reason: resolution.reason });
-						return { result: "marked" as const };
-					}
-				}
-			}
 			if (!current.abortRequested) tx.setTask({ ...current, abortRequested: true });
 			return { result: "marked" as const, run: invocation?.mode === "run" ? invocation : undefined };
 		}, context);
@@ -295,11 +450,37 @@ export class TaskScheduler {
 		return marked.result;
 	}
 
+	/** The exact incident is the repair identity; replay cannot retry a subsequent failure. */
+	async retry(id: TaskId, incident: EntryId, context: Context): Promise<"queued" | "stale" | "terminal"> {
+		const result = await this.#session.commitWith(async (tx) => {
+			const current = await tx.task(id);
+			if (current === undefined) throw new Error(`Task ${id} does not exist`);
+			if (current.state.status === "terminal") return "terminal" as const;
+			if (
+				current.state.status !== "waiting" ||
+				(current.state.mode === "abort") !== current.abortRequested ||
+				current.state.condition.kind !== "failure" ||
+				current.state.condition.incident !== incident
+			)
+				return "stale" as const;
+			tx.setTask(withState(current, { status: "pending", checkpoint: current.state.checkpoint }));
+			return "queued" as const;
+		}, context);
+		if (result === "queued") this.resume();
+		return result;
+	}
+
 	async waitForTask(id: TaskId, context: Context): Promise<SettledTask<JsonValue>> {
 		// Check and register on the line so no terminal publication falls between them.
 		const found = await this.#session.readOnLine(async () => {
-			if (this.#closing) throw closedError();
-			if (this.#live.has(id)) return { promise: this.#taskWaiters.add(id, context) };
+			if (this.#closing) throw this.#closeReason;
+			if (this.#live.has(id)) {
+				await this.#loadScopes(false);
+				const failure = this.#taskFailure(id);
+				return {
+					promise: failure === undefined ? this.#taskWaiters.add(id, context) : Promise.reject(failure.error),
+				};
+			}
 			const record = await this.#storage.task(id, context);
 			if (record === undefined) throw new Error(`Task ${id} does not exist`);
 			return { promise: Promise.resolve(record as SettledTask<JsonValue>) };
@@ -312,10 +493,17 @@ export class TaskScheduler {
 	 * non-background task.
 	 */
 	waitForIdle(conversationId: ConversationId | undefined, context: Context): Promise<void> {
-		if (this.#closing) return Promise.reject(closedError());
-		if (this.#idle(conversationId)) return Promise.resolve();
-		this.#scheduleReconcile();
-		return this.#idleWaiters.add(conversationId, context);
+		return this.#session
+			.readOnLine(async () => {
+				if (this.#closing) throw this.#closeReason;
+				await this.#loadScopes(false);
+				const failure = this.#scopeFailure(conversationId);
+				if (failure !== undefined) return { promise: Promise.reject<void>(failure.error) };
+				if (this.#idle(conversationId)) return { promise: Promise.resolve() };
+				this.#scheduleReconcile();
+				return { promise: this.#idleWaiters.add(conversationId, context) };
+			})
+			.then(({ promise }) => promise);
 	}
 
 	/**
@@ -346,14 +534,49 @@ export class TaskScheduler {
 	// ─── Scheduling ────────────────────────────────────────────────────────
 
 	#observe(publication: CommitPublication): void {
+		if (
+			publication.changes.some(
+				(change) =>
+					change.type === "document" &&
+					change.record.kind === WakeDoc.definition.kind &&
+					change.value !== null &&
+					change.value.revision !== change.value.publishedRevision,
+			)
+		) {
+			queueMicrotask(() => {
+				if (!this.#closing) void this.flushWake(this.#context).catch(this.#report);
+			});
+		}
+		// Transport acknowledgements do not constitute new semantic work or retry a rejected transition.
+		if (
+			publication.changes.every(
+				(change) => change.type === "document" && change.record.kind === WakeDoc.definition.kind,
+			)
+		)
+			return;
 		const updated: AnyTaskRecord[] = [];
 		const failed: TaskId[] = [];
 		let changed = false;
 		for (const change of publication.changes) {
-			if (change.type !== "task") continue;
+			if (change.type !== "task") {
+				if (
+					change.type === "entry" ||
+					(change.type === "document" && change.record.kind !== WakeDoc.definition.kind)
+				)
+					changed = true;
+				continue;
+			}
 			changed = true;
 			const record = change.value;
 			const previous = this.#live.get(record.id);
+			if (
+				previous?.state.status === "waiting" &&
+				previous.state.condition.kind === "failure" &&
+				(record.state.status !== "waiting" ||
+					record.state.condition.kind !== "failure" ||
+					record.state.condition.incident !== previous.state.condition.incident)
+			)
+				this.#failureErrors.delete(previous.state.condition.incident);
 			if (failedOutcome(record) && (previous === undefined || !failedOutcome(previous))) failed.push(record.id);
 			if (record.state.status === "terminal") {
 				this.#live.delete(record.id);
@@ -376,17 +599,28 @@ export class TaskScheduler {
 				if (cancellationIntent(record)) this.#cascadePending = true;
 				this.#scheduleReconcile();
 			}
-			if (status === "waiting" && record.state.policy === "failFast" && previous?.state.status !== "waiting") {
+			if (
+				status === "waiting" &&
+				record.state.condition.kind === "tasks" &&
+				record.state.condition.policy === "failFast" &&
+				previous?.state.status !== "waiting"
+			) {
 				this.#failFastChecks.add(record.id);
 				this.#scheduleReconcile();
 			}
+			if (record.state.status === "running") this.#live.delete(record.id);
 			this.#live.set(record.id, record);
 			updated.push(record);
 		}
 		for (const id of failed) {
 			for (const record of this.#live.values()) {
 				const state = record.state;
-				if (state.status === "waiting" && state.policy === "failFast" && state.on.includes(id)) {
+				if (
+					state.status === "waiting" &&
+					state.condition.kind === "tasks" &&
+					state.condition.policy === "failFast" &&
+					state.condition.on.includes(id)
+				) {
 					this.#failFastChecks.add(record.id);
 					this.#scheduleReconcile();
 				}
@@ -419,9 +653,52 @@ export class TaskScheduler {
 	}
 
 	#resolveIdleWaiters(): void {
-		for (const conversationId of this.#idleWaiters.keys()) {
-			if (this.#idle(conversationId)) this.#idleWaiters.resolve(conversationId);
+		for (const id of this.#taskWaiters.keys()) {
+			const failure = this.#taskFailure(id);
+			if (failure !== undefined) this.#taskWaiters.reject(id, failure.error);
 		}
+		for (const conversationId of this.#idleWaiters.keys()) {
+			const failure = this.#scopeFailure(conversationId);
+			if (failure !== undefined) this.#idleWaiters.reject(conversationId, failure.error);
+			else if (this.#idle(conversationId)) this.#idleWaiters.resolve(conversationId);
+		}
+	}
+
+	#invocationFailure(record: AnyTaskRecord): { error: unknown } | undefined {
+		// Cancellation supersedes the run incident, not a subsequent failure of cleanup.
+		if (record.abortRequested && record.state.status === "waiting" && record.state.mode === "run") return undefined;
+		if (record.state.status !== "waiting" || record.state.condition.kind !== "failure") return undefined;
+		const { incident, error } = record.state.condition;
+		return {
+			error: this.#failureErrors.has(incident)
+				? this.#failureErrors.get(incident)
+				: new Error(error.message, error.detail === undefined ? undefined : { cause: error.detail }),
+		};
+	}
+
+	#taskFailure(id: TaskId): { error: unknown } | undefined {
+		for (const record of this.#live.values()) {
+			const failure = this.#invocationFailure(record);
+			if (failure === undefined) continue;
+			if (record.id === id) return failure;
+			if (record.background) continue;
+			for (const step of this.#above(parentOf(record))) {
+				if (!("task" in step)) continue;
+				if (step.task === id) return failure;
+				if (step.node.background) break;
+			}
+		}
+		return undefined;
+	}
+
+	#scopeFailure(conversationId: ConversationId | undefined): { error: unknown } | undefined {
+		const scope: Scope = conversationId === undefined ? { roots: true } : { conversation: conversationId };
+		for (const record of this.#live.values()) {
+			if (record.background || this.#inScope(parentOf(record), scope) === false) continue;
+			const failure = this.#invocationFailure(record);
+			if (failure !== undefined) return failure;
+		}
+		return undefined;
 	}
 
 	// ─── Ownership ───────────────────────────────────────────────────────────
@@ -460,9 +737,14 @@ export class TaskScheduler {
 				}
 				for (const id of checks) {
 					const waiter = this.#live.get(id);
-					if (waiter?.state.status !== "waiting" || !(await this.#anyFailed(waiter.state.on))) continue;
+					if (
+						waiter?.state.status !== "waiting" ||
+						waiter.state.condition.kind !== "tasks" ||
+						!(await this.#anyFailed(waiter.state.condition.on))
+					)
+						continue;
 					// Every other live task: the failed one keeps its own outcome.
-					for (const member of waiter.state.on) {
+					for (const member of waiter.state.condition.on) {
 						const record = this.#live.get(member);
 						if (record !== undefined && !failedOutcome(record)) mark(record);
 					}
@@ -663,10 +945,13 @@ export class TaskScheduler {
 	}
 
 	/** Close listener: runs synchronously once admission is sealed, before `join()`. */
-	#seal(): void {
+	#seal(error: unknown = closedError()): void {
+		if (this.#closing) return;
+		this.#closeReason = error;
 		this.#closing = true;
+		if (this.#wakeTimer !== undefined) clearTimeout(this.#wakeTimer);
+		this.#wakeTimer = undefined;
 		this.#unsubscribeRegistry();
-		const error = closedError();
 		this.#taskWaiters.rejectAll(error);
 		this.#idleWaiters.rejectAll(error);
 		for (const invocation of this.#invocations.values()) invocation.controller.abort();
@@ -674,7 +959,7 @@ export class TaskScheduler {
 
 	#kick(): void {
 		this.#dirty = true;
-		if (this.#draining || !this.#enabled || this.#closing) return;
+		if (this.#draining || !this.#enabled || this.#closing || this.#remainingStarts === 0) return;
 		this.#draining = true;
 		// Never commit synchronously from a commit or registry listener.
 		queueMicrotask(() => void this.#drain());
@@ -682,7 +967,7 @@ export class TaskScheduler {
 
 	async #drain(): Promise<void> {
 		try {
-			while (this.#dirty && this.#enabled && !this.#closing) {
+			while (this.#dirty && this.#enabled && !this.#closing && this.#remainingStarts > 0) {
 				this.#dirty = false;
 				for (const reservation of await this.#reserve()) this.#start(reservation);
 			}
@@ -695,7 +980,7 @@ export class TaskScheduler {
 		}
 	}
 
-	/** Reserve every eligible task in one commit; orphan abort-marked tasks no definition can take. */
+	/** Reserve eligible tasks; unavailable cleanup code parks without discarding ownership. */
 	async #reserve(): Promise<Reservation[]> {
 		const reservations: Reservation[] = [];
 		try {
@@ -706,7 +991,13 @@ export class TaskScheduler {
 				// Taken once per pass, and only when some task is a candidate.
 				let snapshot: RegistrySnapshot | undefined;
 				for (const record of [...this.#live.values()]) {
+					if (this.#remainingStarts === 0) break;
 					if (this.#invocations.has(record.id) || this.#waitingOn(record, owned).length > 0) continue;
+					if (
+						(!record.abortRequested || (record.state.status === "waiting" && record.state.mode === "abort")) &&
+						!(await this.#conditionReady(tx, record))
+					)
+						continue;
 					if (record.state.status === "completing") continue;
 					const runnable = record as RunnableTaskRecord;
 					const mode = record.abortRequested ? "abort" : "run";
@@ -714,7 +1005,18 @@ export class TaskScheduler {
 					const resolution = this.#resolve(runnable, snapshot);
 					if (resolution.kind === "blocked") {
 						if (mode === "abort") {
-							await this.#terminate(tx, record, { status: "orphaned", reason: resolution.reason });
+							tx.setTask(
+								withState(record, {
+									status: "waiting",
+									checkpoint: runnable.state.checkpoint,
+									mode: "abort",
+									condition: {
+										kind: "registry",
+										after: snapshot.revision,
+										reason: { code: resolution.reason, task: record.kind, version: record.version },
+									},
+								}),
+							);
 						}
 						continue;
 					}
@@ -729,6 +1031,7 @@ export class TaskScheduler {
 					// Registered on the line, so marks and later reservations see it and close joins it.
 					const invocation = this.#createInvocation(record, mode);
 					reservations.push({ invocation, task: resolution.task, snapshot });
+					this.#remainingStarts--;
 				}
 			}, this.#context);
 		} catch (error) {
@@ -747,14 +1050,51 @@ export class TaskScheduler {
 	 */
 	#waitingOn(record: AnyTaskRecord, owned: ReadonlyMap<TaskId, readonly TaskId[]>): readonly TaskId[] {
 		if (record.abortRequested) return owned.get(record.id) ?? [];
-		if (record.state.status !== "waiting") return [];
-		return record.state.on.filter((id) => this.#live.has(id));
+		if (record.state.status !== "waiting" || record.state.condition.kind !== "tasks") return [];
+		return record.state.condition.on.filter((id) => this.#live.has(id));
+	}
+
+	async #conditionReady(tx: Transaction, record: AnyTaskRecord): Promise<boolean> {
+		if (record.state.status !== "waiting") return true;
+		const condition = record.state.condition;
+		switch (condition.kind) {
+			case "failure":
+				return false;
+			case "registry":
+				return condition.after !== this.#registry.snapshot().revision;
+			case "tasks":
+				return condition.on.every((id) => !this.#live.has(id));
+			case "time":
+				return this.#now() >= condition.until;
+			case "receipt": {
+				const receipt = await tx.doc(ReceiptDoc, condition.key, null);
+				return receipt.admitted && receipt.binding === condition.binding && receipt.result !== undefined;
+			}
+			case "input": {
+				const entries = await scanAll((cursor) =>
+					this.#storage.scanEntries(
+						{
+							conversationId: condition.conversationId,
+							minEntryId: condition.after,
+						},
+						SCAN_PAGE_SIZE,
+						cursor,
+						this.#context,
+					),
+				);
+				return entries.some((entry) => entry.id > condition.after && condition.kinds.includes(entry.kind));
+			}
+		}
 	}
 
 	/** Resolve the record's definition by kind, migrating an older stored version. */
 	#resolve(record: RunnableTaskRecord, snapshot: RegistrySnapshot): Resolution {
 		const fit = this.#fit(record, snapshot.task(record.kind));
-		if ("reason" in fit) return { kind: "blocked", reason: fit.reason };
+		if ("reason" in fit) {
+			this.#blocked.add(record.id);
+			return { kind: "blocked", reason: fit.reason };
+		}
+		this.#blocked.delete(record.id);
 		if (!fit.migrates) return { kind: "ready", task: fit.task, record };
 		const definition = erased(fit.task);
 		try {
@@ -765,6 +1105,7 @@ export class TaskScheduler {
 			return { kind: "ready", task: fit.task, record: migratedRecord as RunnableTaskRecord };
 		} catch (error) {
 			this.#failedMigrations.set(record.id, { task: fit.task, error });
+			this.#blocked.add(record.id);
 			this.#report(error);
 			return { kind: "blocked", reason: "migration_failed" };
 		}
@@ -792,7 +1133,20 @@ export class TaskScheduler {
 		const owned = this.#ownedLive();
 		const tasks: TaskInspection[] = [];
 		for (const record of this.#live.values()) {
-			tasks.push({ record, state: this.#inspectTask(record, snapshot, owned) });
+			let state = this.#inspectTask(record, snapshot, owned);
+			if (
+				record.state.status === "waiting" &&
+				(!record.abortRequested || record.state.mode === "abort") &&
+				record.state.condition.kind !== "tasks"
+			) {
+				if (record.state.condition.kind === "failure")
+					state = { kind: "blocked", reason: "invocation_failed", error: record.state.condition.error };
+				else if (record.state.condition.kind === "registry" && record.state.condition.after === snapshot.revision)
+					state = { kind: "blocked", reason: "incompatible_binding", error: record.state.condition.reason };
+				else if (record.state.condition.kind !== "time" || this.#now() < record.state.condition.until)
+					state = { kind: "waiting", on: [], condition: record.state.condition };
+			}
+			tasks.push({ record, state });
 		}
 		const scheduling = this.#closing ? "closing" : this.#enabled ? "running" : "paused";
 		return { scheduling, tasks };
@@ -807,6 +1161,13 @@ export class TaskScheduler {
 		if (record.state.status === "completing") return { kind: "completing" };
 		const on = this.#waitingOn(record, owned);
 		if (on.length > 0) return { kind: "waiting", on };
+		if (
+			record.state.status === "waiting" &&
+			record.state.condition.kind !== "tasks" &&
+			(!record.abortRequested || record.state.mode === "abort") &&
+			(record.state.condition.kind !== "time" || record.state.condition.until > this.#now())
+		)
+			return { kind: "waiting", on: [], condition: record.state.condition };
 		const fit = this.#fit(record, snapshot.task(record.kind));
 		if ("reason" in fit) return { kind: "blocked", ...fit };
 		if (fit.migrates && fit.task.definition.migrate === undefined) {
@@ -825,6 +1186,7 @@ export class TaskScheduler {
 			controller,
 			context: withAbortSignal(controller.signal, this.#context),
 			watches: new Set(),
+			modelRequests: new Set(),
 			ended: false,
 			done,
 			finish: () => finish(),
@@ -843,8 +1205,11 @@ export class TaskScheduler {
 				this.#report(error);
 			} finally {
 				this.#end(invocation);
+				await Promise.allSettled([...invocation.modelRequests]);
+				if (this.#invocations.get(invocation.taskId) === invocation) this.#invocations.delete(invocation.taskId);
 				invocation.finish();
 				this.#kick();
+				if (!this.#closing && this.#invocations.size === 0) void this.flushWake(this.#context).catch(this.#report);
 			}
 		})();
 	}
@@ -856,8 +1221,16 @@ export class TaskScheduler {
 		const phase: Phase = { snapshot: () => state.snapshot, task: () => state.task, agent: undefined };
 		const runtime = this.#runtime(invocation, phase);
 		let previous: PhaseResult | undefined;
+		let phases = 0;
 		for (;;) {
-			const current = await this.#step(invocation, (tx, current) => this.#decide(tx, current, previous, state));
+			const current = await this.#step(invocation, (tx, current) => {
+				const decision = this.#decide(tx, current, previous, state);
+				if (decision === true && phases >= 64) {
+					tx.setTask(withState(current, { status: "pending", checkpoint: current.state.checkpoint }));
+					return false;
+				}
+				return decision;
+			});
 			// Close may seal between the decision and dispatch.
 			if (current === undefined || this.#closing) return;
 			const checkpoint = current.state.checkpoint;
@@ -865,6 +1238,9 @@ export class TaskScheduler {
 			phase.agent = undefined;
 			try {
 				await erased(state.task).phases[checkpoint.phase]!(current, runtime, invocation.context);
+				if (invocation.modelRequests.size > 0)
+					throw new Error(`Task ${invocation.taskId} phase returned with an unjoined model request`);
+				phases++;
 				previous = { checkpoint };
 			} catch (error) {
 				previous = { checkpoint, failure: { error } };
@@ -911,7 +1287,7 @@ export class TaskScheduler {
 		return true;
 	}
 
-	/** Run the abort handler once; rules 1, 2, and 4 apply, and returning without an outcome faults. */
+	/** Run cleanup once; failure retains its checkpoint rather than manufacturing a terminal outcome. */
 	async #runAbort(reservation: Reservation): Promise<void> {
 		const invocation = reservation.invocation;
 		const current = this.#live.get(invocation.taskId) as ErasedRunningTask | undefined;
@@ -921,11 +1297,13 @@ export class TaskScheduler {
 			const phase: Phase = { snapshot: () => reservation.snapshot, task: () => reservation.task, agent: undefined };
 			const runtime = this.#runtime(invocation, phase);
 			await erased(reservation.task).abort(current, runtime, invocation.context);
+			if (invocation.modelRequests.size > 0)
+				throw new Error(`Abort handler of task ${invocation.taskId} returned with an unjoined model request`);
 		} catch (error) {
 			failure = { error };
 		}
 		const message = `Abort handler of task ${invocation.taskId} returned without a terminal outcome`;
-		await this.#step(invocation, () => ({ fault: failure?.error ?? new Error(message) }));
+		await this.#step(invocation, { park: failure?.error ?? new Error(message) });
 	}
 
 	/**
@@ -936,23 +1314,59 @@ export class TaskScheduler {
 	 */
 	async #step(
 		invocation: Invocation,
-		decide: (tx: Transaction, current: ErasedRunningTask) => Decision,
+		decide: ((tx: Transaction, current: ErasedRunningTask) => Decision) | FailureDecision,
 	): Promise<ErasedRunningTask | undefined> {
+		let recordedFailure: { incident: EntryId; error: unknown } | undefined;
 		try {
-			return await this.#session.commitWith(async (tx) => {
+			const result = await this.#session.commitWith(async (tx) => {
 				const found = this.#live.get(invocation.taskId);
 				const current = found?.state.status === "running" ? (found as ErasedRunningTask) : undefined;
-				const decision = current !== undefined && !this.#closing ? decide(tx, current) : false;
+				const decision =
+					current !== undefined && !this.#closing && !(invocation.mode === "run" && current.abortRequested)
+						? typeof decide === "function"
+							? decide(tx, current)
+							: decide
+						: false;
 				if (decision === true) return current;
-				this.#end(invocation);
+				this.#end(invocation, decision !== false && "park" in decision ? decision.park : endedError(invocation));
 				if (decision !== false) {
-					const message = decision.fault instanceof Error ? decision.fault.message : String(decision.fault);
-					await this.#terminate(tx, current!, { status: "faulted", error: { message } });
+					const failure = "park" in decision ? decision.park : decision.fault;
+					const error = snapshotError(failure);
+					if ("park" in decision) {
+						if (invocation.modelRequests.size > 0)
+							throw new Error(`Task ${invocation.taskId} cannot suspend before its model requests join`);
+						const checkpoint = (await decision.change?.(tx, current!)) ?? current!.state.checkpoint;
+						const incident = await tx.appendEntry(FailureEntry, current!.conversationId, {
+							data: { taskId: current!.id, error },
+						});
+						recordedFailure = { incident: incident.id, error: failure };
+						this.#failureErrors.set(incident.id, failure);
+						tx.setTask(
+							withState(current!, {
+								status: "waiting",
+								mode: invocation.mode,
+								checkpoint,
+								condition: { kind: "failure", incident: incident.id, error },
+							}),
+						);
+					} else await this.#terminate(tx, current!, { status: "faulted", error });
 				}
 				return undefined;
 			}, this.#context);
+			if (recordedFailure !== undefined) this.#report(recordedFailure.error);
+			return result;
 		} catch (error) {
 			this.#end(invocation);
+			if (this.#closing) return undefined;
+			if (typeof decide !== "function") {
+				if (recordedFailure !== undefined) this.#failureErrors.delete(recordedFailure.incident);
+				// The old checkpoint remains the only durable truth. Stop dispatch rather than automatically retrying
+				// cleanup whose failure could not be recorded.
+				const failure = new AggregateError([decide.park, error], "Invocation failure could not be committed");
+				this.#seal(failure);
+				this.#report(failure);
+				return undefined;
+			}
 			if (!this.#closing) this.#report(error);
 			return undefined;
 		}
@@ -983,7 +1397,30 @@ export class TaskScheduler {
 		current: ErasedRunningTask,
 		next: NextTaskState<Checkpoint, JsonValue>,
 	): Promise<void> {
-		if (next.status === "waiting") await this.#validateWait(tx, invocation, current, next.on, next.policy);
+		if (next.status !== "running" && invocation.modelRequests.size > 0)
+			throw new Error(`Task ${invocation.taskId} cannot settle or suspend before its model requests join`);
+		if (next.status === "waiting") {
+			const condition = next.condition;
+			if (condition.kind === "failure") throw new Error("Failure waits are owned by the scheduler");
+			if (condition.kind === "tasks")
+				await this.#validateWait(tx, invocation, current, condition.on, condition.policy);
+			else {
+				if (condition.kind === "registry" && !condition.after)
+					throw new Error("Registry wait must name a publication");
+				if (condition.kind === "time" && !Number.isSafeInteger(condition.until))
+					throw new Error("Invalid wait time");
+				if (condition.kind === "receipt") {
+					const receipt = await tx.doc(ReceiptDoc, condition.key, null);
+					if (!receipt.admitted || receipt.binding !== condition.binding)
+						throw new Error("Wait receipt has no matching admission");
+				}
+				if (
+					condition.kind === "input" &&
+					(!condition.kinds.length || condition.conversationId !== current.conversationId)
+				)
+					throw new Error("Input wait must name eligible kinds in the task's own conversation");
+			}
+		}
 		if (next.status === "terminal") {
 			const overlay = overlayOf(tx);
 			await this.#loadScopes(false);
@@ -993,7 +1430,7 @@ export class TaskScheduler {
 				return;
 			}
 		}
-		tx.setTask(withState(current, next));
+		tx.setTask(withState(current, next.status === "waiting" ? { ...next, mode: invocation.mode } : next));
 	}
 
 	/**
@@ -1025,13 +1462,12 @@ export class TaskScheduler {
 	}
 
 	/** End an invocation: its runtime operations reject from now on, its signal aborts, its watches stop, and its task is free. */
-	#end(invocation: Invocation): void {
+	#end(invocation: Invocation, reason: unknown = endedError(invocation)): void {
 		if (invocation.ended) return;
 		invocation.ended = true;
-		if (this.#invocations.get(invocation.taskId) === invocation) this.#invocations.delete(invocation.taskId);
 		for (const watch of invocation.watches) void watch.stop();
 		// Pending waits bound to the invocation, such as a tool's waitForTask(), reject with it.
-		invocation.controller.abort(endedError(invocation));
+		invocation.controller.abort(reason);
 	}
 
 	/** No live non-background task in the scope; a task whose owner edges are not loaded yet counts as inside. */
@@ -1076,6 +1512,20 @@ export class TaskScheduler {
 			conversationId: invocation.conversationId,
 			signal: invocation.controller.signal,
 			models: this.#models,
+			withModelRequest: (request, dispatch, context) => {
+				const owned = this.#withModelRequest(invocation, phase, request, dispatch, context);
+				invocation.modelRequests.add(owned);
+				void owned.then(
+					() => invocation.modelRequests.delete(owned),
+					() => invocation.modelRequests.delete(owned),
+				);
+				return owned;
+			},
+			parkFailure: async (error, context, change) => {
+				context.abortSignal?.throwIfAborted();
+				if (invocation.ended) throw endedError(invocation);
+				await this.#step(invocation, { park: error, change });
+			},
 			agent: (context) =>
 				invocation.ended ? Promise.reject(endedError(invocation)) : awaitWithContext(agent(), context),
 			get settings() {
@@ -1180,6 +1630,93 @@ export class TaskScheduler {
 		};
 	}
 
+	/** Resolve capabilities outside the mutation line, then join the acquired connection on every exit. */
+	async #withModelRequest<T>(
+		invocation: Invocation,
+		phase: Phase,
+		request: ModelRequestInput,
+		dispatch: (
+			capabilities: ModelRequestCapabilities,
+			signal: AbortSignal,
+			prepared: ModelRequestTarget,
+		) => Promise<T>,
+		context: Context,
+	): Promise<ModelRequestResult<T>> {
+		if (invocation.ended) throw endedError(invocation);
+		const signal =
+			context.abortSignal === undefined
+				? invocation.controller.signal
+				: AbortSignal.any([invocation.controller.signal, context.abortSignal]);
+		signal.throwIfAborted();
+		const definition = phase.task().definition;
+		const target: ModelRequestTarget = pinJson({
+			...request,
+			taskId: invocation.taskId,
+			conversationId: invocation.conversationId,
+			taskKind: definition.name,
+			taskVersion: definition.version,
+		});
+		let preparedModel = await this.#gated(
+			invocation,
+			(tx) => admitModelRequest(tx, target),
+			withAbortSignal(signal, context),
+		);
+		let active = true;
+		const api: ModelRequestApi = {
+			get prepared() {
+				return preparedModel === undefined ? undefined : pinJson({ ...target, model: preparedModel });
+			},
+			prepare: async (model, prepareContext) => {
+				const candidate = pinJson(model);
+				preparedModel = await api.commit((tx) => prepareModelRequest(tx, target, candidate), prepareContext);
+				return pinJson({ ...target, model: preparedModel });
+			},
+			commit: (change, commitContext) => {
+				if (!active) return Promise.reject(new Error("Model request has ended"));
+				const commitSignal =
+					commitContext.abortSignal === undefined ? signal : AbortSignal.any([signal, commitContext.abortSignal]);
+				return this.#gated(
+					invocation,
+					(tx) => {
+						if (!active) throw new Error("Model request has ended");
+						return change(tx);
+					},
+					withAbortSignal(commitSignal, commitContext),
+				);
+			},
+		};
+		try {
+			const access = await this.#modelRequests(pinJson(target), api, withAbortSignal(signal, context));
+			if (access.status === "waiting") {
+				signal.throwIfAborted();
+				return access;
+			}
+			let outcome:
+				| { readonly status: "completed"; readonly result: T }
+				| { readonly status: "failed"; readonly error: unknown };
+			try {
+				// Close must still join a connection returned after cancellation; it must never be dispatched.
+				signal.throwIfAborted();
+				if (invocation.ended) throw endedError(invocation);
+				const prepared = api.prepared ?? (await api.prepare(target.model, withAbortSignal(signal, context)));
+				outcome = { status: "completed", result: await dispatch(access.options, signal, prepared) };
+			} catch (error) {
+				outcome = { status: "failed", error };
+			}
+			try {
+				await access.close(withoutAbortSignal(context));
+			} catch (error) {
+				if (outcome.status === "failed")
+					throw new AggregateError([outcome.error, error], "Model request and connection cleanup failed");
+				throw error;
+			}
+			if (outcome.status === "failed") throw outcome.error;
+			return outcome;
+		} finally {
+			active = false;
+		}
+	}
+
 	/** Run a committed-state read unless the invocation has ended. */
 	async #read<T>(invocation: Invocation, read: () => Promise<T>): Promise<T> {
 		if (invocation.ended) throw endedError(invocation);
@@ -1196,7 +1733,7 @@ export class TaskScheduler {
 		return this.#session.commitWith(
 			async (tx) => {
 				if (invocation.ended) throw endedError(invocation);
-				if (this.#closing) throw closedError();
+				if (this.#closing) throw this.#closeReason;
 				const found = this.#live.get(invocation.taskId);
 				if (found === undefined) throw new Error(`Task ${invocation.taskId} is terminal`);
 				if (found.state.status !== "running") throw new Error(`Task ${invocation.taskId} is ${found.state.status}`);
@@ -1321,17 +1858,4 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 		}, ms);
 		signal.addEventListener("abort", onAbort, { once: true });
 	});
-}
-
-/** Structural equality of two JSON values; object key order is ignored. */
-function jsonEqual(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
-	if (left === right) return true;
-	if (typeof left !== "object" || typeof right !== "object" || left === null || right === null) return false;
-	if (Array.isArray(left) || Array.isArray(right)) {
-		if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-		return left.every((value, index) => jsonEqual(value, right[index]));
-	}
-	const keys = Object.keys(left);
-	if (keys.length !== Object.keys(right).length) return false;
-	return keys.every((key) => Object.hasOwn(right, key) && jsonEqual(left[key], right[key]));
 }

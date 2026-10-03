@@ -559,7 +559,12 @@ export function createStorageConformance(options: StorageConformanceOptions): re
 			const waiting: StoredTask = {
 				...pendingTask(waitingId, rootId),
 				owner: ownerId,
-				state: { status: "waiting", checkpoint: { phase: "next" }, on: [ownerId], policy: "allSettled" },
+				state: {
+					status: "waiting",
+					mode: "run",
+					checkpoint: { phase: "next" },
+					condition: { kind: "tasks", on: [ownerId], policy: "allSettled" },
+				},
 				memos: { kept: true },
 			};
 			const { state: _state, ...base } = pendingTask(completingId, rootId);

@@ -1,11 +1,12 @@
-import type { Draft, JsonRepresentation, JsonValue } from "@earendil-works/chord";
+import { copyJson, type Draft, type JsonRepresentation, type JsonValue } from "@earendil-works/chord";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { defineDoc } from "../documents.ts";
+import { defineDoc, defineDocFamily } from "../documents.ts";
 import type { Transaction } from "../session/transaction.ts";
 import type { EntryId, SubmissionId, SubmissionSettlement, TaskId, TaskRecord, Tx } from "../types.ts";
 import { convertPartial } from "./generation.ts";
+import { jsonEqual } from "./json.ts";
 import type { SchedulerOutcome } from "./scheduler.ts";
-import type { CompactionReason, CompactionResult, ToolDiagnostic } from "./types.ts";
+import type { CompactionReason, CompactionResult, GenerationRetrySelection, ToolDiagnostic } from "./types.ts";
 
 /** Presentation of one tool call of the current round. */
 export type ToolSlot = {
@@ -43,7 +44,7 @@ export type CompactionStatus = {
 /** Built-in live conversation state: run control and presentation of the current generation and tool round. */
 export type LiveState = {
 	/** Run control: the task that settles the run's inputs, and those inputs; present exactly while busy. */
-	run?: { taskId: TaskId; inputs: SubmissionId[] };
+	run?: { taskId: TaskId; inputs: SubmissionId[]; requestSelection?: GenerationRetrySelection };
 	/** Presentation of the current generation attempt. */
 	generation?: {
 		attempt: number;
@@ -173,3 +174,46 @@ export async function settleSchedulerOutcome(
 			: { status: "unanswered", reason: outcome.reason },
 	);
 }
+
+/** Authenticated delivery evidence, not a mutable mirror of a domain job's status. */
+export const ReceiptDoc = defineDocFamily<{ admitted: boolean; binding: string; result?: JsonValue }, null>({
+	kind: "pi.receipt",
+	version: 1,
+	scope: "session",
+	family: true,
+	initial: () => ({ admitted: false, binding: "" }),
+	checkpointWhen: () => true,
+});
+
+/** Bind before external admission; key and binding identify one immutable operation. */
+export async function bindReceipt(tx: Tx, key: string, binding: string): Promise<void> {
+	if (!key || !binding) throw new Error("Receipt identity must be nonempty");
+	const receipt = await tx.doc(ReceiptDoc, key, null);
+	if (receipt.admitted && receipt.binding !== binding)
+		throw new Error("Receipt identity conflicts with its admission");
+	receipt.admitted = true;
+	receipt.binding = binding;
+}
+
+/** The host must authenticate the domain owner before entering this trusted kernel API. */
+export async function acceptReceipt(tx: Tx, key: string, binding: string, result: JsonValue): Promise<void> {
+	const receipt = await tx.doc(ReceiptDoc, key, null);
+	if (!receipt.admitted || receipt.binding !== binding)
+		throw new Error("Receipt does not match an admitted operation");
+	if (receipt.result !== undefined && !jsonEqual(receipt.result, result)) {
+		throw new Error("Receipt conflicts with the retained terminal outcome");
+	}
+	receipt.result = copyJson(result);
+}
+
+/** Absolute desired host schedule. Revision remains monotonic after clearing. */
+export type WakeSchedule = { revision: number; wakeAt: number | null };
+
+/** Persisted with task transitions, before any external schedule publication. */
+export const WakeDoc = defineDoc<WakeSchedule & { publishedRevision: number }>({
+	kind: "pi.wake",
+	version: 1,
+	scope: "session",
+	initial: () => ({ revision: 0, wakeAt: null, publishedRevision: -1 }),
+	checkpointWhen: () => true,
+});

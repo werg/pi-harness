@@ -123,13 +123,13 @@ const Node = defineTask<NodeInput, NodeCheckpoint, string>({
 	},
 });
 
-/** Never registered: aborting it can only orphan it. */
+/** Initially unavailable: cancellation retains its checkpoint until compatible cleanup is registered. */
 const Unregistered = defineTask<NodeInput, { phase: "run" }, string>({
 	name: "test.unregistered",
 	version: 1,
 	initial: () => ({ phase: "run" }),
 	phases: { run: async () => {} },
-	abort: async () => {},
+	abort: (_task, runtime, ctx) => runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
 });
 
 const TaskNotes = defineDoc<{ text: string }>({
@@ -152,7 +152,11 @@ function spawn(tx: Tx, owner: TaskId, name: string): Promise<TaskId<string>> {
 
 /** Wait on `on`, resuming in round `round`. */
 function waitOn(on: readonly TaskId[], policy: JoinPolicy, round = 1): Next {
-	return { status: "waiting", checkpoint: { phase: "resume", round }, on, policy };
+	return {
+		status: "waiting",
+		checkpoint: { phase: "resume", round },
+		condition: { kind: "tasks", on: on, policy: policy },
+	};
 }
 
 async function start(conversation: Conversation, name: string, options: TaskOptions = OWN_CONVERSATION) {
@@ -336,14 +340,14 @@ function parentOf(parent: string, children: readonly string[], policy: JoinPolic
 
 describe("waiting", () => {
 	it("resumes once every awaited task is terminal and reads their outcomes in order (allSettled)", async () => {
-		const { harness, root } = await openNodes();
+		const { harness, root, registry } = await openNodes();
 		const found = { ids: [] as TaskId[], outcomes: [] as string[] };
 		script("parent", {
 			run: (runtime, ctx) =>
 				runtime.commit(async (tx) => {
 					for (const name of ["ok", "fails", "throws", "aborted"])
 						found.ids.push(await spawn(tx, runtime.taskId, name));
-					found.ids.push(await tx.createTask(Unregistered, { name: "orphan" }, owned(runtime.taskId)));
+					found.ids.push(await tx.createTask(Unregistered, { name: "unavailable" }, owned(runtime.taskId)));
 					return waitOn(found.ids, "allSettled");
 				}, ctx),
 			resume: async (runtime, ctx) => {
@@ -359,8 +363,19 @@ describe("waiting", () => {
 		open("throws", "throw");
 		await harness.abortTask(found.ids[3]!, context);
 		expect(await harness.abortTask(found.ids[4]!, context)).toBe("marked");
+		await harness.runPass(context);
+		expect(await state(harness, found.ids[4]!)).toMatchObject({
+			status: "waiting",
+			mode: "abort",
+			checkpoint: { phase: "run" },
+			condition: { kind: "registry" },
+		});
+		const parentDone = harness.waitForTask(parent, context);
+		expect(await settled(parentDone)).toBe(false);
+		addTask(registry, Unregistered);
+		await parentDone;
 		expect(await outcomeOf(harness, parent)).toBe("completed");
-		expect(found.outcomes).toEqual(["completed", "failed", "faulted", "aborted", "orphaned"]);
+		expect(found.outcomes).toEqual(["completed", "failed", "faulted", "aborted", "aborted"]);
 		// allSettled never marks siblings.
 		expect(log.filter((line) => line.startsWith("abort:"))).toEqual(["abort:aborted"]);
 		await harness.close(context);
@@ -729,32 +744,64 @@ describe("abort order", () => {
 		await harness.close(context);
 	});
 
-	it("faults an abort handler that tries to wait", async () => {
+	it("retains an abort handler's rejected task wait until explicit cleanup repair", async () => {
 		const { harness, root } = await openNodes();
 		script("parent", { abort: (runtime, ctx) => runtime.commit(() => waitOn([], "allSettled"), ctx) });
 		const parent = await start(root, "parent");
 		await until(() => log.includes("run:parent"));
+		await root.commit(async (tx) => {
+			(await tx.doc(TaskNotes, parent)).text = "cleanup notes";
+		}, context);
 		await harness.abortTask(parent, context);
-		expect((await harness.waitForTask(parent, context)).state.outcome).toMatchObject({
-			status: "faulted",
-			error: { message: expect.stringContaining("cannot wait") },
+		await expect(harness.waitForTask(parent, context)).rejects.toThrow("cannot wait");
+		const failed = await state(harness, parent);
+		if (failed.status !== "waiting" || failed.condition.kind !== "failure")
+			throw new Error("Expected retained cleanup failure");
+		expect(failed).toMatchObject({ mode: "abort", checkpoint: { phase: "run" } });
+		expect(await harness.snapshot(TaskNotes, parent, context)).toEqual({ text: "cleanup notes" });
+		script("parent", {
+			abort: (runtime, ctx) => runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
 		});
+		expect(await harness.retryTask(parent, failed.condition.incident, context)).toBe("queued");
+		expect(await outcomeOf(harness, parent)).toBe("aborted");
+		expect(await harness.snapshot(TaskNotes, parent, context)).toBeUndefined();
 		await harness.close(context);
 	});
 
-	it("orphans a blocked task only after its owned work drained", async () => {
-		const { harness, root } = await openNodes();
+	it("drains a blocked owner's work and retains its documents until compatible cleanup is published", async () => {
+		const { harness, root, registry } = await openNodes();
+		script("child", {
+			abort: async (runtime, ctx) => {
+				await gate("abort.child").promise;
+				await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx);
+			},
+		});
 		const { owner, child } = await root.commit(async (tx) => {
 			const owner = await tx.createTask(Unregistered, { name: "owner" }, OWN_CONVERSATION);
+			(await tx.doc(TaskNotes, owner)).text = "owner cleanup";
 			return { owner, child: await spawn(tx, owner, "child") };
 		}, context);
 		await until(() => log.includes("run:child"));
 		expect(await harness.abortTask(owner, context)).toBe("marked");
+		await until(() => log.includes("abort:child"));
+		const ownerDone = harness.waitForTask(owner, context);
+		expect(await settled(ownerDone)).toBe(false);
+		expect((await state(harness, owner)).status).not.toBe("terminal");
+		expect(await harness.snapshot(TaskNotes, owner, context)).toEqual({ text: "owner cleanup" });
+		open("abort.child");
 		expect(await outcomeOf(harness, child)).toBe("aborted");
-		expect((await harness.waitForTask(owner, context)).state.outcome).toEqual({
-			status: "orphaned",
-			reason: "missing_task",
+		await harness.runPass(context);
+		expect(await state(harness, owner)).toMatchObject({
+			status: "waiting",
+			mode: "abort",
+			checkpoint: { phase: "run" },
+			condition: { kind: "registry" },
 		});
+		expect(await settled(ownerDone)).toBe(false);
+		expect(await harness.snapshot(TaskNotes, owner, context)).toEqual({ text: "owner cleanup" });
+		addTask(registry, Unregistered);
+		expect((await ownerDone).state.outcome.status).toBe("aborted");
+		expect(await harness.snapshot(TaskNotes, owner, context)).toBeUndefined();
 		await harness.close(context);
 	});
 
@@ -893,7 +940,12 @@ describe("recovery", () => {
 		const { parent, children } = await seed(path, ["c1"], async (set, { parent, children }) => {
 			await set(children[0]!, { state: COMPLETED });
 			await set(parent, {
-				state: { status: "waiting", checkpoint: { phase: "resume", round: 1 }, on: children, policy: "allSettled" },
+				state: {
+					status: "waiting",
+					mode: "run",
+					checkpoint: { phase: "resume", round: 1 },
+					condition: { kind: "tasks", on: children, policy: "allSettled" },
+				},
 			});
 		});
 		const { harness } = await openNodes(await openNodeSqliteStorage(path));
@@ -908,7 +960,12 @@ describe("recovery", () => {
 		const { parent, children } = await seed(path, ["c1", "c2"], async (set, { parent, children }) => {
 			await set(children[0]!, { state: FAILED });
 			await set(parent, {
-				state: { status: "waiting", checkpoint: { phase: "resume", round: 1 }, on: children, policy: "failFast" },
+				state: {
+					status: "waiting",
+					mode: "run",
+					checkpoint: { phase: "resume", round: 1 },
+					condition: { kind: "tasks", on: children, policy: "failFast" },
+				},
 			});
 		});
 		const { harness } = await openNodes(await openNodeSqliteStorage(path));
@@ -950,7 +1007,12 @@ describe("recovery", () => {
 		const { parent, children } = await seed(path, ["c1"], async (set, { parent, children }) => {
 			await set(parent, {
 				abortRequested: true,
-				state: { status: "waiting", checkpoint: { phase: "resume", round: 1 }, on: children, policy: "allSettled" },
+				state: {
+					status: "waiting",
+					mode: "run",
+					checkpoint: { phase: "resume", round: 1 },
+					condition: { kind: "tasks", on: children, policy: "allSettled" },
+				},
 			});
 		});
 		const { harness } = await openNodes(await openNodeSqliteStorage(path));
@@ -973,7 +1035,7 @@ describe("recovery", () => {
 		found.ids.splice(
 			0,
 			found.ids.length,
-			...((await state(opened.harness, parent)) as unknown as { on: TaskId<string>[] }).on,
+			...((await state(opened.harness, parent)) as unknown as { condition: { on: TaskId<string>[] } }).condition.on,
 		);
 		open("p1");
 		open("p2");
@@ -1220,7 +1282,11 @@ function versioned(version: 1 | 2) {
 		phases: {
 			wait: (task, runtime, ctx) =>
 				runtime.commit(
-					() => ({ status: "waiting", checkpoint: { phase: "resume" }, on: task.input.on, policy: "allSettled" }),
+					() => ({
+						status: "waiting",
+						checkpoint: { phase: "resume" },
+						condition: { kind: "tasks", on: task.input.on, policy: "allSettled" },
+					}),
 					ctx,
 				),
 			resume: (_task, runtime, ctx) =>
@@ -1274,7 +1340,7 @@ describe("definitions and waits", () => {
 		await harness.close(context);
 	});
 
-	it("orphans an aborted waiting task without its definition at once, leaving the task it waits on running", async () => {
+	it("retains an aborted waiter without its definition while its unowned dependency remains running", async () => {
 		const { harness, root, registry } = await openNodes();
 		const registration = addTask(registry, versioned(1));
 		const other = await start(root, "other");
@@ -1282,9 +1348,20 @@ describe("definitions and waits", () => {
 		await until(async () => (await state(harness, waiter)).status === "waiting");
 		registration.dispose();
 		expect(await harness.abortTask(waiter, context)).toBe("marked");
-		expect((await state(harness, waiter)).outcome).toEqual({ status: "orphaned", reason: "missing_task" });
+		await until(async () => {
+			const current = await state(harness, waiter);
+			return current.status === "waiting" && current.condition.kind === "registry";
+		});
+		expect(await harness.getTask(waiter, context)).toMatchObject({
+			abortRequested: true,
+			state: { status: "waiting", mode: "abort", checkpoint: { phase: "resume" } },
+		});
+		expect((await state(harness, other)).status).toBe("running");
+		addTask(registry, versioned(1));
+		expect(await outcomeOf(harness, waiter)).toBe("aborted");
 		expect((await state(harness, other)).status).toBe("running");
 		open("other");
+		expect(await outcomeOf(harness, other)).toBe("completed");
 		await harness.close(context);
 	});
 

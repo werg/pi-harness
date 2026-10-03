@@ -19,7 +19,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { addTask, addTool } from "./harness-support.ts";
 import { ControlledStorage, context, flush } from "./session-support.ts";
-import { aborted, abortedWith, completed, countingReader, deferred, eventually, openTasks } from "./task-support.ts";
+import {
+	aborted,
+	abortedWith,
+	completed,
+	countingReader,
+	deferred,
+	eventually,
+	openTasks,
+	settled,
+} from "./task-support.ts";
 
 const directories = new Set<string>();
 
@@ -494,31 +503,43 @@ describe("blocked tasks", () => {
 		await opened.harness.close(context);
 	});
 
-	it("settles an aborted blocked task as orphaned and retires its documents", async () => {
+	it("retains an aborted blocked task and its documents until compatible cleanup is published", async () => {
 		const Scratch = defineDoc<{ n: number }>({
 			kind: "test.orphan-scratch",
 			version: 1,
 			scope: "task",
 			initial: () => ({ n: 0 }),
 		});
-		const { harness } = await openTasks(new MemoryStorage(), []);
+		const { harness, registry } = await openTasks(new MemoryStorage(), []);
 		const root = await harness.root(context);
 		const id = await root.commit(async (tx) => {
 			const created = await tx.createTask(versioned(1, "x"), null, { ownership: { kind: "conversation" } });
 			(await tx.doc(Scratch, created)).n = 1;
 			return created;
 		}, context);
-		// Before resume: the marking commit settles the blocked task directly.
 		expect(await harness.abortTask(id, context)).toBe("marked");
+		await harness.runPass(context);
+		expect(await harness.getTask(id, context)).toMatchObject({
+			abortRequested: true,
+			state: {
+				status: "waiting",
+				mode: "abort",
+				checkpoint: { phase: "run" },
+				condition: { kind: "registry", reason: { code: "missing_task" } },
+			},
+		});
+		expect(await harness.snapshot(Scratch, id, context)).toEqual({ n: 1 });
+		addTask(registry, versioned(1, "x"));
+		await harness.runPass(context);
 		expect((await harness.getTask(id, context))?.state).toEqual({
 			status: "terminal",
-			outcome: { status: "orphaned", reason: "missing_task" },
+			outcome: { status: "aborted", reason: "x" },
 		});
 		expect(await harness.snapshot(Scratch, id, context)).toBeUndefined();
 		await harness.close(context);
 	});
 
-	it("orphans a marked task whose definition disappeared while its run was active", async () => {
+	it("retains a marked task whose definition disappeared while its run was active", async () => {
 		const reached = deferred();
 		const Running = defineTask<null, Step, null>({
 			name: "test.vanishing",
@@ -541,16 +562,28 @@ describe("blocked tasks", () => {
 		harness.resume();
 		await reached.promise;
 		registration.dispose();
-		// An active run means the mark does not orphan directly; the scheduler orphans once the run has ended.
 		expect(await harness.abortTask(id, context)).toBe("marked");
+		await harness.runPass(context);
+		expect(await harness.getTask(id, context)).toMatchObject({
+			abortRequested: true,
+			state: { status: "waiting", mode: "abort", checkpoint: { phase: "run" }, condition: { kind: "registry" } },
+		});
+		addTask(
+			registry,
+			defineTask<null, Step, null>({
+				...Running.definition,
+				abort: (_task, runtime, ctx) => runtime.commit(() => abortedWith("restored"), ctx),
+			}),
+		);
+		await harness.runPass(context);
 		expect((await harness.waitForTask(id, context)).state.outcome).toEqual({
-			status: "orphaned",
-			reason: "missing_task",
+			status: "aborted",
+			reason: "restored",
 		});
 		await harness.close(context);
 	});
 
-	it("orphans a reopened abort-marked task without a definition once scheduling resumes", async () => {
+	it("keeps a reopened abort-marked task live until its cleanup definition is restored", async () => {
 		const path = await sqlitePath();
 		let opened = await openTasks(await openNodeSqliteStorage(path), [versioned(1, "x")]);
 		const id = await createIn(opened.harness, versioned(1, "x"));
@@ -563,11 +596,18 @@ describe("blocked tasks", () => {
 			state: { status: "pending" },
 		});
 		const idle = opened.harness.waitForIdle(context);
-		opened.harness.resume();
+		await opened.harness.runPass(context);
+		expect(await settled(idle)).toBe(false);
+		expect(await opened.harness.getTask(id, context)).toMatchObject({
+			abortRequested: true,
+			state: { status: "waiting", mode: "abort", checkpoint: { phase: "run" }, condition: { kind: "registry" } },
+		});
+		addTask(opened.registry, versioned(1, "x"));
+		await opened.harness.runPass(context);
 		await idle;
 		expect((await opened.harness.getTask(id, context))?.state).toEqual({
 			status: "terminal",
-			outcome: { status: "orphaned", reason: "missing_task" },
+			outcome: { status: "aborted", reason: "x" },
 		});
 		await opened.harness.close(context);
 	});

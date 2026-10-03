@@ -324,12 +324,14 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
-	it("reports a failed deferred cancellation and still ends the run aborted", async () => {
+	it("reports failed deferred cancellation, retains the run, and settles after explicit repair", async () => {
 		const base = chatSetup({ deferred: { pendingFetches: 100, pollAfterMs: 60_000 } });
 		base.faux.setResponses([fauxAssistantMessage("never")]);
+		const original = new Error("cancel failed");
+		let repaired = false;
 		const models = new Proxy(base.models, {
 			get(target, property) {
-				if (property === "cancelDeferred") return async () => Promise.reject(new Error("cancel failed"));
+				if (property === "cancelDeferred" && !repaired) return async () => Promise.reject(original);
 				const value = Reflect.get(target, property, target);
 				return typeof value === "function" ? value.bind(target) : value;
 			},
@@ -341,7 +343,18 @@ describe("generation", () => {
 		const submission = await root.submit({ type: "input", content: "hi" }, context);
 		const taskId = await runTask(harness, root);
 		await waitFor(async () => (await live(harness, root))?.generation?.deferred !== undefined);
-		await harness.abortTask(taskId, context);
+		await expect(root.abort(context)).rejects.toBe(original);
+		await harness.runPass(context);
+		const failed = await harness.getTask(taskId, context);
+		if (failed?.state.status !== "waiting" || failed.state.condition.kind !== "failure")
+			throw new Error("Expected failed cleanup wait");
+		expect(failed.abortRequested).toBe(true);
+		expect(await submission.status(context)).toMatchObject({ status: "placed" });
+		expect((await live(harness, root))?.run?.taskId).toBe(taskId);
+		await expect(harness.waitForTask(taskId, context)).rejects.toBe(original);
+		repaired = true;
+		expect(await harness.retryTask(taskId, failed.state.condition.incident, context)).toBe("queued");
+		await harness.runPass(context);
 		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
 		expect(setup.reports).toContainEqual(new Error("cancel failed"));
 		expect(await live(harness, root)).toEqual({});
@@ -529,9 +542,43 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
-	it("orphans a blocked run task with full run cleanup", async () => {
+	it("retains a blocked run until compatible cleanup code settles its inputs and live state", async () => {
 		const setup = chatSetup();
-		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		const futureGeneration = {
+			definition: { ...GenerationTask.definition, version: GenerationTask.definition.version + 1 },
+		};
+		// Built-ins belong to the loaded code image, not replaceable extensions. The reader represents publication of
+		// that image's definitions; it cannot rewrite the already admitted task version/checkpoint.
+		let loadedGeneration = GenerationTask;
+		const harness = await Harness.open(
+			new MemoryStorage(),
+			{
+				models: setup.models,
+				registry: {
+					subscribe: (listener) => setup.registry.subscribe(listener),
+					snapshot: () => {
+						const snapshot = setup.registry.snapshot();
+						const generation = loadedGeneration;
+						return {
+							revision: snapshot.revision,
+							installed: () => snapshot.installed(),
+							extension: (name) => snapshot.extension(name),
+							tools: () => snapshot.tools(),
+							sections: () => snapshot.sections(),
+							tasks: () =>
+								snapshot
+									.tasks()
+									.map((task) =>
+										task.definition.name === GenerationTask.definition.name ? generation : task,
+									),
+							task: (name) => (name === GenerationTask.definition.name ? generation : snapshot.task(name)),
+						};
+					},
+				},
+			},
+			context,
+		);
+		const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 		// A run whose task was stored by a newer generation definition this process cannot run.
 		const { taskId, submissionId } = await (harness as unknown as SessionImpl).commitWith(async (tx) => {
 			const entry = await tx.appendEntry(UserEntry, root.id, {
@@ -544,7 +591,7 @@ describe("generation", () => {
 				entry: entry.id,
 			});
 			const taskId = await tx.createTask(
-				{ definition: { ...GenerationTask.definition, version: 2 } },
+				futureGeneration,
 				{},
 				{ ownership: { kind: "conversation" }, conversationId: root.id },
 			);
@@ -556,13 +603,24 @@ describe("generation", () => {
 			"is busy",
 		);
 		expect(await harness.abortTask(taskId, context)).toBe("marked");
+		await harness.runPass(context);
+		expect(await harness.getTask(taskId, context)).toMatchObject({
+			abortRequested: true,
+			state: { status: "waiting", mode: "abort", condition: { kind: "registry", reason: { code: "task_too_old" } } },
+		});
+		expect(await (await harness.submission(submissionId, context))!.status(context)).toMatchObject({
+			status: "placed",
+		});
+		expect((await live(harness, root))?.run?.taskId).toBe(taskId);
+		loadedGeneration = futureGeneration;
+		setup.registry.install(defineExtension({ name: "loaded-code-publication" }));
+		await harness.runPass(context);
 		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({
-			status: "orphaned",
-			reason: "task_too_old",
+			status: "aborted",
 		});
 		expect(await (await harness.submission(submissionId, context))!.status(context)).toMatchObject({
 			status: "unanswered",
-			reason: "task_too_old",
+			reason: "aborted",
 		});
 		expect(await live(harness, root)).toEqual({});
 		await harness.close(context);
@@ -571,6 +629,7 @@ describe("generation", () => {
 	it("rejects a registry without the built-in tasks", async () => {
 		const empty = createRegistry().snapshot();
 		const snapshot: RegistrySnapshot = {
+			revision: empty.revision,
 			installed: () => [],
 			extension: () => undefined,
 			tools: () => [],

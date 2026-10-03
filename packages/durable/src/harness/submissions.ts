@@ -56,6 +56,7 @@ export class Submissions {
 		const id = await this.#session.commitWith(
 			(tx) => admitSubmission(tx, conversationId, draft, this.#now(), this.#queueModes()),
 			context,
+			{ conversationId },
 		);
 		return new SubmissionHandle(id, this);
 	}
@@ -94,6 +95,11 @@ export class Submissions {
 				return "not_found";
 			}
 			if (record.status === "queued") {
+				if (record.type === "input") {
+					const result = await tx.reviseQueuedInput(id, { kind: "withdraw" });
+					if (result !== "withdrawn") throw new Error(`Queued input ${id} could not be withdrawn`);
+					return "aborted";
+				}
 				tx.settleSubmission(id, { status: "unanswered", reason: "aborted" });
 				await removeInboxItem(tx, record.conversationId, id);
 				return "aborted";
@@ -167,19 +173,25 @@ export async function admitSubmission(
 	const requestId = draft.requestId === undefined ? {} : { requestId: draft.requestId };
 	// A boundary reads the table, so it is prepared before the first table write; a busy one needs none.
 	const boundary = busy ? undefined : await prepareBoundary(tx, conversationId, queueModes);
+	// Reserve the genuine native identity before product preparation; only the final candidate is committed.
+	const { id } = await tx.createSubmission({ conversationId, ...requestId, type: draft.type, status: "queued" });
+	const prepared =
+		draft.type === "write"
+			? {
+					type: "write" as const,
+					entry: typeof draft.entry === "function" ? await draft.entry(tx, id) : draft.entry,
+				}
+			: {
+					type: "input" as const,
+					content: typeof draft.content === "function" ? await draft.content(tx, id) : draft.content,
+				};
 	if (boundary === undefined || boundary.inbox.items.length > 0) {
-		const { id } = await tx.createSubmission({
-			conversationId,
-			...requestId,
-			type: draft.type,
-			status: "queued",
-		});
 		// Hosts may leave optional fields `undefined`; drafts take strict JSON.
-		const value = copyJson(draft.type === "write" ? draft.entry : draft.content, {
+		const value = copyJson(prepared.type === "write" ? prepared.entry : prepared.content, {
 			omitUndefinedProperties: true,
 		});
 		const items = (boundary?.inbox ?? (await tx.doc(InboxDoc, conversationId))).items;
-		if (draft.type === "write") items.push({ id, mode: "write", entry: value as JsonObject });
+		if (prepared.type === "write") items.push({ id, mode: "write", entry: value as JsonObject });
 		else {
 			const mode = draft.whenBusy === "steer" ? "steer" : "followUp";
 			items.push({ id, mode, content: value as JsonRepresentation<UserInput> });
@@ -189,19 +201,19 @@ export async function admitSubmission(
 		if (users.length > 0) await startRun(tx, conversationId, live, users);
 		return id;
 	}
-	if (draft.type === "write") {
-		if (isStale(boundary, draft.entry)) {
+	if (prepared.type === "write") {
+		if (isStale(boundary, prepared.entry)) {
 			const stale = { status: "unanswered", reason: "stale" } as const;
-			return (await tx.createSubmission({ conversationId, ...requestId, type: "write", ...stale })).id;
+			tx.settleSubmission(id, stale);
+			return id;
 		}
-		const entry = await tx.appendEntry(conversationId, draft.entry);
-		const write = { conversationId, ...requestId, type: "write", status: "done", entry: entry.id } as const;
-		return (await tx.createSubmission(write)).id;
+		const entry = await tx.appendEntry(conversationId, prepared.entry);
+		tx.placeSubmission(id, entry.id);
+		return id;
 	}
-	const message = { role: "user", content: draft.content, timestamp: now } as const;
+	const message = { role: "user", content: prepared.content, timestamp: now } as const;
 	const entry = await tx.appendEntry(UserEntry, conversationId, { model: [message] });
-	const input = { conversationId, ...requestId, type: "input", status: "placed", entry: entry.id } as const;
-	const { id } = await tx.createSubmission(input);
+	tx.placeSubmission(id, entry.id);
 	await startRun(tx, conversationId, live, [id]);
 	return id;
 }

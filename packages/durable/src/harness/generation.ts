@@ -11,7 +11,6 @@ import type {
 } from "@earendil-works/pi-ai";
 import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
 import { isRetryableAssistantError, retryDelayMs } from "@earendil-works/pi-ai/utils/retry";
-import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { AssistantEntry, ResetEntry, SystemEntry, UserEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
 import { defineTask } from "../tasks.ts";
@@ -27,8 +26,9 @@ import type {
 } from "../types.ts";
 import { addTools } from "./agent.ts";
 import { createCompaction, estimateContext, selectCut } from "./compaction.ts";
+import { bindTool } from "./define.ts";
 import { applyBoundary, prepareBoundary } from "./inbox.ts";
-import { assignJson } from "./json.ts";
+import { assignJson, jsonEqual, type PinnedMessages, type PinnedModel, pinMessages, pinModel } from "./json.ts";
 import { endRun, LiveDoc, type LiveState, type ToolSlot } from "./live.ts";
 import { planSystemEntries, renderSections, replaySections } from "./prompt.ts";
 import { appendToolResult, harnessError, ToolTask, type ToolTaskResult } from "./tool.ts";
@@ -38,14 +38,30 @@ import type {
 	ContextView,
 	ConversationStreamOptions,
 	GenerationHooks,
+	GenerationResponseRequest,
+	GenerationRetrySelection,
 	ModelRef,
+	ModelRequestResult,
 	PromptInput,
+	ToolBinding,
 	ToolControl,
 	UserInput,
 } from "./types.ts";
 import { recordUsage } from "./usage.ts";
 
 export type GenerationInput = Record<string, never>;
+
+/** Preparation fixes the endpoint, provider conversion policy, request options and offered executable bindings. */
+type PreparedRequest = {
+	attempt: number;
+	compacted?: TaskId<CompactionResult>;
+	model: PinnedModel;
+	thinkingLevel: ModelThinkingLevel;
+	streamOptions: ConversationStreamOptions;
+	/** Newest entry included in the request. */
+	cutoff: EntryId;
+	offered: ToolBinding[];
+};
 
 export type GenerationCheckpoint =
 	| {
@@ -56,36 +72,25 @@ export type GenerationCheckpoint =
 			/** Error text of the overflow that started `compacted`; checked once when `prepare` resumes. */
 			overflow?: string;
 	  }
-	| {
-			phase: "request";
-			attempt: number;
-			compacted?: TaskId<CompactionResult>;
-			model: ModelRef;
-			thinkingLevel: ModelThinkingLevel;
-			/** The settings' request options when preparation committed; a resend after recovery uses them unchanged. */
-			streamOptions: ConversationStreamOptions;
-			/** Newest entry included in the request. */
-			cutoff: EntryId;
-	  }
+	| ({ phase: "bind" } & PreparedRequest)
+	| ({ phase: "request"; messages: PinnedMessages } & PreparedRequest)
 	| { phase: "retry"; attempt: number; compacted?: TaskId<CompactionResult>; until: number }
-	| {
+	| ({
 			phase: "poll";
-			attempt: number;
-			compacted?: TaskId<CompactionResult>;
-			model: ModelRef;
-			cutoff: EntryId;
+			messages: PinnedMessages;
 			handle: DeferredHandle;
 			pollAt: number;
-	  }
+	  } & PreparedRequest)
 	| {
 			/** Waiting on the round's tool tasks, which the generation owns (spec §8.5). */
 			phase: "tools";
 			/** The tool-calling answer. */
 			assistant: EntryId;
-			/** Tool tasks created so far, in call order; grows by one per started call of a sequential round. */
+			/** Tool tasks created so far, in call order, across the committed waves. */
 			tools: TaskId<ToolTaskResult>[];
-			/** Calls of a sequential round not started yet, in call order. */
-			pending: string[];
+			/** Ordered waves not yet admitted: parallel groups separated by singleton barriers. */
+			pending: string[][];
+			bindings: ToolBinding[];
 	  };
 
 export type GenerationResult = { entryId: EntryId };
@@ -94,13 +99,8 @@ type Runtime = TaskRuntime<GenerationInput, GenerationCheckpoint, GenerationResu
 type Next = NextTaskState<GenerationCheckpoint, GenerationResult>;
 
 /** What classification needs from the request that produced a message. */
-type Request = {
-	readonly attempt: number;
-	readonly compacted: TaskId<CompactionResult> | undefined;
-	readonly model: ModelRef;
-	readonly cutoff: EntryId;
-	/** Committed model context through `cutoff`, when the phase already derived it. */
-	readonly messages?: readonly Message[];
+type Request = PreparedRequest & {
+	readonly messages: PinnedMessages;
 	/** Set when the message came from polling, so a still deferred result polls strictly later. */
 	readonly pollAt?: number;
 };
@@ -114,7 +114,7 @@ const DEFAULT_POLL_AFTER_MS = 5000;
  */
 export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, GenerationResult, GenerationHooks>({
 	name: "pi.generation",
-	version: 1,
+	version: 2,
 	initial: () => ({ phase: "prepare", attempt: 1 }),
 	phases: {
 		/**
@@ -126,9 +126,14 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 			const { conversationId } = runtime;
 			const agent = await runtime.agent(context);
 			const settings = runtime.settings;
-			const { model, thinkingLevel } = agent;
+			const live = await runtime.snapshot(LiveDoc, conversationId, context);
+			const selection = live?.run?.taskId === runtime.taskId ? live.run.requestSelection : undefined;
+			const model = selection?.model ?? agent.model;
+			const thinkingLevel = selection?.thinkingLevel ?? agent.thinkingLevel;
+			const streamOptions = selection?.stream ?? agent.stream;
 			const resolved = model === undefined ? undefined : runtime.models.getModel(model.provider, model.modelId);
 			if (model === undefined || resolved === undefined) return failNoModel(runtime, model, context);
+			const descriptor = pinModel(resolved);
 			const { attempt, compacted, overflow } = task.state.checkpoint;
 			if (compacted !== undefined && overflow !== undefined) {
 				const [outcome] = await runtime.outcomes([compacted], context);
@@ -146,19 +151,31 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				if (context.abortSignal?.aborted) throw error;
 				report(error);
 			}
-			const input: PromptInput = { conversationId, agent, env, shown: Object.fromEntries(shown), read: runtime };
+			// Execution selection remains intact for genuine direct calls. The descriptor fixes what this model can receive.
+			const offeredTools = descriptor.capabilities?.tools === false ? [] : agent.tools;
+			const input: PromptInput = {
+				conversationId,
+				agent: { ...agent, tools: offeredTools },
+				env,
+				shown: Object.fromEntries(shown),
+				read: runtime,
+			};
 			const desired = await renderSections(agent.sections, input, shown, report, context);
-			const entries = planSystemEntries(view, desired, agent.tools, runtime.now());
+			const entries = planSystemEntries(view, desired, offeredTools, runtime.now());
 			const threshold =
 				compacted === undefined
-					? thresholdCompaction(view, entries, resolved.contextWindow, settings.compaction)
+					? thresholdCompaction(view, entries, descriptor.contextWindow, settings.compaction)
 					: undefined;
 			if (threshold === "blocking") {
 				// Compact first and prepare again; the transcript is unchanged until the compaction appends.
 				await runtime.commit(async (tx): Promise<Next> => {
 					const child = await createCompaction(tx, conversationId, { reason: "threshold" }, runtime.taskId);
 					const checkpoint = { phase: "prepare", attempt, compacted: child } as const;
-					return { status: "waiting", checkpoint, on: [child], policy: "allSettled" };
+					return {
+						status: "waiting",
+						checkpoint,
+						condition: { kind: "tasks", on: [child], policy: "allSettled" },
+					};
 				}, context);
 				return;
 			}
@@ -173,16 +190,32 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				const request = {
 					attempt,
 					...(compacted === undefined ? {} : { compacted }),
-					model,
+					model: descriptor,
 					thinkingLevel,
-					streamOptions: settings.stream,
+					streamOptions,
+					offered: offeredTools.map((tool) => bindTool(tool, settings.toolExecution)),
 					cutoff,
 				};
-				return { status: "running", checkpoint: { phase: "request", ...request } };
+				return { status: "running", checkpoint: { phase: "bind", ...request } };
 			}, context);
 		},
+		bind: async (task, runtime, context) => {
+			const { phase: _, ...request } = task.state.checkpoint;
+			const view = await runtime.context(runtime.conversationId, context, request.cutoff);
+			let messages = view.messages;
+			await runtime.hooks.each("beforeRequest", async (hook) => {
+				const replaced = await hook({ messages }, runtime, context);
+				if (replaced !== undefined) messages = replaced.messages;
+			});
+			const input = pinMessages(messages);
+			await runtime.commit(
+				() => ({ status: "running", checkpoint: { phase: "request", ...request, messages: input } }),
+				context,
+			);
+		},
 		request: async (task, runtime, context) => {
-			const { attempt, compacted, model: ref, thinkingLevel, streamOptions, cutoff } = task.state.checkpoint;
+			const { phase: _, ...request } = task.state.checkpoint;
+			const { attempt, model, thinkingLevel, streamOptions, messages } = request;
 			const conversationId = runtime.conversationId;
 			await runtime.commit(async (tx) => {
 				const live = await tx.doc(LiveDoc, conversationId);
@@ -190,26 +223,43 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				live.generation = { attempt };
 				return undefined;
 			}, context);
-			const model = runtime.models.getModel(ref.provider, ref.modelId);
-			if (model === undefined) return failNoModel(runtime, ref, context);
-			const view = await runtime.context(conversationId, context, cutoff);
-			let messages = view.messages;
-			await runtime.hooks.each("beforeRequest", async (hook) => {
-				const replaced = await hook({ messages }, runtime, context);
-				if (replaced !== undefined) messages = replaced.messages;
-			});
-			const options: SimpleStreamOptions = {
+			if (runtime.models.getProvider(model.provider) === undefined)
+				return failNoModel(runtime, { provider: model.provider, modelId: model.id }, context);
+			const options = {
 				...streamOptions,
-				signal: runtime.signal,
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
-			};
-			const message = await streamResponse(runtime, model, messages, options, attempt, context);
-			const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
-			await classify(runtime, request, message, context);
+			} satisfies SimpleStreamOptions;
+			const response = await runtime.withModelRequest(
+				{ purpose: "generation", operation: "stream", attempt, model, messages, cutoff: request.cutoff, options },
+				(capabilities, signal, prepared) =>
+					streamResponse(
+						runtime,
+						prepared.model,
+						messages,
+						{ ...options, ...capabilities, signal },
+						attempt,
+						context,
+					),
+				context,
+			);
+			if (response.status === "waiting") {
+				await runtime.commit(
+					() => ({ status: "waiting", checkpoint: task.state.checkpoint, condition: response.condition }),
+					context,
+				);
+				return;
+			}
+			await classify(runtime, request, response.result, context);
 		},
 		retry: async (task, runtime, context) => {
 			const { attempt, compacted, until } = task.state.checkpoint;
-			await runtime.sleep(until, context);
+			if (runtime.now() < until) {
+				await runtime.commit(
+					() => ({ status: "waiting", checkpoint: task.state.checkpoint, condition: { kind: "time", until } }),
+					context,
+				);
+				return;
+			}
 			await runtime.commit(async (tx) => {
 				(await tx.doc(LiveDoc, runtime.conversationId)).generation = { attempt: attempt + 1 };
 				const checkpoint: GenerationCheckpoint = {
@@ -221,51 +271,116 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 			}, context);
 		},
 		poll: async (task, runtime, context) => {
-			const { attempt, compacted, model: ref, cutoff, handle, pollAt } = task.state.checkpoint;
-			const model = runtime.models.getModel(ref.provider, ref.modelId);
-			if (model === undefined) return failNoModel(runtime, ref, context);
-			await runtime.sleep(pollAt, context);
-			const message = await runtime.models.fetchDeferred(model, handle, { signal: runtime.signal });
-			const request = { attempt, compacted, model: ref, cutoff, pollAt };
+			const { phase: _, ...request } = task.state.checkpoint;
+			const { model, handle, pollAt, streamOptions } = request;
+			if (runtime.now() < pollAt) {
+				await runtime.commit(
+					() => ({
+						status: "waiting",
+						checkpoint: task.state.checkpoint,
+						condition: { kind: "time", until: pollAt },
+					}),
+					context,
+				);
+				return;
+			}
+			let response: ModelRequestResult<AssistantMessage>;
+			try {
+				response = await runtime.withModelRequest(
+					{
+						purpose: "generation",
+						operation: "fetchDeferred",
+						attempt: request.attempt,
+						model,
+						messages: request.messages,
+						cutoff: request.cutoff,
+						options: streamOptions,
+						handle,
+					},
+					(capabilities, signal, prepared) =>
+						runtime.models.fetchDeferred(prepared.model, handle, {
+							...streamOptions,
+							...capabilities,
+							signal,
+						}),
+					context,
+				);
+			} catch (error) {
+				if (runtime.signal.aborted) throw error;
+				await runtime.parkFailure(error, context);
+				return;
+			}
+			if (response.status === "waiting") {
+				await runtime.commit(
+					() => ({ status: "waiting", checkpoint: task.state.checkpoint, condition: response.condition }),
+					context,
+				);
+				return;
+			}
+			const message = response.result;
+			// A failed observation is not proof that the admitted remote operation ended. Retain its handle;
+			// repair polls that same operation, while explicit cancellation still invokes its cancel contract.
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				const error = new Error(message.errorMessage ?? `Deferred polling ended with ${message.stopReason}`);
+				await runtime.parkFailure(error, context, async (tx) => {
+					await appendAssistant(tx, runtime.conversationId, message);
+				});
+				return;
+			}
 			await classify(runtime, request, message, context);
 		},
 		tools: async (task, runtime, context) => {
-			const { assistant, tools, pending } = task.state.checkpoint;
+			const { assistant, tools, pending, bindings } = task.state.checkpoint;
 			const [next, ...rest] = pending;
 			if (next === undefined) return finishToolRound(runtime, assistant, tools, context);
-			// Sequential round: start the next call and wait for it.
+			// The prior wave is terminal; admit the next wave atomically before any call executes.
 			await runtime.commit(async (tx): Promise<Next> => {
 				const live = await tx.doc(LiveDoc, runtime.conversationId);
-				const taskId = await createToolTask(tx, runtime, assistant, next);
-				const slot = live.tools?.find((slot) => slot.callId === next && slot.taskId === undefined);
-				if (slot !== undefined) slot.taskId = taskId;
+				const admitted = await admitToolWave(tx, runtime, assistant, next, live.tools ?? [], bindings);
 				const checkpoint: GenerationCheckpoint = {
 					phase: "tools",
 					assistant,
-					tools: [...tools, taskId],
+					tools: [...tools, ...admitted],
 					pending: rest,
+					bindings,
 				};
-				return { status: "waiting", checkpoint, on: [taskId], policy: "allSettled" };
+				return { status: "waiting", checkpoint, condition: { kind: "tasks", on: admitted, policy: "allSettled" } };
 			}, context);
 		},
 	},
 	abort: async (task, runtime, context) => {
 		const checkpoint = task.state.checkpoint;
 		if (checkpoint.phase === "poll") {
-			const model = runtime.models.getModel(checkpoint.model.provider, checkpoint.model.modelId);
-			if (model !== undefined) {
-				try {
-					await runtime.models.cancelDeferred(model, checkpoint.handle, { signal: runtime.signal });
-				} catch (error) {
-					runtime.report(error);
-				}
+			const model = checkpoint.model;
+			const response = await runtime.withModelRequest(
+				{
+					purpose: "generation",
+					operation: "cancelDeferred",
+					attempt: checkpoint.attempt,
+					model,
+					messages: checkpoint.messages,
+					cutoff: checkpoint.cutoff,
+					options: checkpoint.streamOptions,
+					handle: checkpoint.handle,
+				},
+				(capabilities, signal, prepared) =>
+					runtime.models.cancelDeferred(prepared.model, checkpoint.handle, {
+						...checkpoint.streamOptions,
+						...capabilities,
+						signal,
+					}),
+				context,
+			);
+			if (response.status === "waiting") {
+				await runtime.commit(() => ({ status: "waiting", checkpoint, condition: response.condition }), context);
+				return;
 			}
 		}
 		const conversationId = runtime.conversationId;
 		// Runs after the round's tool tasks are terminal; calls never started get `aborted` results (spec §8.5).
 		const unstarted =
 			checkpoint.phase === "tools"
-				? await readCalls(runtime, checkpoint.assistant, checkpoint.pending, context)
+				? await readCalls(runtime, checkpoint.assistant, checkpoint.pending.flat(), context)
 				: [];
 		await runtime.commit(async (tx) => {
 			const live = await tx.doc(LiveDoc, conversationId);
@@ -293,8 +408,18 @@ async function readCalls(
 }
 
 /** A tool task for call `callId`, owned by the generation. */
-function createToolTask(tx: Tx, runtime: Runtime, assistant: EntryId, callId: string): Promise<TaskId<ToolTaskResult>> {
-	return tx.createTask(ToolTask, { assistant, callId }, { ownership: { kind: "task", taskId: runtime.taskId } });
+function createToolTask(
+	tx: Tx,
+	runtime: Runtime,
+	assistant: EntryId,
+	callId: string,
+	binding: ToolBinding,
+): Promise<TaskId<ToolTaskResult>> {
+	return tx.createTask(
+		ToolTask,
+		{ source: { kind: "assistant" as const, entryId: assistant }, callId, binding },
+		{ ownership: { kind: "task", taskId: runtime.taskId } },
+	);
 }
 
 /**
@@ -422,7 +547,7 @@ async function classify(
 	// An abort mark or close: the abort invocation or the reopened run handles the committed state.
 	runtime.signal.throwIfAborted();
 	const conversationId = runtime.conversationId;
-	const { attempt, compacted, model: ref, cutoff } = request;
+	const { attempt, compacted, cutoff } = request;
 	if (message.stopReason === "deferred" && message.deferred !== undefined) {
 		const handle = message.deferred;
 		const pollAt = Math.max(
@@ -433,10 +558,7 @@ async function classify(
 			(await tx.doc(LiveDoc, conversationId)).generation = { attempt, deferred: { pollAt } };
 			const checkpoint = {
 				phase: "poll",
-				attempt,
-				...(compacted === undefined ? {} : { compacted }),
-				model: ref,
-				cutoff,
+				...request,
 				handle,
 				pollAt,
 			} as const;
@@ -444,7 +566,69 @@ async function classify(
 		}, context);
 		return;
 	}
-	await runtime.hooks.each("afterResponse", (hook) => hook(message, runtime, context));
+	let selected: GenerationRetrySelection | undefined;
+	await runtime.hooks.each("afterResponse", async (hook) => {
+		const decision = await hook(
+			message,
+			runtime,
+			context,
+			copyJson({
+				attempt,
+				model: request.model,
+				thinkingLevel: request.thinkingLevel,
+				streamOptions: request.streamOptions,
+				cutoff,
+			}) as GenerationResponseRequest,
+		);
+		if (selected === undefined && decision?.retry !== undefined) selected = decision.retry;
+	});
+	if (selected !== undefined) {
+		const selection = copyJson(
+			{
+				model: selected.model,
+				thinkingLevel: selected.thinkingLevel ?? request.thinkingLevel,
+				stream:
+					selected.stream === undefined ? request.streamOptions : { ...request.streamOptions, ...selected.stream },
+			},
+			{ omitUndefinedProperties: true },
+		) as GenerationRetrySelection;
+		const unchanged = jsonEqual(selection, {
+			model: { provider: request.model.provider, modelId: request.model.id },
+			thinkingLevel: request.thinkingLevel,
+			stream: request.streamOptions,
+		});
+		const invalid =
+			message.stopReason !== "error"
+				? "Model retry selection requires an actual provider error"
+				: unchanged
+					? "Model retry selection must change the failed request policy"
+					: undefined;
+		await runtime.commit(async (tx): Promise<Next> => {
+			const live = await tx.doc(LiveDoc, conversationId);
+			if (live.run?.taskId !== runtime.taskId) throw new Error("Model retry selection has no owning input run");
+			await appendAssistant(tx, conversationId, message);
+			if (invalid !== undefined) {
+				endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "model_error", detail: invalid });
+				return {
+					status: "terminal",
+					outcome: {
+						status: "failed",
+						error: {
+							message: invalid,
+							detail: { reason: "model_policy_error", providerError: message.errorMessage ?? null },
+						},
+					},
+				};
+			}
+			live.run.requestSelection = selection;
+			delete live.generation;
+			return {
+				status: "running",
+				checkpoint: { phase: "prepare", attempt: attempt + 1, ...(compacted === undefined ? {} : { compacted }) },
+			};
+		}, context);
+		return;
+	}
 	const calls = message.content.filter((content): content is ToolCall => content.type === "toolCall");
 	if (message.stopReason === "toolUse" && calls.length > 0) {
 		return startToolRound(runtime, request, message, calls, context);
@@ -466,7 +650,7 @@ async function classify(
 				delete live.generation;
 				const child = await createCompaction(tx, conversationId, { reason: "overflow" }, runtime.taskId);
 				const checkpoint = { phase: "prepare", attempt, compacted: child, overflow: text } as const;
-				return { status: "waiting", checkpoint, on: [child], policy: "allSettled" };
+				return { status: "waiting", checkpoint, condition: { kind: "tasks", on: [child], policy: "allSettled" } };
 			}, context);
 			return;
 		}
@@ -537,7 +721,7 @@ async function answer(runtime: Runtime, message: AssistantMessage, context: Cont
 /**
  * Append the tool-calling answer and start its tool round in one commit (spec §8.3). A call to a tool the request did
  * not offer gets its `tool_unavailable` result here; every other call gets a tool task owned by the generation, only the
- * first one now when the round is sequential. The generation then waits for them in its `tools` phase, keeping the run.
+ * first wave now. Parallel-safe groups and singleton barriers are committed in call order; generation waits for each wave.
  */
 async function startToolRound(
 	runtime: Runtime,
@@ -547,22 +731,25 @@ async function startToolRound(
 	context: Context,
 ): Promise<void> {
 	const conversationId = runtime.conversationId;
-	const messages = request.messages ?? (await runtime.context(conversationId, context, request.cutoff)).messages;
-	const offered = new Set(getCurrentTools(messages).map((tool) => tool.name));
-	// Read as the round starts; a tool is resolved as its tool task resolves it.
-	const tools = (await runtime.agent(context)).tools;
-	const sequential =
-		runtime.settings.toolExecution === "sequential" ||
-		calls.some(
-			(call) =>
-				offered.has(call.name) && tools.find((tool) => tool.name === call.name)?.executionMode === "sequential",
-		);
+	const bindings = request.offered;
+	const offered = new Map(bindings.map((binding) => [binding.name, binding]));
+	const waves: string[][] = [];
+	let parallel: string[] = [];
+	for (const call of calls) {
+		if (!offered.has(call.name)) continue;
+		const sequential = offered.get(call.name)?.executionMode === "sequential";
+		if (sequential) {
+			if (parallel.length > 0) waves.push(parallel);
+			parallel = [];
+			waves.push([call.id]);
+		} else parallel.push(call.id);
+	}
+	if (parallel.length > 0) waves.push(parallel);
 	await runtime.commit(async (tx): Promise<Next> => {
 		const live = await tx.doc(LiveDoc, conversationId);
 		const entry = await appendAssistant(tx, conversationId, message);
 		const slots: ToolSlot[] = [];
-		const tools: TaskId<ToolTaskResult>[] = [];
-		const pending: string[] = [];
+
 		for (const call of calls) {
 			if (!offered.has(call.name)) {
 				const unavailable = harnessError("tool_unavailable", `Tool ${call.name} is not available`);
@@ -570,20 +757,38 @@ async function startToolRound(
 				slots.push({ callId: call.id, name: call.name, status: "done", entry: result.id });
 				continue;
 			}
-			if (sequential && tools.length > 0) {
-				pending.push(call.id);
-				slots.push({ callId: call.id, name: call.name, status: "pending" });
-				continue;
-			}
-			const taskId = await createToolTask(tx, runtime, entry.id, call.id);
-			tools.push(taskId);
-			slots.push({ callId: call.id, name: call.name, taskId, status: "pending" });
+			slots.push({ callId: call.id, name: call.name, status: "pending" });
 		}
+		const [first = [], ...pending] = waves;
+		const tools = await admitToolWave(tx, runtime, entry.id, first, slots, bindings);
 		delete live.generation;
 		live.tools = slots;
-		const checkpoint = { phase: "tools", assistant: entry.id, tools, pending } as const;
-		return { status: "waiting", checkpoint, on: tools, policy: "allSettled" };
+		const checkpoint = { phase: "tools", assistant: entry.id, tools, pending, bindings } as const;
+		return { status: "waiting", checkpoint, condition: { kind: "tasks", on: tools, policy: "allSettled" } };
 	}, context);
+}
+
+/** Create exactly one committed wave. The generation's checkpoint is the only admission cursor. */
+async function admitToolWave(
+	tx: Tx,
+	runtime: Runtime,
+	assistant: EntryId,
+	calls: readonly string[],
+	slots: Draft<ToolSlot>[],
+	bindings: readonly ToolBinding[],
+): Promise<TaskId<ToolTaskResult>[]> {
+	const admitted: TaskId<ToolTaskResult>[] = [];
+	for (const callId of calls) {
+		const slot = slots.find((slot) => slot.callId === callId);
+		if (slot === undefined || slot.taskId !== undefined)
+			throw new Error(`Tool wave has invalid admission slot ${callId}`);
+		const binding = bindings.find((binding) => binding.name === slot.name);
+		if (binding === undefined) throw new Error(`Tool wave has no offered binding for ${slot.name}`);
+		const taskId = await createToolTask(tx, runtime, assistant, callId, binding);
+		slot.taskId = taskId;
+		admitted.push(taskId);
+	}
+	return admitted;
 }
 
 /**

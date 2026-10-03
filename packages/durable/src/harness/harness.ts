@@ -1,4 +1,4 @@
-import type { AttachedReplicatedState, Context, JsonValue } from "@earendil-works/chord";
+import { type AttachedReplicatedState, type Context, copyJson, type JsonValue } from "@earendil-works/chord";
 import { withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { ResetEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
@@ -23,12 +23,15 @@ import { ROOT_CONVERSATION_ID } from "../types.ts";
 import { AgentDoc, configure, createAgent, resolveAgent, resolveSettings } from "./agent.ts";
 import { createCompaction } from "./compaction.ts";
 import { readContext } from "./context.ts";
+import { bindTool } from "./define.ts";
+import { exportConversationHistory, importConversationHistory, prepareConversationHistory } from "./history.ts";
 import { InboxDoc, withdrawQueuedInputs } from "./inbox.ts";
 import { LiveDoc, settleSchedulerOutcome } from "./live.ts";
 import { BUILTIN_TASKS } from "./registry.ts";
 import { type InvocationBinding, TaskScheduler } from "./scheduler.ts";
 import { Submissions } from "./submissions.ts";
 import { type TaskGraph, TaskGraphView, type TaskGraphWatch } from "./task-graph.ts";
+import { createDirectToolTask, type DirectToolCall, type ToolTaskResult } from "./tool.ts";
 import type {
 	Agent,
 	AgentChange,
@@ -38,8 +41,11 @@ import type {
 	ConversationAbortOptions,
 	ConversationCreateOptions,
 	ConversationHandle,
+	ConversationHistory,
+	ConversationHistoryImportOptions,
 	ConversationInit,
 	ConversationWatch,
+	HarnessCommit,
 	HarnessInspection,
 	HarnessOptions,
 	Harness as HarnessType,
@@ -58,6 +64,12 @@ const SCAN_PAGE_SIZE = 256;
 type CreateTarget =
 	| { readonly kind: "root" }
 	| { readonly kind: "independent"; readonly ownership: ConversationOwnership }
+	| {
+			readonly kind: "history";
+			readonly ownership: ConversationOwnership;
+			readonly history: ConversationHistory;
+			readonly initialize?: ConversationHistoryImportOptions["init"];
+	  }
 	| {
 			readonly kind: "fork";
 			readonly parentId: ConversationId;
@@ -100,6 +112,15 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 		return this.#host.submissions.submit(this.id, submission, context);
 	}
 
+	invokeTool(
+		call: DirectToolCall,
+		context: Context,
+		options?: { readonly background?: boolean },
+	): Promise<TaskId<ToolTaskResult>> {
+		this.#host.tasks.resume();
+		return this.#host.harness.invokeTool(this.id, call, context, options);
+	}
+
 	compact(instructions: string | undefined, context: Context): Promise<TaskId<CompactionResult>> {
 		this.#host.tasks.resume();
 		const input = { reason: "manual", ...(instructions === undefined ? {} : { instructions }) } as const;
@@ -139,6 +160,10 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 
 	fork(at: EntryId, options: ConversationCreateOptions, context: Context): Promise<Conversation> {
 		return this.#host.create({ kind: "fork", parentId: this.id, at, ownership: options.ownership }, options, context);
+	}
+
+	exportHistory(at: EntryId | null, context: Context): Promise<ConversationHistory> {
+		return exportConversationHistory(this.#host.harness, this.#host.storage, this.id, at, context);
 	}
 
 	abort(context: Context, options?: ConversationAbortOptions): Promise<void> {
@@ -183,11 +208,13 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 			storage,
 			registry: options.registry,
 			models: options.models,
+			modelRequests: options.modelRequests,
 			agent: (id, snapshot, callContext) => this.resolveAgent(id, snapshot as RegistrySnapshot<Tool>, callContext),
 			settings,
 			env: (id, callContext) => this.buildEnv(id, callContext),
 			now,
 			report: this.#report,
+			publishWake: options.publishWake,
 			settleOutcome: settleSchedulerOutcome,
 			withdrawInputs: withdrawQueuedInputs,
 			conversation: async (id, binding, callContext) => {
@@ -220,6 +247,31 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 		return resolveAgent(state, registry, resolveSettings(this.#options.settings), this.#report);
 	}
 
+	invokeTool(
+		conversationId: ConversationId,
+		call: DirectToolCall,
+		context: Context,
+		options?: { readonly background?: boolean },
+	): Promise<TaskId<ToolTaskResult>> {
+		const snapshot = this.#options.registry.snapshot();
+		const settings = resolveSettings(this.#options.settings);
+		return this.commitWith(
+			async (tx) => {
+				if (!(await tx.conversation(conversationId)))
+					throw new Error(`Conversation ${conversationId} does not exist`);
+				const agent = resolveAgent(await tx.doc(AgentDoc, conversationId), snapshot, settings, this.#report);
+				const tool = agent.tools.find((tool) => tool.name === call.name);
+				if (!tool) throw new Error(`Tool ${call.name} is not selected for conversation ${conversationId}`);
+				return createDirectToolTask(tx, conversationId, call, bindTool(tool, settings.toolExecution), {
+					ownership: { kind: "conversation" },
+					...(options?.background === undefined ? {} : { background: options.background }),
+				});
+			},
+			context,
+			{ conversationId },
+		);
+	}
+
 	/** Build a conversation's environment from its current `cwd`; `undefined` without an `env` option. */
 	async buildEnv(id: ConversationId, context: Context): Promise<ExecutionEnv | undefined> {
 		const build = this.#options.env;
@@ -236,6 +288,28 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 	resume(): void {
 		this.#assertOpen();
 		this.#tasks.resume();
+	}
+
+	flushWake(context: Context) {
+		return this.#tasks.flushWake(context);
+	}
+
+	runPass(context: Context) {
+		return this.#tasks.runPass(context);
+	}
+
+	protected override async prepareCommit(tx: Transaction, context: Context): Promise<void> {
+		if (this.#options.prepareCommit !== undefined) {
+			const staged = copyJson({
+				entries: tx.stagedEntries(),
+				submissions: await tx.stagedSubmissions(),
+				tasks: tx.stagedTasks(),
+			}) as unknown as HarnessCommit;
+			freezeCommit(staged);
+			await this.#options.prepareCommit(tx, staged, context);
+			tx.assertCallbackSettled();
+		}
+		await this.#tasks.prepare(tx);
 	}
 
 	getTask<R>(id: TaskId<R>, context: Context): Promise<TaskRecord<JsonValue, JsonValue, R> | undefined> {
@@ -268,6 +342,10 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 
 	abortTask(id: TaskId, context: Context): Promise<"marked" | "terminal"> {
 		return this.#tasks.abort(id, context);
+	}
+
+	retryTask(id: TaskId, incident: EntryId, context: Context): Promise<"queued" | "stale" | "terminal"> {
+		return this.#tasks.retry(id, incident, context);
 	}
 
 	waitForTask<R>(id: TaskId<R>, context: Context): Promise<SettledTask<R>> {
@@ -318,6 +396,19 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 		return this.#create({ kind: "independent", ownership: options.ownership }, options, context);
 	}
 
+	async importHistory(
+		history: ConversationHistory,
+		options: ConversationHistoryImportOptions,
+		context: Context,
+	): Promise<Conversation> {
+		const prepared = prepareConversationHistory(history);
+		return this.#create(
+			{ kind: "history", ownership: options.ownership, history: prepared, initialize: options.init },
+			{ agent: options.agent },
+			context,
+		);
+	}
+
 	override close(context: Context): Promise<void> {
 		this.#closed = true;
 		return super.close(context);
@@ -340,7 +431,10 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 					: target.kind === "fork"
 						? await tx.forkConversation(target.parentId, target.at, { ownership: target.ownership })
 						: await tx.createConversation({ ownership: target.ownership });
+			const entryIds =
+				target.kind === "history" ? await importConversationHistory(tx, record.id, target.history) : undefined;
 			if (options.agent !== undefined) await configure(tx, record.id, options.agent);
+			if (target.kind === "history") await target.initialize?.(tx, record.id, entryIds!);
 			if (options.init !== undefined) await options.init(tx, record.id);
 			return record.id;
 		}, context);
@@ -431,3 +525,10 @@ export const Harness = {
 		return harness;
 	},
 };
+
+/** Freeze a detached JSON snapshot, including nested model content and task checkpoints. */
+function freezeCommit(value: unknown): void {
+	if (typeof value !== "object" || value === null) return;
+	for (const child of Object.values(value)) freezeCommit(child);
+	Object.freeze(value);
+}

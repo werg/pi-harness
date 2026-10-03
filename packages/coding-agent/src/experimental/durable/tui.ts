@@ -510,7 +510,9 @@ function describeTask(node: TaskGraphNode): string {
 	const state = node.state;
 	const status =
 		state.status === "waiting"
-			? `waiting on ${state.on.join(", ")}`
+			? state.condition.kind === "tasks"
+				? `waiting on ${state.condition.on.join(", ")}`
+				: `waiting for ${state.condition.kind}`
 			: state.status === "completing"
 				? `completing (${state.outcome})`
 				: `${state.status} ${state.phase}`;

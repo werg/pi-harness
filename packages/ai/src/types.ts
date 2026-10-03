@@ -134,6 +134,8 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	/** Explicit parent context for telemetry produced by this logical request. */
 	telemetryContext?: TelemetryContext;
 	apiKey?: string;
+	/** Credential method when authentication is injected by a trusted transport. */
+	authType?: "api_key" | "oauth";
 	/**
 	 * Optional fetch implementation for provider HTTP requests.
 	 * Defaults to `globalThis.fetch`. Provider adapters that cannot inject a custom implementation may reject it.
@@ -184,7 +186,23 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	maxRetryDelayMs?: number;
 }
 
+/** Open, consumable socket supplied by an invocation's attributed transport. */
+export interface ProviderWebSocket {
+	send(data: string): void;
+	close(code?: number, reason?: string): void;
+	addEventListener(type: "open" | "message" | "error" | "close", listener: (event: unknown) => void): void;
+	removeEventListener(type: "open" | "message" | "error" | "close", listener: (event: unknown) => void): void;
+}
+
 export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
+	/**
+	 * Connect through the caller's transport, including credential injection.
+	 * Return an open socket and honor cancellation during connection. Such sockets
+	 * belong to this request and are closed at settlement, never cached across
+	 * invocations. Providers supporting WebSockets may use this instead of an
+	 * ambient constructor; HTTP fallback still uses `fetch`.
+	 */
+	connectWebSocket?: (url: string, options: { headers: Headers; signal?: AbortSignal }) => Promise<ProviderWebSocket>;
 	/**
 	 * Optional callback invoked after an HTTP response is received and before
 	 * its body stream is consumed.
@@ -765,6 +783,7 @@ export type TranscriptContext = {
  * `toolcall_delta` carries subsequent JSON updates.
  */
 export type AssistantMessageEvent =
+	| { type: "prompt_progress"; total: number; processed: number; cache: number; partial: AssistantMessage }
 	| { type: "start"; partial: AssistantMessage }
 	| { type: "text_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "text_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
@@ -1109,6 +1128,8 @@ export interface BaseModel<TApi extends string> {
 
 /** Chat model: usable with `stream()` and friends. */
 export interface Model<TApi extends Api> extends BaseModel<TApi> {
+	/** Catalog capability; absence follows the standard tool-capable chat contract. */
+	capabilities?: { tools: boolean };
 	/**
 	 * Optional: chat is the default model type, so models without `type` are chat
 	 * models. Narrow mixed model lists with `isModelType()` instead of comparing

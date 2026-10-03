@@ -227,7 +227,7 @@ describe("generation recovery", () => {
 		await opened.harness.close(context);
 	});
 
-	it("fails no_model when the pinned model is gone after reopen, in request and in poll", async () => {
+	it("refuses missing providers before admission but retains admitted deferred work through repair", async () => {
 		const path = await sqlitePath();
 		const setup = chatSetup({ deferred: { pollAfterMs: 60_000 } });
 		const busy = unanswered();
@@ -259,11 +259,27 @@ describe("generation recovery", () => {
 		await opened.harness.close(context);
 
 		opened = await open(path, empty);
-		opened.harness.resume();
-		expect(await (await opened.harness.submission(polling, context))!.wait(context)).toMatchObject({
-			status: "unanswered",
-			reason: "no_model",
+		// A durable timed wait runs no phase before its deadline, including after replacement.
+		await opened.harness.runPass(context);
+		expect((await opened.harness.submission(polling, context)) !== undefined).toBe(true);
+		empty.now = () => Date.now() + 60_001;
+		await opened.harness.runPass(context);
+		const taskId = await runTaskId(opened.harness);
+		const failed = await opened.harness.getTask(taskId, context);
+		if (failed?.state.status !== "waiting" || failed.state.condition.kind !== "failure")
+			throw new Error("Expected retained deferred polling failure");
+		expect(failed.state).toMatchObject({ mode: "run", checkpoint: { phase: "poll" } });
+		expect(await (await opened.harness.submission(polling, context))!.status(context)).toMatchObject({
+			status: "placed",
 		});
+		const incident = failed.state.condition.incident;
+		await opened.harness.close(context);
+		setup.now = empty.now;
+		opened = await open(path, setup);
+		expect(await opened.harness.retryTask(taskId, incident, context)).toBe("queued");
+		await opened.harness.runPass(context);
+		expect((await (await opened.harness.submission(polling, context))!.wait(context)).status).toBe("done");
+		expect(setup.faux.state.deferredFetchCount).toBe(1);
 		await opened.harness.close(context);
 	});
 

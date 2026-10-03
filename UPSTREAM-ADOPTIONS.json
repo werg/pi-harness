@@ -1,0 +1,39 @@
+{
+  "baseline": "0f8740bb65638180403a225ad7ec4d0cc1f8dedf",
+  "reviewedRelease": "a13d35a742c6ef8462812a28fbe1d8c8b7431c32",
+  "reviewedMain": "7fbbd5f4a1d982bb02d63472dde0774fa639f99b",
+  "mode": "Selective adoption; not a full 1.0.0 monorepo rebase",
+  "files": [
+    {
+      "path": "packages/ai/src/api/openai-responses-shared.ts",
+      "sha256": "09100e0bfe8fa4ad212312956930f4a9e70cd29ca823d2e1f1c97f87b4541afe",
+      "mode": "complete reviewed file"
+    },
+    {
+      "path": "packages/ai/test/constrained-sampling.test.ts",
+      "sha256": "6ea43195759d9f284f2ecdbaab99b89444ef630c8821407ede914ce5a7fe0a5e",
+      "mode": "complete reviewed file"
+    },
+    {
+      "path": "packages/chord/src/types.ts",
+      "sha256": "49ecf6a5dd354c97d068ca57d280c9080d3274c8b04fe720d68742e9216114fb",
+      "mode": "complete reviewed file"
+    },
+    {
+      "path": "packages/durable/README.md",
+      "sha256": "3531c856b03bb0ce6538a9cdfd47a7fb0a50d75e3509233896f4d97de0a959ff",
+      "mode": "complete reviewed file"
+    },
+    {
+      "path": "packages/durable/package.json",
+      "mode": "default export conditions and packaged documentation only; workspace baseline version retained"
+    }
+  ],
+  "retained": "Vibestudio workerd storage, dormant waits, execution pins, tool waves and provider transport changes",
+  "notAdopted": [
+    "CLI/client/server/example changes outside the four distributed libraries",
+    "Cosmetic OAuth logo",
+    "Released changelog history rewrite and version-only changes",
+    "Source-only specification rename; packaged README links to upstream documentation"
+  ]
+}

@@ -1,6 +1,6 @@
 import { arch, platform, release } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
+import { stream as streamAnthropic, streamSimple } from "../src/api/anthropic-messages.ts";
 import { ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV } from "../src/env-api-keys.ts";
 import { createModels } from "../src/models.ts";
 import { anthropicProvider } from "../src/providers/anthropic.ts";
@@ -90,6 +90,27 @@ afterEach(() => {
 });
 
 describe("Anthropic auth token env", () => {
+	it("preserves trusted OAuth mode through simple streaming when the transport owns the credential", async () => {
+		const result = await streamSimple(anthropicModel, context, {
+			apiKey: "transport-placeholder",
+			authType: "oauth",
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(mockState.constructorOpts?.apiKey).toBeNull();
+		expect(mockState.constructorOpts?.authToken).toBe("transport-placeholder");
+		expect(mockState.createParams?.betas).toContain("oauth-2025-04-20");
+		expect(mockState.createParams?.system).toEqual([
+			expect.objectContaining({ text: "You are Claude Code, Anthropic's official CLI for Claude." }),
+			expect.objectContaining({ text: "System prompt." }),
+		]);
+	});
+
+	it("uses an explicit API-key mode instead of inferring OAuth from an opaque key", async () => {
+		await streamSimple(anthropicModel, context, { apiKey: "sk-ant-oat-looking-key", authType: "api_key" }).result();
+		expect(mockState.constructorOpts?.apiKey).toBe("sk-ant-oat-looking-key");
+		expect(mockState.constructorOpts?.authToken).toBeNull();
+		expect(mockState.createParams?.betas ?? []).not.toContain("oauth-2025-04-20");
+	});
 	it("resolves ANTHROPIC_AUTH_TOKEN as a bearer Authorization header", async () => {
 		const provider = anthropicProvider();
 		const auth = await provider.auth.apiKey?.resolve({

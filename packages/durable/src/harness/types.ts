@@ -2,9 +2,13 @@ import type { AttachedReplicatedState, Context, JsonValue } from "@earendil-work
 import type {
 	AssistantMessage,
 	CacheRetention,
+	DeferredHandle,
 	Message,
 	Models,
+	ModelsRequestTransforms,
 	ModelThinkingLevel,
+	OpenAICodexResponsesOptions,
+	SimpleStreamOptions,
 	Static,
 	Tool,
 	ToolCall,
@@ -36,10 +40,14 @@ import type {
 	TaskOptions,
 	TaskRecord,
 	TaskState,
+	TaskWaitCondition,
 	Tx,
 	WatchHandle,
 } from "../types.ts";
+import type { PinnedMessages, PinnedModel } from "./json.ts";
+import type { WakeSchedule } from "./live.ts";
 import type { TaskGraph, TaskGraphWatch } from "./task-graph.ts";
+import type { DirectToolCall, ToolTaskResult } from "./tool.ts";
 import type { UsageState } from "./usage.ts";
 import type { ConversationView } from "./view.ts";
 
@@ -57,19 +65,28 @@ export type SubmissionDraft = {
 } & (
 	| {
 			readonly type: "input";
-			readonly content: UserInput;
+			readonly content: UserInput | SubmissionPrepare<UserInput>;
 			readonly whenBusy?: "steer" | "followUp" | "reject";
 			readonly entry?: never;
 	  }
 	| {
 			readonly type: "write";
-			readonly entry: EntryDraft;
+			readonly entry: EntryDraft | SubmissionPrepare<EntryDraft>;
 			readonly content?: never;
 			readonly whenBusy?: never;
 	  }
 );
 
 export type InputSubmissionDraft = Extract<SubmissionDraft, { readonly type: "input" }>;
+
+/**
+ * Prepare a payload and local writes in the same admission commit, using the reserved submission identity. Runs only
+ * for fresh admission, never for a request-ID replay or busy rejection. The payload follows the ordinary native
+ * inbox/placement rules. A throw rolls back every native and local write. Document access remains available; table
+ * reads throw `ReadAfterWrite`. `tx.createTask()` defaults to this conversation. Await every Tx operation; do not
+ * call Session APIs or perform external effects here.
+ */
+export type SubmissionPrepare<T> = (tx: Tx, submissionId: SubmissionId) => T | Promise<T>;
 
 export type SettledSubmissionRecord = SubmissionRecord & {
 	readonly status: "done" | "unanswered";
@@ -153,6 +170,9 @@ export type ToolExecutionResult<TDetails extends JsonValue = JsonValue> = {
 	readonly control?: ToolControl;
 };
 
+/** A committed external continuation; returning it releases this invocation. */
+export type ToolExecutionWait = { readonly wait: TaskWaitCondition; readonly continuation: JsonValue };
+
 /** Whether the tools of one round run at once or one after another in call order. */
 export type ToolExecutionMode = "parallel" | "sequential";
 
@@ -167,6 +187,10 @@ export interface ToolExecutionApi<TDetails extends JsonValue = JsonValue> extend
 	readonly taskId: TaskId;
 	readonly conversationId: ConversationId;
 	readonly callId: string;
+	/** Immutable JSON context captured from the original offered definition, independent of the current registry. Each read is detached. */
+	readonly executionData: JsonValue | undefined;
+	/** Committed continuation from the prior invocation, absent on first admission. */
+	readonly continuation: JsonValue | undefined;
 	/** The tool task's phase snapshot. */
 	readonly registry: RegistrySnapshot;
 	/** The calling conversation's agent, as the tool task's phase resolved it. */
@@ -180,6 +204,12 @@ export interface ToolExecutionApi<TDetails extends JsonValue = JsonValue> extend
 	/** Replace running details; the last value becomes the result details when the result omits `details`. */
 	details(value: TDetails, context: Context): Promise<void>;
 	commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T>;
+	/** Commit an external operation's continuation and original binding before uncertain dispatch. Subsequent failures retain this task for exact repair or cancellation. */
+	retainContinuation(
+		continuation: JsonValue,
+		change: (tx: Tx) => void | Promise<void>,
+		context: Context,
+	): Promise<void>;
 	memo<T extends JsonValue>(name: string, context: Context): Promise<T | undefined>;
 	memo<T extends JsonValue>(name: string, candidate: T, context: Context): Promise<T>;
 	createTask<I, S extends { phase: string }, R, H extends object>(
@@ -194,6 +224,16 @@ export interface ToolExecutionApi<TDetails extends JsonValue = JsonValue> extend
 	conversation(id: ConversationId, context: Context): Promise<ConversationHandle | undefined>;
 }
 
+/** Executable contract offered by one prepared request; independent of later agent settings. */
+export type ToolBinding = {
+	name: string;
+	version: number;
+	signature: string;
+	executionMode: ToolExecutionMode;
+	/** Original offered operation context; separate from the executable's semantic signature. */
+	data?: JsonValue;
+};
+
 /**
  * Executable tool registered in a registry. Only pi-ai `Tool` fields enter the transcript. `args` are typed by
  * `parameters`, which the Harness validates them against before `execute()`; `defineTool()` infers both generics.
@@ -202,9 +242,13 @@ export type ToolRegistration<
 	TParameters extends TSchema = TSchema,
 	TDetails extends JsonValue = JsonValue,
 > = Tool<TParameters> & {
+	/** Positive semantic version; default 1. Bump when execution/cancellation/hook semantics change. */
+	readonly version?: number;
+	/** JSON operation context captured when this definition is offered or directly bound, before execution. */
+	readonly executionData?: JsonValue;
 	/** Whether an interrupted execution may rerun on recovery. Default `unsafe`. */
 	readonly replay?: "safe" | "unsafe";
-	/** Default: the settings' `toolExecution`. One sequential call makes its whole round sequential. */
+	/** Default: the settings' `toolExecution`. A sequential call is a barrier between parallel-safe waves. */
 	readonly executionMode?: ToolExecutionMode;
 	/**
 	 * Repair arguments models commonly get wrong before validation, such as a JSON string where an array belongs. Must be
@@ -221,7 +265,13 @@ export type ToolRegistration<
 		args: Static<TParameters>,
 		api: ToolExecutionApi<TDetails>,
 		context: Context,
-	): Promise<ToolExecutionResult<TDetails>>;
+	): Promise<ToolExecutionResult<TDetails> | ToolExecutionWait>;
+	/** External tools cancel/attach by their immutable identity; cleanup may itself park. */
+	cancel?(
+		args: Static<TParameters>,
+		api: ToolExecutionApi<TDetails>,
+		context: Context,
+	): Promise<ToolExecutionResult<TDetails> | ToolExecutionWait>;
 };
 
 /** Input to system prompt section rendering for one request preparation. */
@@ -267,6 +317,8 @@ export interface Extension<Tool extends ToolRegistration = ToolRegistration> {
 
 /** Immutable view of one published registry state. */
 export interface RegistrySnapshot<Tool extends ToolRegistration = ToolRegistration> {
+	/** Activation-local publication identity; a different activation always rechecks parked bindings. */
+	readonly revision: string;
 	installed(): readonly Extension<Tool>[];
 	extension(name: string): Extension<Tool> | undefined;
 	/** Every installed tool with its extension, in install order. Names may repeat across extensions. */
@@ -297,6 +349,7 @@ export interface Registry<Tool extends ToolRegistration = ToolRegistration> exte
 export type AgentState = {
 	model?: ModelRef;
 	thinkingLevel?: ModelThinkingLevel;
+	stream?: ConversationStreamOptions;
 	/** An array selects exactly these extensions, in order. An object edits the host default selection. */
 	extensions?: string[] | { add?: string[]; remove?: string[] };
 	/** Filters the selected extensions' tools. An array offers exactly these, in order. */
@@ -311,6 +364,7 @@ export type AgentState = {
 export type AgentChange = {
 	readonly model?: ModelRef | null;
 	readonly thinkingLevel?: ModelThinkingLevel | null;
+	readonly stream?: ConversationStreamOptions | null;
 	readonly extensions?:
 		| readonly Extension[]
 		| { readonly add?: readonly Extension[]; readonly remove?: readonly Extension[] }
@@ -324,6 +378,7 @@ export type AgentChange = {
 export type Agent<Tool extends ToolRegistration = ToolRegistration> = {
 	readonly model?: ModelRef;
 	readonly thinkingLevel: ModelThinkingLevel;
+	readonly stream: ConversationStreamOptions;
 	readonly extensions: readonly Extension<Tool>[];
 	/** The tools a request offers, in order. */
 	readonly tools: readonly Tool[];
@@ -348,6 +403,7 @@ export type ConversationCreateOptions = {
 
 /** Curated pi-ai request options; absent fields use pi-ai defaults. */
 export type ConversationStreamOptions = {
+	serviceTier?: OpenAICodexResponsesOptions["serviceTier"];
 	transport?: Transport;
 	timeoutMs?: number;
 	/** Provider/SDK retries inside one request attempt. */
@@ -358,6 +414,80 @@ export type ConversationStreamOptions = {
 	cacheRetention?: CacheRetention;
 	deferred?: boolean | { window?: "15m" | "1h" | "24h" };
 };
+
+/** Durable input selected by the task before acquiring authentication or opening transport. */
+export type ModelRequestInput = {
+	readonly purpose: string;
+	readonly attempt: number;
+	readonly model: PinnedModel;
+	readonly messages: PinnedMessages;
+	readonly cutoff: EntryId;
+	readonly options: ConversationStreamOptions & Pick<SimpleStreamOptions, "reasoning" | "maxTokens">;
+} & (
+	| { readonly operation: "stream" | "complete"; readonly handle?: never }
+	| { readonly operation: "fetchDeferred" | "cancelDeferred"; readonly handle: DeferredHandle }
+);
+
+/** Identity stamped by the scheduler, never supplied by a model/tool caller. */
+export type ModelRequestTarget = ModelRequestInput & {
+	readonly taskId: TaskId;
+	readonly conversationId: ConversationId;
+	readonly taskKind: string;
+	readonly taskVersion: number;
+};
+
+/** Activation-local authentication, attributed transports and observers; never checkpointed. */
+export type ModelRequestCapabilities = Pick<
+	SimpleStreamOptions,
+	| "apiKey"
+	| "authType"
+	| "env"
+	| "fetch"
+	| "connectWebSocket"
+	| "telemetryContext"
+	| "onPayload"
+	| "onResponse"
+	| "onProviderStreamEvent"
+	| "sessionId"
+> &
+	ModelsRequestTransforms;
+
+/** Pending access has a real durable readiness source, with no resident approval wait. */
+export type ModelRequestWait = {
+	readonly status: "waiting";
+	readonly condition: Extract<TaskWaitCondition, { readonly kind: "input" | "receipt" | "registry" }>;
+};
+
+/** A connection owns its transports until close joins them, including cancellation and late acquisition. */
+export type ModelRequestConnection = {
+	readonly status: "ready";
+	readonly options: ModelRequestCapabilities;
+	/** Retain ownership of uncertain resources if cleanup rejects; the product owner must still release them. */
+	close(context: Context): Promise<void>;
+};
+
+/** The invoking task's mutation boundary; never open another Session from a model port. */
+export interface ModelRequestApi {
+	/** Detached committed effective target, absent until endpoint preparation; original intent remains unchanged. */
+	readonly prepared: ModelRequestTarget | undefined;
+	/**
+	 * Commit the effective endpoint before provider-specific admission or transport. Only baseUrl may differ from the
+	 * selected descriptor. Same preparation is idempotent; conflicting reuse rejects. Deferred observations and
+	 * cancellation reuse this round's exact endpoint. Scoped to the invoking request and task lifecycle.
+	 */
+	prepare(model: ModelRequestTarget["model"], context: Context): Promise<ModelRequestTarget>;
+	/** Scoped to this request and invocation. Commit admission rejects after either ends or is cancelled. */
+	commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T>;
+}
+
+/** The embedding binds authority, credentials and transport to each committed model invocation. */
+export type ModelRequestPort = (
+	request: ModelRequestTarget,
+	api: ModelRequestApi,
+	context: Context,
+) => Promise<ModelRequestConnection | ModelRequestWait>;
+
+export type ModelRequestResult<T> = { readonly status: "completed"; readonly result: T } | ModelRequestWait;
 
 /** Durable generation attempt retries; the JSON shape of pi-ai `RetryPolicy`. */
 export type ConversationRetryPolicy = {
@@ -420,9 +550,20 @@ export type EnvTarget = {
 	readonly read: DocumentReader;
 };
 
+/** Detached, recursively frozen candidates staged before the embedding's commit preparation. */
+export type HarnessCommit = {
+	readonly entries: readonly EntryRecord[];
+	readonly submissions: readonly SubmissionRecord[];
+	readonly tasks: readonly TaskRecord<JsonValue, JsonValue, JsonValue>[];
+};
+
 export type HarnessOptions<Tool extends ToolRegistration = ToolRegistration> = {
+	/** Publish durable schedules outside the mutation line. Omitted: a local clock adapter owns the timer. */
+	readonly publishWake?: (schedule: WakeSchedule) => Promise<void>;
 	/** pi-ai model access used by generation. */
 	readonly models: Models;
+	/** Omitted: ordinary pi-ai authentication and transport. Product embeddings supply a protected port. */
+	readonly modelRequests?: ModelRequestPort;
 	readonly registry: RegistryReader<Tool>;
 	readonly settings?: HarnessSettings;
 	/** Builds a conversation's environment at each use. Never called on the Session line; may be async. */
@@ -433,6 +574,14 @@ export type HarnessOptions<Tool extends ToolRegistration = ToolRegistration> = {
 	 * Table reads throw `ReadAfterWrite`, as in `init`; a throw fails the creating commit.
 	 */
 	readonly conversationCreated?: (tx: Tx, conversation: ConversationRecord) => void | Promise<void>;
+	/**
+	 * Runs once after each commit callback settles, before native scheduler preparation and Storage admission. The
+	 * snapshot includes appended entries, resolved submission candidates and created/replaced task candidates; writes made here are not fed back into
+	 * this hook. Derived documents, entries and tasks join the same atomic batch and native wake schedule. A throw
+	 * rolls back the whole commit. Await every Tx operation; table reads retain the ordinary ReadAfterWrite restriction.
+	 * Do not call Session APIs or perform external effects here. Reopen may call this with no staged entries or tasks.
+	 */
+	readonly prepareCommit?: (tx: Tx, staged: HarnessCommit, context: Context) => void | Promise<void>;
 	readonly now?: () => number;
 	/** Receives extension failures that do not fail the calling operation. Must not throw. */
 	readonly onReport?: (error: unknown) => void;
@@ -449,13 +598,18 @@ export type TaskInspection = {
 		 * Waits for these live tasks: the live part of its `on`, or, when abort-marked, its live ordinary owned work, which
 		 * must end before its abort handler starts.
 		 */
-		| { readonly kind: "waiting"; readonly on: readonly TaskId[] }
+		| { readonly kind: "waiting"; readonly on: readonly TaskId[]; readonly condition?: TaskWaitCondition }
 		/** Outcome held until its ordinary owned work drains. */
 		| { readonly kind: "completing" }
-		/** No registered definition can take it; aborting it settles it as `orphaned`. */
+		/** Unavailable executable binding or a failed invocation; ownership remains live. */
 		| {
 				readonly kind: "blocked";
-				readonly reason: "missing_task" | "task_too_old" | "migration_failed";
+				readonly reason:
+					| "missing_task"
+					| "task_too_old"
+					| "migration_failed"
+					| "incompatible_binding"
+					| "invocation_failed";
 				readonly error?: unknown;
 		  };
 };
@@ -480,6 +634,36 @@ export type ContextView = {
 	readonly messages: readonly Message[];
 };
 
+/** Knowledge-only entry graph: local source IDs locate heads and edits, never executable task attribution. */
+export type ConversationHistoryEntry = Pick<EntryRecord, "id" | "model" | "head" | "edits"> & {
+	/** Positional system entries retain their role in native prompt-baseline replay. */
+	readonly system?: true;
+};
+
+/**
+ * Detached immutable transcript knowledge at an exact visible frontier. Contains no tasks, submissions, receipts,
+ * waits, authority, arbitrary entry data, or copied documents. A null frontier deliberately exports no entries and
+ * pins the source's currently committed agent settings; an entry frontier pins settings as of that entry's commit.
+ * The embedding authenticates the source owner separately; these IDs are local transcript provenance only.
+ */
+export type ConversationHistory = {
+	readonly source: { readonly conversationId: ConversationId; readonly at: EntryId | null };
+	readonly agent: Readonly<AgentState>;
+	readonly entries: readonly ConversationHistoryEntry[];
+};
+
+/** Exact receiving entry IDs allocated by the native import, detached and frozen before initialization. */
+export type ConversationHistoryEntryMap = Readonly<Record<EntryId, EntryId>>;
+
+/** Bind receiving knowledge provenance in the same creating commit, without reading newly staged native tables. */
+export type ConversationHistoryImportOptions = Omit<ConversationCreateOptions, "init"> & {
+	readonly init?: (
+		tx: Tx,
+		conversationId: ConversationId,
+		entryIds: ConversationHistoryEntryMap,
+	) => void | Promise<void>;
+};
+
 /** Stateless handle for one conversation, bound to the Harness that returned it. Compare handles by `id`. */
 export interface Conversation {
 	readonly id: ConversationId;
@@ -491,9 +675,16 @@ export interface Conversation {
 
 	/**
 	 * Durably admit user input or a passive entry write. A busy conversation, or one with queued items, queues it in
-	 * `pi.inbox`; `whenBusy: "reject"` rejects with `ConversationBusy` instead and writes nothing.
+	 * `pi.inbox`; `whenBusy: "reject"` rejects with `ConversationBusy` instead and writes nothing. A payload factory
+	 * composes local writes and payload preparation with fresh admission atomically; request-ID replay skips it.
 	 */
 	submit(submission: SubmissionDraft, context: Context): Promise<Submission>;
+	/** Invoke an actually selected tool without a model call, using the same native task lifecycle. */
+	invokeTool(
+		call: DirectToolCall,
+		context: Context,
+		options?: { readonly background?: boolean },
+	): Promise<TaskId<ToolTaskResult>>;
 	/**
 	 * Admit a write of a `pi.reset` entry that starts a new context, carrying `handoff` as a user message when given.
 	 * Resolves after admission; while busy, it is placed at the next boundary.
@@ -516,6 +707,8 @@ export interface Conversation {
 		context: Context,
 	): Promise<Page<EntryRecord, Cursor>>;
 	fork(at: EntryId, options: ConversationCreateOptions, context: Context): Promise<Conversation>;
+	/** Export knowledge through exactly this visible entry; null deliberately selects an empty prefix. */
+	exportHistory(at: EntryId | null, context: Context): Promise<ConversationHistory>;
 	/**
 	 * Withdraw queued inputs (queued writes stay), mark every live non-background task of the ordinary ownership scope,
 	 * signal them, and resolve once the scope is idle. Background subtrees survive unless `background` is set.
@@ -536,6 +729,10 @@ export type ConversationWatch = WatchHandle<ConversationView>;
 
 /** Durable agent harness over one Session. */
 export interface Harness extends Session {
+	/** Publish the current committed schedule again, e.g. after a host recovery scan. */
+	flushWake(context: Context): Promise<WakeSchedule>;
+	/** Run one finite pass and wait until its invocations have released. */
+	runPass(context: Context): Promise<WakeSchedule>;
 	/**
 	 * Enable task scheduling. Idempotent; throws after close. Calls that ask for progress enable it too:
 	 * `Conversation.submit()`, `Conversation.compact()`, `Conversation.abort()`, `Submission.wait()`, `waitForTask()`,
@@ -550,6 +747,12 @@ export interface Harness extends Session {
 	): Promise<Conversation>;
 	conversation(id: ConversationId, context: Context): Promise<Conversation | undefined>;
 	createConversation(options: ConversationCreateOptions, context: Context): Promise<Conversation>;
+	/** Create fresh ownership and import only transcript knowledge atomically, then apply receiving agent/init options. */
+	importHistory(
+		history: ConversationHistory,
+		options: ConversationHistoryImportOptions,
+		context: Context,
+	): Promise<Conversation>;
 
 	getTask<R>(id: TaskId<R>, context: Context): Promise<TaskRecord<JsonValue, JsonValue, R> | undefined>;
 	/** Live tasks and unsettled submissions. Writes nothing and runs no task code. */
@@ -563,11 +766,13 @@ export interface Harness extends Session {
 		conversationId?: ConversationId,
 	): Promise<"aborted" | "already_placed" | "settled" | "not_found">;
 	/**
-	 * Commit the abort mark, signal and join an active run invocation, and schedule the abort invocation. A task whose
-	 * definition cannot take it settles as `orphaned` instead.
+	 * Commit the abort mark, signal and join an active run invocation, and schedule cleanup. Unavailable definitions
+	 * park on registry publication. Repeating cancellation never retries a failed cleanup attempt.
 	 */
 	abortTask(id: TaskId, context: Context): Promise<"marked" | "terminal">;
-	/** Resolve with the terminal receipt; cancelling `context` cancels only this wait. */
+	/** Retry only the named failed invocation incident, in its retained run/abort mode. Stale/duplicate repair cannot retry a newer failure. */
+	retryTask(id: TaskId, incident: EntryId, context: Context): Promise<"queued" | "stale" | "terminal">;
+	/** Resolve with the terminal receipt; a retained invocation failure rejects while preserving ownership. Caller cancellation ends only this wait. */
 	waitForTask<R>(id: TaskId<R>, context: Context): Promise<SettledTask<R>>;
 	/** Resolve when the ordinary ownership scope of every ownerless conversation has no live non-background task. */
 	waitForIdle(context: Context): Promise<void>;
@@ -589,16 +794,36 @@ export interface HookApi extends DocumentReader {
 
 export type HookResult<T> = T | undefined | Promise<T | undefined>;
 
+/** A request-policy change for the same input run after an actual provider error. */
+export type GenerationRetrySelection = {
+	readonly model: ModelRef;
+	readonly thinkingLevel?: ModelThinkingLevel;
+	readonly stream?: ConversationStreamOptions;
+};
+
+export type GenerationResponseRequest = {
+	readonly attempt: number;
+	readonly model: PinnedModel;
+	readonly thinkingLevel: ModelThinkingLevel;
+	readonly streamOptions: ConversationStreamOptions;
+	readonly cutoff: EntryId;
+};
+
 /** Hooks of the built-in generation task. */
 export interface GenerationHooks {
-	/** Before every request attempt, including recovery; the result is used for that request only. */
+	/** Before actual input binding commits; committed request recovery does not rerun this hook. */
 	beforeRequest(
 		request: { readonly messages: readonly Message[] },
 		api: HookApi,
 		context: Context,
 	): HookResult<{ readonly messages: readonly Message[] }>;
 	/** Every terminal provider message, before classification. */
-	afterResponse(message: AssistantMessage, api: HookApi, context: Context): void | Promise<void>;
+	afterResponse(
+		message: AssistantMessage,
+		api: HookApi,
+		context: Context,
+		request: GenerationResponseRequest,
+	): void | Promise<void> | HookResult<{ readonly retry: GenerationRetrySelection }>;
 	/** A final answer; the first `continue` appends a user message and continues the run. */
 	onYield(answer: AssistantMessage, api: HookApi, context: Context): HookResult<{ readonly continue: UserInput }>;
 	/** After every tool of the round is terminal; `results` are the round's result entries in call order. */

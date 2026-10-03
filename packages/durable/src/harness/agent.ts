@@ -7,6 +7,7 @@ import type {
 	AgentState,
 	CompactionPolicy,
 	ConversationRetryPolicy,
+	ConversationStreamOptions,
 	Extension,
 	HarnessSettings,
 	PromptSection,
@@ -89,6 +90,12 @@ function applyChange(state: Draft<AgentState>, change: AgentChange): void {
 	};
 	set("model", change.model === undefined || change.model === null ? change.model : { ...change.model });
 	set("thinkingLevel", change.thinkingLevel);
+	set(
+		"stream",
+		change.stream === undefined || change.stream === null
+			? change.stream
+			: (copyJson(change.stream, { omitUndefinedProperties: true }) as ConversationStreamOptions),
+	);
 	const extensions = change.extensions;
 	set(
 		"extensions",
@@ -200,6 +207,7 @@ export function resolveAgent<Tool extends ToolRegistration>(
 	const agent: Agent<Tool> = {
 		...(state?.model === undefined ? {} : { model: state.model }),
 		thinkingLevel: state?.thinkingLevel ?? "off",
+		stream: { ...settings.stream, ...state?.stream },
 		extensions,
 		tools,
 		sections: agentSections,

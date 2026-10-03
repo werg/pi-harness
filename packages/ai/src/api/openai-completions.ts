@@ -358,6 +358,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				cacheRetention,
 				grammarToolInputProperties,
 			);
+			// llama.cpp reports prompt processing on this request's completion stream.
+			if (model.provider === "local") Object.assign(params, { return_progress: true });
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
@@ -550,6 +552,9 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				return block;
 			};
 
+			let lastPromptProcessed = -1;
+			let promptTotal: number | undefined;
+			let promptCache: number | undefined;
 			for await (const chunk of openaiStream) {
 				await options?.onProviderStreamEvent?.(chunk, model);
 				if (!chunk || typeof chunk !== "object") continue;
@@ -559,6 +564,40 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				output.responseId ||= chunk.id;
 				if (typeof chunk.model === "string" && chunk.model.length > 0 && chunk.model !== model.id) {
 					output.responseModel ||= chunk.model;
+				}
+				const progress = (chunk as ChatCompletionChunk & { prompt_progress?: unknown }).prompt_progress;
+				if (progress && typeof progress === "object" && !Array.isArray(progress)) {
+					const prompt = progress as Record<string, unknown>;
+					if (
+						typeof chunk.id === "string" &&
+						chunk.id.length > 0 &&
+						chunk.id === output.responseId &&
+						typeof prompt.total === "number" &&
+						Number.isSafeInteger(prompt.total) &&
+						prompt.total > 0 &&
+						typeof prompt.processed === "number" &&
+						Number.isSafeInteger(prompt.processed) &&
+						prompt.processed >= 0 &&
+						prompt.processed <= prompt.total &&
+						typeof prompt.cache === "number" &&
+						Number.isSafeInteger(prompt.cache) &&
+						prompt.cache >= 0 &&
+						prompt.cache <= prompt.total &&
+						(promptTotal === undefined || promptTotal === prompt.total) &&
+						(promptCache === undefined || promptCache === prompt.cache) &&
+						prompt.processed > lastPromptProcessed
+					) {
+						promptTotal = prompt.total;
+						promptCache = prompt.cache;
+						lastPromptProcessed = prompt.processed;
+						stream.push({
+							type: "prompt_progress",
+							total: prompt.total,
+							processed: prompt.processed,
+							cache: prompt.cache,
+							partial: output,
+						});
+					}
 				}
 				if (chunk.usage) {
 					output.usage = parseChunkUsage(chunk.usage, model);

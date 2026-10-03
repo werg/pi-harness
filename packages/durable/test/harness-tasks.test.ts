@@ -268,7 +268,10 @@ describe("task phases", () => {
 				wait: async (_task, runtime, ctx) => {
 					order.push("wait");
 					const checkpoint = { phase: "resume" } as const;
-					await runtime.commit(() => ({ status: "waiting", checkpoint, on, policy: "allSettled" }), ctx);
+					await runtime.commit(
+						() => ({ status: "waiting", checkpoint, condition: { kind: "tasks", on: on, policy: "allSettled" } }),
+						ctx,
+					);
 				},
 				resume: async (_task, runtime, ctx) => {
 					order.push("resume");
@@ -299,7 +302,10 @@ describe("task phases", () => {
 		await eventually(() => order.length === 3);
 		await flush();
 		expect(order.sort()).toEqual(["faulting", "first", "wait"]);
-		expect((await harness.getTask(waiter, context))?.state).toMatchObject({ status: "waiting", on });
+		expect((await harness.getTask(waiter, context))?.state).toMatchObject({
+			status: "waiting",
+			condition: { kind: "tasks", on },
+		});
 		gate.resolve();
 		await harness.waitForTask(waiter, context);
 		expect(order.at(-1)).toBe("resume");
@@ -965,19 +971,22 @@ describe("task abort", () => {
 		await harness.close(context);
 	});
 
-	it("aborts waiting work before its wait ends and faults abort handlers that throw or settle nothing", async () => {
+	it("aborts waiting work before its dependency ends and retains failed cleanup until explicit repair", async () => {
 		const gate = deferred();
 		const First = gated("test.dependency", gate.promise);
 		let first: TaskId | undefined;
 		const wait = async (_task: unknown, runtime: StepRuntime<null>, ctx: Context): Promise<void> => {
 			const checkpoint = { phase: "run" } as const;
-			await runtime.commit(() => ({ status: "waiting", checkpoint, on: [first!], policy: "allSettled" }), ctx);
+			await runtime.commit(
+				() => ({ status: "waiting", checkpoint, condition: { kind: "tasks", on: [first!], policy: "allSettled" } }),
+				ctx,
+			);
 		};
 		const Lazy = oneStep("test.lazy-abort", wait, async () => {});
 		const Throwing = oneStep("test.throwing-abort", wait, async () => {
 			throw new Error("abort failed");
 		});
-		const { harness, root } = await openRoot([First, Lazy, Throwing]);
+		const { harness, root, registry } = await openRoot([First, Lazy, Throwing]);
 		first = await start(root, First);
 		const lazy = await start(root, Lazy);
 		const throwing = await start(root, Throwing);
@@ -986,14 +995,32 @@ describe("task abort", () => {
 		await eventually(async () => (await harness.getTask(lazy, context))?.state.status === "waiting");
 		await harness.abortTask(lazy, context);
 		await harness.abortTask(throwing, context);
-		expect((await harness.waitForTask(lazy, context)).state.outcome).toEqual({
-			status: "faulted",
-			error: { message: `Abort handler of task ${lazy} returned without a terminal outcome` },
-		});
-		expect((await harness.waitForTask(throwing, context)).state.outcome).toEqual({
-			status: "faulted",
-			error: { message: "abort failed" },
-		});
+		await expect(harness.waitForTask(lazy, context)).rejects.toThrow(
+			`Abort handler of task ${lazy} returned without a terminal outcome`,
+		);
+		await expect(harness.waitForTask(throwing, context)).rejects.toThrow("abort failed");
+		for (const [id, definition] of [
+			[lazy, Lazy],
+			[throwing, Throwing],
+		] as const) {
+			const failed = await harness.getTask(id, context);
+			if (failed?.state.status !== "waiting" || failed.state.condition.kind !== "failure")
+				throw new Error("Expected failed cleanup wait");
+			expect(failed.abortRequested).toBe(true);
+			expect(failed.state.checkpoint).toEqual({ phase: "run" });
+			registry.install({
+				name: "tasks",
+				tasks: [First, Lazy, Throwing].map((task) =>
+					task === definition
+						? oneStep(definition.definition.name, wait)
+						: registry.snapshot().task(task.definition.name)!,
+				),
+			});
+			expect(await harness.retryTask(id, failed.state.condition.incident, context)).toBe("queued");
+			await expect(harness.waitForTask(id, context)).resolves.toMatchObject({
+				state: { outcome: { status: "aborted", reason: "test" } },
+			});
+		}
 		expect((await harness.getTask(first, context))?.state.status).toBe("running");
 		gate.resolve();
 		await harness.waitForTask(first, context);

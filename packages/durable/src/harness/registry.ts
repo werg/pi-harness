@@ -1,5 +1,6 @@
 import { INSTRUCTIONS_KEY } from "./agent.ts";
 import { CompactionTask } from "./compaction.ts";
+import { bindTool } from "./define.ts";
 import { GenerationTask } from "./generation.ts";
 import { ToolTask } from "./tool.ts";
 import type { AnyTask, Extension, PromptSection, Registry, RegistrySnapshot, ToolRegistration } from "./types.ts";
@@ -11,6 +12,7 @@ export const BUILTIN_TASKS: readonly AnyTask[] = [GenerationTask, ToolTask, Comp
 
 /** Immutable published registry state. */
 class RegistryState<Tool extends ToolRegistration> implements RegistrySnapshot<Tool> {
+	readonly revision = crypto.randomUUID();
 	readonly #extensions: readonly Extension<Tool>[];
 	readonly #byName: ReadonlyMap<string, Extension<Tool>>;
 	readonly #tasks: ReadonlyMap<string, AnyTask>;
@@ -96,6 +98,7 @@ class RegistryImpl<Tool extends ToolRegistration> implements Registry<Tool> {
 function validateExtension(extension: Extension): void {
 	const tools = new Set<string>();
 	for (const tool of extension.tools ?? []) {
+		bindTool(tool, "parallel");
 		if (tools.has(tool.name)) throw new Error(`Extension ${extension.name} has two tools named ${tool.name}`);
 		tools.add(tool.name);
 	}

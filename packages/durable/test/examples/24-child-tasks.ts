@@ -69,7 +69,11 @@ const Checkout = defineTask<{ cards: string[] }, CheckoutState, string>({
 				for (const card of task.input.cards) {
 					payments.push(await tx.createTask(Payment, { card }, { ownership: { kind: "task", taskId: task.id } }));
 				}
-				return { status: "waiting", checkpoint: { phase: "decide", payments }, on: payments, policy: "failFast" };
+				return {
+					status: "waiting",
+					checkpoint: { phase: "decide", payments },
+					condition: { kind: "tasks", on: payments, policy: "failFast" },
+				};
 			}, taskContext);
 		},
 		decide: async (task, runtime, taskContext) => {
@@ -103,7 +107,12 @@ function printGraph(graph: TaskGraph): void {
 	const nodes = Object.values(graph.tasks);
 	const print = (node: TaskGraphNode, depth: number): void => {
 		const state = node.state;
-		const status = state.status === "waiting" ? `waiting on ${state.on.join(", ")}` : state.status;
+		const status =
+			state.status === "waiting"
+				? state.condition.kind === "tasks"
+					? `waiting on ${state.condition.on.join(", ")}`
+					: `waiting for ${state.condition.kind}`
+				: state.status;
 		console.log(`  ${"  ".repeat(depth)}${node.kind} ${node.id}: ${status}`);
 		for (const child of nodes.filter((candidate) => candidate.owner === node.id)) print(child, depth + 1);
 	};

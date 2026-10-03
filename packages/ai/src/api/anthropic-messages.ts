@@ -634,6 +634,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					copilotDynamicHeaders,
 					cacheSessionId,
 					federation,
+					options?.authType,
 				);
 				client = created.client;
 				isOAuth = created.isOAuthToken;
@@ -989,6 +990,7 @@ function createClient(
 	dynamicHeaders?: Record<string, string>,
 	sessionId?: string,
 	federation?: AnthropicFederationConfig,
+	authType?: StreamOptions["authType"],
 ): { client: Anthropic; isOAuthToken: boolean } {
 	// Copilot: Bearer auth.
 	if (model.provider === "github-copilot") {
@@ -1013,7 +1015,7 @@ function createClient(
 	}
 
 	// OAuth: Bearer auth, Claude Code identity headers
-	if (apiKey && isOAuthToken(apiKey)) {
+	if (authType === "oauth" || (authType === undefined && apiKey && isOAuthToken(apiKey))) {
 		const client = new PiAnthropic({
 			apiKey: null,
 			authToken: apiKey,

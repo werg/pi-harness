@@ -18,10 +18,11 @@ import {
 	CompactionTask,
 	type ContextView,
 	type Conversation,
+	createRegistry,
 	defineTask,
 	defineTool,
 	type EntryRecord,
-	type Harness,
+	Harness,
 	LiveDoc,
 	MemoryStorage,
 	StorageRejected,
@@ -997,7 +998,7 @@ describe("blocking threshold compaction", () => {
 		expect(child).toMatchObject({ owner: generation, background: false, input: { reason: "threshold" } });
 		expect((await chat.harness.getTask(generation, context))?.state).toMatchObject({
 			status: "waiting",
-			on: [child!.id],
+			condition: { kind: "tasks", on: [child!.id] },
 			checkpoint: { phase: "prepare", attempt: 1, compacted: child!.id },
 		});
 		expect((await live(chat)).compactions).toEqual([
@@ -1608,9 +1609,7 @@ describe("compaction recovery", () => {
 		expect((await result(chat, id)).status).toBe("completed");
 		expect(chat.faux.summaryRequests).toHaveLength(2);
 		const [, resent] = chat.faux.summaryRequests;
-		expect(resent!.messages).toEqual(
-			chat.faux.summaryRequests[0]!.messages.map((message) => ({ ...message, timestamp: expect.any(Number) })),
-		);
+		expect(resent!.messages).toEqual(chat.faux.summaryRequests[0]!.messages);
 		const usage = (await chat.harness.snapshot(UsageDoc, chat.root.id, context))!.models["faux/faux-1"]!;
 		expect(usage.input).toBeGreaterThan(usageBefore.input);
 		expect(usage.output - usageBefore.output).toBe(2);
@@ -2203,41 +2202,105 @@ describe("compaction pinning, silent overflow, and late policy changes", () => {
 });
 
 describe("blocked compaction", () => {
-	it("survives reopen blocked and is orphaned on abort with its status removed", async () => {
+	it("retains blocked cancellation and status through reopen until compatible cleanup completes", async () => {
 		const path = await sqlitePath();
 		const setup = chatSetup();
 		let { harness, root } = await openChat(await openNodeSqliteStorage(path), setup);
-		// A compaction stored by a newer version than this process registers, for example after a downgrade.
-		const newer = { definition: { ...CompactionTask.definition, version: 2 } } as typeof CompactionTask;
-		const id = await root.commit(async (tx) => {
-			const taskId = await tx.createTask(newer, { reason: "manual" }, { ownership: { kind: "conversation" } });
-			const live = await tx.doc(LiveDoc, root.id);
-			live.compactions = [{ taskId, reason: "manual", blocking: false, attempt: 1 }];
-			return taskId;
-		}, context);
-		await harness.close(context);
-		({ harness, root } = await openChat(await openNodeSqliteStorage(path), setup));
-		harness.resume();
-		const chat = { harness, root, setup, faux: script(setup) };
-		const events: AgentEvent[] = [];
-		const stream = await watchEvents(chat.harness, chat.root.id, context);
-		stream.start(async (batch) => {
-			events.push(...batch);
-		});
-		const inspection = await chat.harness.inspect(context);
-		expect(inspection.tasks.find((task) => task.record.id === id)?.state).toEqual({
-			kind: "blocked",
-			reason: "task_too_old",
-		});
-		await chat.harness.abortTask(id, context);
-		expect((await chat.harness.waitForTask(id, context)).state.outcome).toEqual({
-			status: "orphaned",
-			reason: "task_too_old",
-		});
-		expect((await live(chat)).compactions).toBeUndefined();
-		await waitFor(() => events.some((event) => event.type === "compaction_end"));
-		await stream.stop();
-		await chat.harness.close(context);
+		const streams: Awaited<ReturnType<typeof watchEvents>>[] = [];
+		try {
+			// A compaction stored by a newer version than this process registers, for example after a downgrade.
+			const newer = {
+				definition: { ...CompactionTask.definition, version: CompactionTask.definition.version + 1 },
+			};
+			const id = await root.commit(async (tx) => {
+				const taskId = await tx.createTask(newer, { reason: "manual" }, { ownership: { kind: "conversation" } });
+				const live = await tx.doc(LiveDoc, root.id);
+				live.compactions = [{ taskId, reason: "manual", blocking: false, attempt: 1 }];
+				return taskId;
+			}, context);
+			await harness.close(context);
+			({ harness, root } = await openChat(await openNodeSqliteStorage(path), setup));
+			harness.resume();
+			const chat = { harness, root, setup, faux: script(setup) };
+			const events: AgentEvent[] = [];
+			const stream = await watchEvents(chat.harness, chat.root.id, context);
+			streams.push(stream);
+			stream.start(async (batch) => {
+				events.push(...batch);
+			});
+			const inspection = await chat.harness.inspect(context);
+			expect(inspection.tasks.find((task) => task.record.id === id)?.state).toEqual({
+				kind: "blocked",
+				reason: "task_too_old",
+			});
+			await chat.harness.abortTask(id, context);
+			await chat.harness.runPass(context);
+			expect(await chat.harness.getTask(id, context)).toMatchObject({
+				version: newer.definition.version,
+				abortRequested: true,
+				state: {
+					status: "waiting",
+					mode: "abort",
+					checkpoint: { phase: "select" },
+					condition: { kind: "registry", reason: { code: "task_too_old" } },
+				},
+			});
+			expect((await live(chat)).compactions).toEqual([
+				{ taskId: id, reason: "manual", blocking: false, attempt: 1 },
+			]);
+			expect(events.some((event) => event.type === "compaction_end")).toBe(false);
+			await stream.stop();
+			await chat.harness.close(context);
+			// Built-ins are part of the loaded code image. Replacement supplies a compatible definition without
+			// rewriting the admitted version/checkpoint or running its summarization phase.
+			const replacementRegistry = createRegistry();
+			harness = await Harness.open(
+				await openNodeSqliteStorage(path),
+				{
+					models: setup.models,
+					registry: {
+						subscribe: (listener) => replacementRegistry.subscribe(listener),
+						snapshot: () => {
+							const snapshot = replacementRegistry.snapshot();
+							return {
+								revision: snapshot.revision,
+								installed: () => snapshot.installed(),
+								extension: (name) => snapshot.extension(name),
+								tools: () => snapshot.tools(),
+								sections: () => snapshot.sections(),
+								tasks: () =>
+									snapshot
+										.tasks()
+										.map((task) => (task.definition.name === newer.definition.name ? newer : task)),
+								task: (name) => (name === newer.definition.name ? newer : snapshot.task(name)),
+							};
+						},
+					},
+				},
+				context,
+			);
+			root = await harness.root(context);
+			const replacementStream = await watchEvents(harness, root.id, context);
+			streams.push(replacementStream);
+			expect(replacementStream.snapshot.compactions).toEqual([
+				{ taskId: id, reason: "manual", blocking: false, attempt: 1 },
+			]);
+			replacementStream.start(async (batch) => {
+				events.push(...batch);
+			});
+			harness.resume();
+			expect((await harness.waitForTask(id, context)).state.outcome).toEqual({ status: "aborted" });
+			expect((await harness.snapshot(LiveDoc, root.id, context))?.compactions).toBeUndefined();
+			await waitFor(() => events.some((event) => event.type === "compaction_end"));
+			expect(chat.faux.summaryRequests).toHaveLength(0);
+			expect((await kinds(root)).includes("pi.compaction")).toBe(false);
+		} finally {
+			try {
+				await Promise.all(streams.map((stream) => stream.stop()));
+			} finally {
+				await harness.close(context);
+			}
+		}
 	});
 });
 

@@ -6,6 +6,7 @@ import { parseStreamingJson } from "./json-parse.ts";
  * intentionally excluded and must be persisted separately.
  */
 export type AssistantMessageFrame =
+	| { type: "prompt_progress"; total: number; processed: number; cache: number }
 	| { type: "start"; partial: AssistantMessage }
 	| { type: "text_start"; contentIndex: number; content: TextContent }
 	| { type: "text_delta"; contentIndex: number; delta: string }
@@ -97,7 +98,7 @@ function assertContentIndex(contentIndex: number): void {
 	}
 }
 
-function eventBlock(event: Exclude<AssistantMessageEvent, { type: "start" | "done" | "error" }>) {
+function eventBlock(event: Exclude<AssistantMessageEvent, { type: "start" | "done" | "error" | "prompt_progress" }>) {
 	assertContentIndex(event.contentIndex);
 	const block = event.partial.content[event.contentIndex];
 	if (!block) {
@@ -161,6 +162,8 @@ export class AssistantMessageFrameEncoder {
 		if (!this.started) throw new Error(`Assistant message ${event.type} event appears before start`);
 
 		switch (event.type) {
+			case "prompt_progress":
+				return { type: "prompt_progress", total: event.total, processed: event.processed, cache: event.cache };
 			case "text_start": {
 				const content = eventBlock(event);
 				if (content.type !== "text") {
@@ -388,6 +391,9 @@ export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFr
 		}
 
 		switch (frame.type) {
+			case "prompt_progress":
+				// Request work is observable progress, not generated model content.
+				break;
 			case "text_start":
 				if (frame.content.type !== "text") {
 					throw new Error(`text_start frame contains ${frame.content.type} content`);

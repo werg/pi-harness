@@ -6,11 +6,11 @@ import type { SessionImpl } from "../session/session.ts";
 import type {
 	CommitPublication,
 	ConversationId,
-	JoinPolicy,
 	Storage,
 	TaskId,
 	TaskOutcome,
 	TaskRecord,
+	TaskWaitCondition,
 	WatchHandle,
 } from "../types.ts";
 import { closedError, scanAll } from "./util.ts";
@@ -21,8 +21,7 @@ export type TaskGraphState =
 	| {
 			readonly status: "waiting";
 			readonly phase: string;
-			readonly on: readonly TaskId[];
-			readonly policy: JoinPolicy;
+			readonly condition: TaskWaitCondition;
 	  }
 	/** Outcome held until its ordinary owned work drains. */
 	| { readonly status: "completing"; readonly outcome: TaskOutcome<JsonValue>["status"] };
@@ -209,7 +208,7 @@ function stateOf(record: AnyTaskRecord): TaskGraphState {
 		case "running":
 			return { status: state.status, phase: phaseOf(state.checkpoint) };
 		case "waiting":
-			return { status: "waiting", phase: phaseOf(state.checkpoint), on: [...state.on], policy: state.policy };
+			return { status: "waiting", phase: phaseOf(state.checkpoint), condition: structuredClone(state.condition) };
 		// Terminal records never reach here: they leave the graph.
 		case "completing":
 		case "terminal":

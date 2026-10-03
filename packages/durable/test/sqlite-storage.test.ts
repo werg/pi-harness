@@ -295,9 +295,9 @@ describe("Pico SqliteStorage", () => {
 		const database = new DatabaseSync(path);
 		try {
 			database
-				.prepare(`UPDATE document_revisions SET content = ? WHERE document_id = ? AND seq =
+				.prepare(`UPDATE payload_chunks SET data = ?, byte_length = ? WHERE id = ? AND revision =
 					(SELECT max(seq) FROM document_revisions WHERE document_id = ?)`)
-				.run('[["unknown"]]', id, id);
+				.run(new TextEncoder().encode('[["unknown"]]'), 13, id, id);
 		} finally {
 			database.close();
 		}
@@ -388,37 +388,37 @@ describe("Pico SqliteStorage", () => {
 		try {
 			const plans = [
 				db
-					.prepare(`EXPLAIN QUERY PLAN SELECT record FROM documents
+					.prepare(`EXPLAIN QUERY PLAN SELECT id FROM documents
 						WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
 						AND retired_at IS NULL ORDER BY created_at DESC LIMIT 1`)
 					.all("kind", "session", 0, 0, ""),
 				db
-					.prepare(`EXPLAIN QUERY PLAN SELECT record FROM documents
+					.prepare(`EXPLAIN QUERY PLAN SELECT id FROM documents
 						WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
 						AND created_at <= ? AND (retired_at IS NULL OR retired_at > ?)
 						ORDER BY created_at DESC LIMIT 1`)
 					.all("kind", "conversation", 1, 0, "", 10, 10),
 				db
-					.prepare(`EXPLAIN QUERY PLAN SELECT record FROM documents
+					.prepare(`EXPLAIN QUERY PLAN SELECT id FROM documents
 						WHERE scope_kind = ? AND owner_id = ? AND kind = ? AND id > ? ORDER BY id LIMIT ?`)
 					.all("task", 1, "kind", 0, 10),
 				db
-					.prepare(`EXPLAIN QUERY PLAN SELECT record FROM entries
+					.prepare(`EXPLAIN QUERY PLAN SELECT id FROM entries
 						WHERE conversation_id = ? AND id <= ? ORDER BY id DESC LIMIT ?`)
 					.all(1, 10, 10),
 				db
-					.prepare(`EXPLAIN QUERY PLAN SELECT record FROM entries
+					.prepare(`EXPLAIN QUERY PLAN SELECT id FROM entries
 						WHERE conversation_id = ? AND head IS NOT NULL AND id <= ? ORDER BY id DESC LIMIT 1`)
 					.all(1, 10),
 				db
-					.prepare("EXPLAIN QUERY PLAN SELECT record FROM tasks WHERE status = ? AND id > ? ORDER BY id LIMIT ?")
+					.prepare("EXPLAIN QUERY PLAN SELECT id FROM tasks WHERE status = ? AND id > ? ORDER BY id LIMIT ?")
 					.all("pending", 0, 10),
 				db
-					.prepare(`EXPLAIN QUERY PLAN SELECT seq, kind, version, content FROM document_revisions
+					.prepare(`EXPLAIN QUERY PLAN SELECT seq, kind, version FROM document_revisions
 						WHERE document_id = ? AND kind = 'base' AND seq <= ? ORDER BY seq DESC LIMIT 1`)
 					.all(1, 10),
 				db
-					.prepare(`EXPLAIN QUERY PLAN SELECT seq, kind, version, content FROM document_revisions
+					.prepare(`EXPLAIN QUERY PLAN SELECT seq, kind, version FROM document_revisions
 						WHERE document_id = ? AND seq > ? AND seq <= ? ORDER BY seq`)
 					.all(1, 5, 10),
 			];
@@ -463,10 +463,10 @@ describe("Pico SqliteStorage", () => {
 		try {
 			const row = revisions
 				.prepare(
-					"SELECT content FROM document_revisions WHERE document_id = ? AND kind = 'delta' ORDER BY seq DESC LIMIT 1",
+					"SELECT data FROM payload_chunks WHERE id = ? AND revision = (SELECT max(seq) FROM document_revisions WHERE document_id = ? AND kind = 'delta') ORDER BY ordinal",
 				)
-				.get(id) as { readonly content: string };
-			expect(JSON.parse(row.content)).toEqual([["s", ["count"], 10]]);
+				.get(id, id) as { readonly data: Uint8Array };
+			expect(JSON.parse(new TextDecoder().decode(row.data))).toEqual([["s", ["count"], 10]]);
 		} finally {
 			revisions.close();
 		}

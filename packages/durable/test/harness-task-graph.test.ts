@@ -50,7 +50,11 @@ function family(gates: { readonly child: Promise<void>; readonly late: Promise<v
 				}, ctx);
 				await runtime.commit(async (tx) => {
 					const child = await tx.createTask(Child, { late: false }, { ownership });
-					return { status: "waiting", checkpoint: { phase: "join", child }, on: [child], policy: "allSettled" };
+					return {
+						status: "waiting",
+						checkpoint: { phase: "join", child },
+						condition: { kind: "tasks", on: [child], policy: "allSettled" },
+					};
 				}, ctx);
 			},
 			join: async (task, runtime, ctx) => {
@@ -136,7 +140,11 @@ describe("task graph view", () => {
 		}
 		const first = Number(childId()) as TaskId;
 		const parentNode = graph.value.tasks[String(parent)]!;
-		expect(parentNode.state).toEqual({ status: "waiting", phase: "join", on: [first], policy: "allSettled" });
+		expect(parentNode.state).toEqual({
+			status: "waiting",
+			phase: "join",
+			condition: { kind: "tasks", on: [first], policy: "allSettled" },
+		});
 		expect(parentNode.conversations).toHaveLength(2);
 		expect([...parentNode.conversations].sort((a, b) => a - b)).toEqual(parentNode.conversations);
 		const owned = parentNode.conversations[0]!;

@@ -211,28 +211,42 @@ describe("tool round", () => {
 		await harness.close(context);
 	});
 
-	it("reads the execution mode when a round starts and keeps it for the round", async () => {
+	it("pins execution mode at request preparation and refreshes it for the next request", async () => {
 		const setup = chatSetup();
 		const events: string[] = [];
 		const slow =
 			(name: string): Execute =>
-			async () => {
-				events.push(`start ${name}`);
-				// Changed after the round started: not seen by this round.
-				setup.settings.toolExecution = "parallel";
+			async (_args, api) => {
+				events.push(`start ${name}:${api.callId}`);
 				await new Promise((resolve) => setTimeout(resolve, 20));
-				events.push(`end ${name}`);
+				events.push(`end ${name}:${api.callId}`);
 				return { content: [] };
 			};
 		addTool(setup.registry, tool("a", slow("a")));
 		addTool(setup.registry, tool("b", slow("b")));
-		// Changed while the model request runs: the round that follows uses it.
-		const request: FauxResponseStep = () => {
+		const first: FauxResponseStep = () => {
 			setup.settings.toolExecution = "sequential";
 			return calls(["a", {}, "c1"], ["b", {}, "c2"]);
 		};
-		const { harness } = await run(setup, [request, DONE]);
-		expect(events).toEqual(["start a", "end a", "start b", "end b"]);
+		const second: FauxResponseStep = () => {
+			setup.settings.toolExecution = "parallel";
+			return calls(["a", {}, "c3"], ["b", {}, "c4"]);
+		};
+		const { harness } = await run(setup, [first, second, calls(["a", {}, "c5"], ["b", {}, "c6"]), DONE]);
+		expect(events).toEqual([
+			"start a:c1",
+			"start b:c2",
+			"end a:c1",
+			"end b:c2",
+			"start a:c3",
+			"end a:c3",
+			"start b:c4",
+			"end b:c4",
+			"start a:c5",
+			"start b:c6",
+			"end a:c5",
+			"end b:c6",
+		]);
 		await harness.close(context);
 	});
 

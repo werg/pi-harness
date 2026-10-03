@@ -543,7 +543,7 @@ describe("openai-codex streaming", () => {
 		expect(cancelled).toBe(true);
 	});
 
-	it("sets session-id/x-client-request-id headers and prompt_cache_key when sessionId is provided", async () => {
+	it("separates invocation request identity from session affinity and prompt_cache_key", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;
 
@@ -606,7 +606,8 @@ describe("openai-codex streaming", () => {
 				// Verify sessionId is set in headers
 				expect(headers?.get("session-id")).toBe(sessionId);
 				expect(headers?.has("session_id")).toBe(false);
-				expect(headers?.get("x-client-request-id")).toBe(sessionId);
+				expect(headers?.get("x-client-request-id")).toMatch(/^[0-9a-f-]{36}$/);
+				expect(headers?.get("x-client-request-id")).not.toBe(sessionId);
 
 				// Verify sessionId is set in request body as prompt_cache_key
 				const body = decodeCodexRequestBody(init?.body);
@@ -694,8 +695,8 @@ describe("openai-codex streaming", () => {
 			transport: "sse",
 		}).result();
 
-		expect(capturedHeaders?.has("session-id")).toBe(false);
-		expect(capturedHeaders?.has("x-client-request-id")).toBe(false);
+		expect(capturedHeaders?.get("x-client-request-id")).toMatch(/^[0-9a-f-]{36}$/);
+		expect(capturedHeaders?.get("session-id")).toBe(capturedHeaders?.get("x-client-request-id"));
 		expect(capturedBody).not.toHaveProperty("prompt_cache_key");
 	});
 
@@ -794,7 +795,7 @@ describe("openai-codex streaming", () => {
 		}).result();
 
 		expect(capturedHeaders?.get("session-id")).toBe("x".repeat(64));
-		expect(capturedHeaders?.get("x-client-request-id")).toBe("x".repeat(64));
+		expect(capturedHeaders?.get("x-client-request-id")).toMatch(/^[0-9a-f-]{36}$/);
 	});
 
 	it("preserves gpt-5.5 xhigh reasoning effort from simple options", async () => {
@@ -1181,7 +1182,7 @@ describe("openai-codex streaming", () => {
 		},
 	);
 
-	it("does not set session-id/x-client-request-id headers when sessionId is not provided", async () => {
+	it("uses a fresh invocation identity when no session affinity is provided", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;
 
@@ -1240,10 +1241,10 @@ describe("openai-codex streaming", () => {
 			}
 			if (url === "https://chatgpt.com/backend-api/codex/responses") {
 				const headers = init?.headers instanceof Headers ? init.headers : undefined;
-				// Verify headers are not set when sessionId is not provided
-				expect(headers?.has("session-id")).toBe(false);
+				// No persistent affinity: the transport is scoped to this invocation.
+				expect(headers?.get("x-client-request-id")).toMatch(/^[0-9a-f-]{36}$/);
+				expect(headers?.get("session-id")).toBe(headers?.get("x-client-request-id"));
 				expect(headers?.has("session_id")).toBe(false);
-				expect(headers?.has("x-client-request-id")).toBe(false);
 
 				return new Response(stream, {
 					status: 200,
@@ -1403,7 +1404,8 @@ describe("openai-codex streaming", () => {
 		expect(providerEventModels).toEqual([model, model, model, model, model]);
 		expect(capturedWebSocketHeaders?.["session-id"]).toBe("session-auto");
 		expect(capturedWebSocketHeaders?.session_id).toBeUndefined();
-		expect(capturedWebSocketHeaders?.["x-client-request-id"]).toBe("session-auto");
+		expect(capturedWebSocketHeaders?.["x-client-request-id"]).toMatch(/^[0-9a-f-]{36}$/);
+		expect(capturedWebSocketHeaders?.["x-client-request-id"]).not.toBe("session-auto");
 		expect(global.fetch).not.toHaveBeenCalled();
 		expect(getOpenAICodexWebSocketDebugStats("session-auto")).toMatchObject({
 			cachedContextRequests: 1,

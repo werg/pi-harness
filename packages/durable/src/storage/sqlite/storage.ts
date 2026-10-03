@@ -33,6 +33,7 @@ import type {
 } from "../../types.ts";
 import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "./database.ts";
 import { applySqliteMigrations } from "./migrations.ts";
+import { readJsonRow, readJsonRows, writeJsonPayload } from "./payload.ts";
 
 type StoredTask = TaskRecord<JsonValue, JsonValue, JsonValue>;
 type TableName = "conversation" | "entry" | "task" | "submission" | "document";
@@ -59,7 +60,6 @@ type ScopeColumns = {
 };
 
 const parseJson = <T>(value: string): T => JSON.parse(value) as T;
-const encodeJson = (value: unknown): string => JSON.stringify(value) as string;
 // Some SQLite bindings replace lone UTF-16 surrogates. JSON encoding keeps indexed identities lossless.
 const encodeIndexedString = (value: string): string => JSON.stringify(value);
 
@@ -141,9 +141,12 @@ export class SqliteStorage implements Storage {
 	}
 
 	/** Initialize storage over an owned SQLite database facade. */
-	static async open(db: SqliteDatabase): Promise<SqliteStorage> {
+	static async open(
+		db: SqliteDatabase,
+		initialize: (database: SqliteDatabase) => Promise<void> = applySqliteMigrations,
+	): Promise<SqliteStorage> {
 		try {
-			await applySqliteMigrations(db);
+			await initialize(db);
 			const metadata = await db.get<MetadataRow>(
 				"SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1",
 			);
@@ -192,7 +195,7 @@ export class SqliteStorage implements Storage {
 
 	async conversation(id: ConversationId, _context: Context): Promise<ConversationRecord | undefined> {
 		this.assertOpen();
-		const row = await this.db.get<JsonRow>("SELECT record FROM conversations WHERE id = ?", id);
+		const row = await readJsonRow<JsonRow>(this.db, "SELECT id FROM conversations WHERE id = ?", [id]);
 		return row === undefined ? undefined : parseJson<ConversationRecord>(row.record);
 	}
 
@@ -214,9 +217,10 @@ export class SqliteStorage implements Storage {
 			params.push(query.ownerTaskId);
 		}
 		params.push(limit + 1);
-		const rows = await this.db.all<JsonRow>(
-			`SELECT record FROM conversations WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
-			...params,
+		const rows = await readJsonRows<JsonRow>(
+			this.db,
+			`SELECT id FROM conversations WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
+			[...params],
 		);
 		return page(
 			rows.map((row) => parseJson<ConversationRecord>(row.record)),
@@ -273,7 +277,7 @@ export class SqliteStorage implements Storage {
 			conversation = await this.readConversation(conversationId);
 			if (conversation === undefined) throw new Error(`Unknown conversation: ${conversationId}`);
 		}
-		const row = await this.db.get<EntryJsonRow>("SELECT record, commit_seq FROM entries WHERE id = ?", id);
+		const row = await readJsonRow<EntryJsonRow>(this.db, "SELECT id, commit_seq FROM entries WHERE id = ?", [id]);
 		if (row === undefined) return undefined;
 		const entry = parseJson<EntryRecord>(row.record);
 		if (conversation !== undefined) {
@@ -298,14 +302,17 @@ export class SqliteStorage implements Storage {
 		while (true) {
 			const row =
 				upper === undefined
-					? await this.db.get<JsonRow>(
-							"SELECT record FROM entries WHERE conversation_id = ? AND head IS NOT NULL ORDER BY id DESC LIMIT 1",
-							conversation.id,
+					? await readJsonRow<JsonRow>(
+							this.db,
+							"SELECT id FROM entries WHERE conversation_id = ? AND head IS NOT NULL ORDER BY id DESC LIMIT 1",
+							[conversation.id],
+							{ descending: true },
 						)
-					: await this.db.get<JsonRow>(
-							"SELECT record FROM entries WHERE conversation_id = ? AND head IS NOT NULL AND id <= ? ORDER BY id DESC LIMIT 1",
-							conversation.id,
-							upper,
+					: await readJsonRow<JsonRow>(
+							this.db,
+							"SELECT id FROM entries WHERE conversation_id = ? AND head IS NOT NULL AND id <= ? ORDER BY id DESC LIMIT 1",
+							[conversation.id, upper],
+							{ descending: true },
 						);
 			if (row !== undefined) return parseJson<EntryRecord & { readonly head: EntryId }>(row.record);
 			if (conversation.parent === undefined) return undefined;
@@ -337,9 +344,11 @@ export class SqliteStorage implements Storage {
 				params.push(upper);
 			}
 			params.push(limit + 1 - values.length);
-			const rows = await this.db.all<JsonRow>(
-				`SELECT record FROM entries WHERE ${clauses.join(" AND ")} ORDER BY id DESC LIMIT ?`,
-				...params,
+			const rows = await readJsonRows<JsonRow>(
+				this.db,
+				`SELECT id FROM entries WHERE ${clauses.join(" AND ")} ORDER BY id DESC LIMIT ?`,
+				[...params],
+				{ descending: true },
 			);
 			values.push(...rows.map((row) => parseJson<EntryRecord>(row.record)));
 			if (values.length > limit || conversation.parent === undefined) break;
@@ -352,7 +361,7 @@ export class SqliteStorage implements Storage {
 
 	async task(id: TaskId, _context: Context): Promise<StoredTask | undefined> {
 		this.assertOpen();
-		const row = await this.db.get<JsonRow>("SELECT record FROM tasks WHERE id = ?", id);
+		const row = await readJsonRow<JsonRow>(this.db, "SELECT id FROM tasks WHERE id = ?", [id]);
 		return row === undefined ? undefined : parseJson<StoredTask>(row.record);
 	}
 
@@ -386,9 +395,10 @@ export class SqliteStorage implements Storage {
 			params.push(query.background ? 1 : 0);
 		}
 		params.push(limit + 1);
-		const rows = await this.db.all<JsonRow>(
-			`SELECT record FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
-			...params,
+		const rows = await readJsonRows<JsonRow>(
+			this.db,
+			`SELECT id FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
+			[...params],
 		);
 		return page(
 			rows.map((row) => parseJson<StoredTask>(row.record)),
@@ -398,7 +408,7 @@ export class SqliteStorage implements Storage {
 
 	async submission(id: SubmissionId, _context: Context): Promise<SubmissionRecord | undefined> {
 		this.assertOpen();
-		const row = await this.db.get<JsonRow>("SELECT record FROM submissions WHERE id = ?", id);
+		const row = await readJsonRow<JsonRow>(this.db, "SELECT id FROM submissions WHERE id = ?", [id]);
 		return row === undefined ? undefined : parseJson<SubmissionRecord>(row.record);
 	}
 
@@ -420,9 +430,10 @@ export class SqliteStorage implements Storage {
 			params.push(query.status);
 		}
 		params.push(limit + 1);
-		const rows = await this.db.all<JsonRow>(
-			`SELECT record FROM submissions WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
-			...params,
+		const rows = await readJsonRows<JsonRow>(
+			this.db,
+			`SELECT id FROM submissions WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
+			[...params],
 		);
 		return page(
 			rows.map((row) => parseJson<SubmissionRecord>(row.record)),
@@ -436,10 +447,10 @@ export class SqliteStorage implements Storage {
 		_context: Context,
 	): Promise<SubmissionRecord | undefined> {
 		this.assertOpen();
-		const row = await this.db.get<JsonRow>(
-			"SELECT record FROM submissions WHERE conversation_id = ? AND request_id = ?",
-			conversationId,
-			encodeIndexedString(requestId),
+		const row = await readJsonRow<JsonRow>(
+			this.db,
+			"SELECT id FROM submissions WHERE conversation_id = ? AND request_id = ?",
+			[conversationId, encodeIndexedString(requestId)],
 		);
 		return row === undefined ? undefined : parseJson<SubmissionRecord>(row.record);
 	}
@@ -453,16 +464,16 @@ export class SqliteStorage implements Storage {
 		const parts = addressParts(address);
 		const sql =
 			at === "current"
-				? `SELECT record FROM documents
+				? `SELECT id FROM documents
 					WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
 					AND retired_at IS NULL ORDER BY created_at DESC LIMIT 1`
-				: `SELECT record FROM documents
+				: `SELECT id FROM documents
 					WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
 					AND created_at <= ? AND (retired_at IS NULL OR retired_at > ?)
 					ORDER BY created_at DESC LIMIT 1`;
 		const params: SqliteValue[] = [parts.kind, parts.scopeKind, parts.ownerId, parts.family, parts.keyValue];
 		if (at !== "current") params.push(at, at);
-		const row = await this.db.get<JsonRow>(sql, ...params);
+		const row = await readJsonRow<JsonRow>(this.db, sql, [...params]);
 		return row === undefined ? undefined : parseJson<DocumentRecord>(row.record);
 	}
 
@@ -493,9 +504,10 @@ export class SqliteStorage implements Storage {
 			params.push(query.at, query.at);
 		}
 		params.push(limit + 1);
-		const rows = await this.db.all<JsonRow>(
-			`SELECT record FROM documents WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
-			...params,
+		const rows = await readJsonRows<JsonRow>(
+			this.db,
+			`SELECT id FROM documents WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
+			[...params],
 		);
 		return page(
 			rows.map((row) => parseJson<DocumentRecord>(row.record)),
@@ -535,7 +547,7 @@ export class SqliteStorage implements Storage {
 	}
 
 	private async readConversation(id: ConversationId): Promise<ConversationRecord | undefined> {
-		const row = await this.db.get<JsonRow>("SELECT record FROM conversations WHERE id = ?", id);
+		const row = await readJsonRow<JsonRow>(this.db, "SELECT id FROM conversations WHERE id = ?", [id]);
 		return row === undefined ? undefined : parseJson<ConversationRecord>(row.record);
 	}
 
@@ -544,7 +556,7 @@ export class SqliteStorage implements Storage {
 		id: DocumentId,
 		at: DocumentPoint,
 	): Promise<StoredDocument | undefined> {
-		const row = await executor.get<JsonRow>("SELECT record FROM documents WHERE id = ?", id);
+		const row = await readJsonRow<JsonRow>(executor, "SELECT id FROM documents WHERE id = ?", [id]);
 		if (row === undefined) return undefined;
 		const record = parseJson<DocumentRecord>(row.record);
 		if (at !== "current" && isCurrentOnly(record)) {
@@ -552,20 +564,21 @@ export class SqliteStorage implements Storage {
 		}
 		if (!isAliveAt(record, at)) return undefined;
 		const upper = at === "current" ? Number.MAX_SAFE_INTEGER : at;
-		const base = await executor.get<RevisionRow>(
-			`SELECT seq, kind, version, content FROM document_revisions
+		const base = await readJsonRow<RevisionRow>(
+			executor,
+			`SELECT document_id AS id, seq AS payload_revision, seq, kind, version FROM document_revisions
 				WHERE document_id = ? AND kind = 'base' AND seq <= ? ORDER BY seq DESC LIMIT 1`,
-			id,
-			upper,
+			[id, upper],
+			{ revision: true },
 		);
 		if (base === undefined) throw new Error(`Document ${id} is missing a required base`);
 		let value = parseJson<JsonObject>(base.content);
-		const tail = await executor.all<RevisionRow>(
-			`SELECT seq, kind, version, content FROM document_revisions
+		const tail = await readJsonRows<RevisionRow>(
+			executor,
+			`SELECT document_id AS id, seq AS payload_revision, seq, kind, version FROM document_revisions
 				WHERE document_id = ? AND seq > ? AND seq <= ? ORDER BY seq`,
-			id,
-			base.seq,
-			upper,
+			[id, base.seq, upper],
+			{ revision: true },
 		);
 		for (const revision of tail) {
 			if (revision.kind !== "delta" || revision.version !== base.version) {
@@ -663,7 +676,7 @@ export class SqliteStorage implements Storage {
 			if (action.copy !== undefined && actions.has(action.copy.id)) {
 				throw new StorageRejected(`Document copy ${id} source is changed in the copy batch`);
 			}
-			const row = await executor.get<JsonRow>("SELECT record FROM documents WHERE id = ?", id);
+			const row = await readJsonRow<JsonRow>(executor, "SELECT id FROM documents WHERE id = ?", [id]);
 			const existing = row === undefined ? undefined : parseJson<DocumentRecord>(row.record);
 			if (action.create === undefined && existing === undefined) throw new Error(`Unknown document: ${id}`);
 			if (action.create !== undefined && existing !== undefined) throw new Error(`Document ${id} already exists`);
@@ -716,53 +729,53 @@ export class SqliteStorage implements Storage {
 			case "conversation":
 				await this.claimId(executor, write.value.id, "conversation");
 				await executor.run(
-					"INSERT INTO conversations (id, owner_conversation_id, owner_task_id, record) VALUES (?, ?, ?, ?)",
+					"INSERT INTO conversations (id, owner_conversation_id, owner_task_id) VALUES (?, ?, ?)",
 					write.value.id,
 					write.value.owner?.conversationId ?? null,
 					write.value.owner?.taskId ?? null,
-					encodeJson(write.value),
 				);
+				await writeJsonPayload(executor, write.value.id, 0, write.value);
 				break;
 			case "entry":
 				await this.claimId(executor, write.value.id, "entry");
 				await executor.run(
-					"INSERT INTO entries (id, conversation_id, head, commit_seq, record) VALUES (?, ?, ?, ?, ?)",
+					"INSERT INTO entries (id, conversation_id, head, commit_seq) VALUES (?, ?, ?, ?)",
 					write.value.id,
 					write.value.conversationId,
 					write.value.head ?? null,
 					seq,
-					encodeJson(write.value),
 				);
+				await writeJsonPayload(executor, write.value.id, 0, write.value);
 				break;
 			case "task":
 				await this.claimId(executor, write.value.id, "task");
 				await executor.run(
-					`INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record)
-						VALUES (?, ?, ?, ?, ?, ?, ?)
+					`INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background)
+						VALUES (?, ?, ?, ?, ?, ?)
 						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
 						status = excluded.status, abort_requested = excluded.abort_requested,
-						background = excluded.background, record = excluded.record`,
+						background = excluded.background`,
 					write.value.id,
 					write.value.conversationId,
 					encodeIndexedString(write.value.kind),
 					write.value.state.status,
 					write.value.abortRequested ? 1 : 0,
 					write.value.background ? 1 : 0,
-					encodeJson(write.value),
 				);
+				await writeJsonPayload(executor, write.value.id, 0, write.value);
 				break;
 			case "submission":
 				await this.claimId(executor, write.value.id, "submission");
 				await executor.run(
-					`INSERT INTO submissions (id, conversation_id, request_id, status, record) VALUES (?, ?, ?, ?, ?)
+					`INSERT INTO submissions (id, conversation_id, request_id, status) VALUES (?, ?, ?, ?)
 						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
-						request_id = excluded.request_id, status = excluded.status, record = excluded.record`,
+						request_id = excluded.request_id, status = excluded.status`,
 					write.value.id,
 					write.value.conversationId,
 					write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
 					write.value.status,
-					encodeJson(write.value),
 				);
+				await writeJsonPayload(executor, write.value.id, 0, write.value);
 				break;
 			case "document.create":
 			case "document.copy":
@@ -815,8 +828,8 @@ export class SqliteStorage implements Storage {
 				await this.claimId(executor, id, "document");
 				await executor.run(
 					`INSERT INTO documents
-						(id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
-						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+						(id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at)
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 					id,
 					parts.kind,
 					parts.family,
@@ -825,40 +838,38 @@ export class SqliteStorage implements Storage {
 					parts.ownerId,
 					seq,
 					action.retire ? seq : null,
-					encodeJson(record),
 				);
+				await writeJsonPayload(executor, id, 0, record);
 			} else {
-				const row = (await executor.get<JsonRow>("SELECT record FROM documents WHERE id = ?", id))!;
+				const row = (await readJsonRow<JsonRow>(executor, "SELECT id FROM documents WHERE id = ?", [id]))!;
 				record = parseJson<DocumentRecord>(row.record);
 			}
 
 			if (content !== undefined) {
 				if (content.kind === "base" && isCurrentOnly(record)) {
 					await executor.run("DELETE FROM document_revisions WHERE document_id = ?", id);
+					await executor.run("DELETE FROM payload_chunks WHERE id = ? AND revision > 0", id);
 				}
-				const encodedContent = content.kind === "base" ? encodeJson(content.value) : encodeJson(content.ops);
+				const value = content.kind === "base" ? content.value : content.ops;
 				await executor.run(
-					"INSERT INTO document_revisions (document_id, seq, kind, version, content) VALUES (?, ?, ?, ?, ?)",
+					"INSERT INTO document_revisions (document_id, seq, kind, version) VALUES (?, ?, ?, ?)",
 					id,
 					seq,
 					content.kind,
 					content.version,
-					encodedContent,
 				);
+				await writeJsonPayload(executor, id, seq, value);
 			}
 
 			if (action.retire) {
 				if (action.create === undefined) {
 					record = { ...record, retiredAt: seq };
-					await executor.run(
-						"UPDATE documents SET retired_at = ?, record = ? WHERE id = ?",
-						seq,
-						encodeJson(record),
-						id,
-					);
+					await executor.run("UPDATE documents SET retired_at = ? WHERE id = ?", seq, id);
+					await writeJsonPayload(executor, id, 0, record);
 				}
 				if (isCurrentOnly(record)) {
 					await executor.run("DELETE FROM document_revisions WHERE document_id = ?", id);
+					await executor.run("DELETE FROM payload_chunks WHERE id = ? AND revision > 0", id);
 				}
 			}
 		}

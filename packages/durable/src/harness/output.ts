@@ -6,6 +6,15 @@ export type OutputLimits = { readonly maxBytes: number; readonly maxLines: numbe
 /** Retained output and what the limits dropped. */
 export type BoundedOutput = { readonly text: string; readonly droppedBytes: number; readonly droppedLines: number };
 
+/** Durable stream counters and a bounded raw window, without a live decoder or timer. */
+export type OutputCheckpoint = {
+	text: string;
+	totalBytes: number;
+	totalNewlines: number;
+	endsWithNewline: boolean;
+	full: boolean;
+};
+
 /** An exact slice of the input within the limits, and what it left out. */
 export type OutputSlice = {
 	readonly text: string;
@@ -119,8 +128,37 @@ export class OutputBuffer {
 	#totalNewlines = 0;
 	#endsWithNewline = true;
 
-	constructor(limits: OutputLimits) {
+	constructor(limits: OutputLimits, checkpoint?: OutputCheckpoint) {
 		this.#limits = limits;
+		if (checkpoint !== undefined) {
+			const text = checkpoint.text;
+			this.#chunks = text === "" ? [] : [{ text, bytes: utf8ByteLength(text), newlines: countNewlines(text) }];
+			this.#storedBytes = utf8ByteLength(text);
+			this.#storedNewlines = countNewlines(text);
+			this.#totalBytes = checkpoint.totalBytes;
+			this.#totalNewlines = checkpoint.totalNewlines;
+			this.#endsWithNewline = checkpoint.endsWithNewline;
+			this.#full = checkpoint.full;
+		}
+	}
+
+	/** Flush the decoder at a durable boundary and retain only the configured raw window. */
+	checkpoint(): OutputCheckpoint {
+		this.end();
+		return this.snapshotCheckpoint();
+	}
+
+	/** Persist current decoded progress without flushing a still-live UTF-8 decoder. */
+	snapshotCheckpoint(): OutputCheckpoint {
+		const stored = this.#chunks.map((chunk) => chunk.text).join("");
+		const bounded = boundOutput(stored, this.#limits);
+		return {
+			text: bounded.text,
+			totalBytes: this.#totalBytes,
+			totalNewlines: this.#totalNewlines,
+			endsWithNewline: this.#endsWithNewline,
+			full: this.#limits.retain === "head" && (this.#full || bounded.droppedBytes > 0),
+		};
 	}
 
 	/** Bytes currently held; bounded by the limits plus one chunk. */

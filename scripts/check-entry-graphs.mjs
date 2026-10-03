@@ -44,7 +44,8 @@ const BUDGETS = {
 	"packages/durable": {
 		".": {
 			// The built-in tool task validates arguments with pi-ai's TypeBox-based validation, so TypeBox is allowed.
-			maxFiles: 60,
+			// Knowledge-only history transfer and protected model preparation add two single-path native modules.
+			maxFiles: 62,
 			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
 		},
 	},

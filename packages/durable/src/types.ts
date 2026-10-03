@@ -6,9 +6,14 @@ import type {
 	Agent,
 	ContextView,
 	ConversationHandle,
+	ModelRequestCapabilities,
+	ModelRequestInput,
+	ModelRequestResult,
+	ModelRequestTarget,
 	RegistrySnapshot,
 	Settings,
 	SettledTask,
+	UserInput,
 } from "./harness/types.ts";
 
 /** JSON object used as the root of every durable document. */
@@ -28,6 +33,12 @@ export type ConversationId = Id<"conversation">;
 export type EntryId = Id<"entry">;
 export type TaskId<Result = unknown> = Id<"task", Result>;
 export type SubmissionId = Id<"submission">;
+
+/** Correct an input only while it remains in the native inbox, preserving its admission identity. */
+export type QueuedInputRevision =
+	| { readonly kind: "replace"; readonly content: UserInput }
+	| { readonly kind: "withdraw" };
+export type QueuedInputRevisionResult = "updated" | "withdrawn" | "already_placed" | "settled" | "not_found";
 export type DocumentId = Id<"document">;
 
 declare const seqBrand: unique symbol;
@@ -142,7 +153,9 @@ export type RunningTask<I, S, R> = TaskRecord<I, S, R> & {
  * Next state a task commits for itself: a replacement checkpoint, a wait, or its outcome. A returned `terminal` state is
  * stored as `completing` while ordinary owned work below the task is live (spec §5.5).
  */
-export type NextTaskState<S, R> = Extract<TaskState<S, R>, { readonly status: "running" | "waiting" | "terminal" }>;
+export type NextTaskState<S, R> =
+	| Extract<TaskState<S, R>, { readonly status: "running" | "terminal" }>
+	| Omit<Extract<TaskState<S, R>, { readonly status: "waiting" }>, "mode">;
 
 /**
  * Runs one checkpoint phase. It must commit a changed checkpoint or a terminal outcome through `runtime.commit()`;
@@ -182,6 +195,25 @@ export interface TaskRuntime<I, S, R, H extends object> extends DocumentObserver
 	/** `HarnessOptions.settings`, resolved at each access. */
 	readonly settings: Settings;
 	readonly models: Models;
+	/** Acquire invocation-scoped capabilities, run dispatch, and join connection cleanup before returning. */
+	withModelRequest<T>(
+		request: ModelRequestInput,
+		dispatch: (
+			capabilities: ModelRequestCapabilities,
+			signal: AbortSignal,
+			prepared: ModelRequestTarget,
+		) => Promise<T>,
+		context: Context,
+	): Promise<ModelRequestResult<T>>;
+	/**
+	 * Retain ownership and fail waiting callers until exact incident repair or explicit cancellation. Optional document
+	 * writes and a returned checkpoint commit atomically with the failure; returning nothing retains the current checkpoint.
+	 */
+	parkFailure(
+		error: unknown,
+		context: Context,
+		change?: (tx: Tx, current: RunningTask<I, S, R>) => S | void | Promise<S | undefined> | Promise<void>,
+	): Promise<void>;
 	/** Calls `HarnessOptions.env` for the task's conversation; rejects with its error. */
 	env(context: Context): Promise<ExecutionEnv | undefined>;
 	/** Handlers of this task's name from the extensions its conversation selects, in extension order. */
@@ -241,7 +273,7 @@ export type TaskDefinition<I, S extends { phase: string }, R, H extends object> 
 	readonly phases: {
 		readonly [P in S["phase"]]: PhaseHandler<I, Extract<S, { phase: P }>, S, R, H>;
 	};
-	/** Runs in a fresh invocation after an abort mark and must commit a terminal outcome. */
+	/** Runs after an abort mark; failure retains its checkpoint and cleanup ownership for explicit repair. */
 	abort(task: RunningTask<I, S, R>, runtime: TaskRuntime<I, S, R, H>, context: Context): Promise<void>;
 	/** Convert a record stored by any older supported version; runs at reservation. */
 	migrate?(
@@ -265,6 +297,22 @@ export type TaskOwnership = { readonly kind: "conversation" } | { readonly kind:
 
 /** How a waiting task treats the tasks it waits on (spec §5.5). */
 export type JoinPolicy = "failFast" | "allSettled";
+
+/** Durable conditions evaluated on the Session line, without retaining an invocation. */
+export type TaskWaitCondition =
+	| { readonly kind: "tasks"; readonly on: readonly TaskId[]; readonly policy: JoinPolicy }
+	| { readonly kind: "time"; readonly until: number }
+	| { readonly kind: "receipt"; readonly key: string; readonly binding: string }
+	/** Scheduler-owned failed invocation. Only an explicit repair of this incident can retry it. */
+	| { readonly kind: "failure"; readonly incident: EntryId; readonly error: TaskOutcomeError }
+	/** Reconsider an unsupported executable binding only after registry publication or activation replacement. */
+	| { readonly kind: "registry"; readonly after: string; readonly reason: JsonObject }
+	| {
+			readonly kind: "input";
+			readonly conversationId: ConversationId;
+			readonly after: EntryId;
+			readonly kinds: readonly string[];
+	  };
 
 /** Creation options for a durable task. */
 export type TaskOptions = {
@@ -499,11 +547,12 @@ export type TaskState<S, R> =
 			readonly outcome?: never;
 	  }
 	| {
-			/** Parked without an invocation until every task in `on` is terminal; then resumes at `checkpoint`. */
+			/** Parked without an invocation until its committed condition holds. */
 			readonly status: "waiting";
 			readonly checkpoint: S;
-			readonly on: readonly TaskId[];
-			readonly policy: JoinPolicy;
+			readonly condition: TaskWaitCondition;
+			/** Which handler resumes after this wait; stamped by the runtime. */
+			readonly mode: "run" | "abort";
 			readonly outcome?: never;
 	  }
 	| {
@@ -795,6 +844,11 @@ export interface Tx {
 	 * Run tasks settle the inputs they answer.
 	 */
 	settleSubmission(id: SubmissionId, settlement: SubmissionSettlement): void;
+	/**
+	 * Correct or withdraw an existing queued input atomically with product authorization and audit facts. Resolve the
+	 * latest candidate; never rewrite a placed user entry or create a new admission. Request replay keeps this identity.
+	 */
+	reviseQueuedInput(id: SubmissionId, revision: QueuedInputRevision): Promise<QueuedInputRevisionResult>;
 	/**
 	 * Place a queued submission at `entry`: an input becomes `placed`, a write `done`. Resolved like
 	 * `settleSubmission()`. Inbox boundaries place the submissions they select.
