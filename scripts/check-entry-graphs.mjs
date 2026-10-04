@@ -45,7 +45,8 @@ const BUDGETS = {
 		".": {
 			// The built-in tool task validates arguments with pi-ai's TypeBox-based validation, so TypeBox is allowed.
 			// Knowledge-only history transfer and protected model preparation add two single-path native modules.
-			maxFiles: 62,
+			// Provider-session creation adds its document and pi-ai's lean UUID utility.
+			maxFiles: 64,
 			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
 		},
 	},

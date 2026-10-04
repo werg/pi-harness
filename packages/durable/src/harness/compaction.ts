@@ -17,6 +17,7 @@ import type {
 import { orderToolResults } from "./context.ts";
 import { type PinnedMessages, type PinnedModel, pinMessages, pinModel } from "./json.ts";
 import { addCompactionStatus, compactionStatus, LiveDoc, type LiveState, removeCompactionStatus } from "./live.ts";
+import { ensureProviderSessionId } from "./provider.ts";
 import { admitSubmission } from "./submissions.ts";
 import type {
 	CompactionHooks,
@@ -165,6 +166,7 @@ export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, 
 			const { deferred: _deferred, ...forwarded } = streamOptions;
 			const options = {
 				...forwarded,
+				sessionId: await ensureProviderSessionId(runtime, context),
 				cacheRetention: "none",
 				maxTokens,
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),

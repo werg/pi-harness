@@ -1,8 +1,19 @@
 {
   "baseline": "0f8740bb65638180403a225ad7ec4d0cc1f8dedf",
-  "reviewedRelease": "a13d35a742c6ef8462812a28fbe1d8c8b7431c32",
-  "reviewedMain": "7fbbd5f4a1d982bb02d63472dde0774fa639f99b",
-  "mode": "Selective adoption; not a full 1.0.0 monorepo rebase",
+  "reviewedRelease": "cd32f7725fdbddbaecdff5b1e68491563394e0ca",
+  "reviewedMain": "200387122ca450d6387f033949423114a270b96c",
+  "mode": "Selective library adoption through upstream 1.0.2; workspace baseline versions retained",
+  "adoptedChangesSincePreviousReview": [
+    "70eceaad: persisted provider conversation identity for generation, compaction, reload and fork",
+    "76dfb88f: per-thinking-level sampling parameters with explicit request overrides",
+    "b271b0a5: Anthropic inline mid-conversation tool definitions; SDK 0.129.0",
+    "69f0be6f: remove stale Bedrock Claude thinking blocks on supported replays",
+    "eeac84ca: fail ChatGPT OAuth before browser launch when callback port is occupied",
+    "3874b3e9: classify model capacity responses as retryable provider failures",
+    "4812cb26: Cloudflare Clef classifiers and direct classifier response envelopes",
+    "c10bfb0d, 28eaccb8, 4665fafb: gateway model IDs, Together V4 Pro 0813 and Bedrock pricing tiers",
+    "Shared catalog grouping and published-catalog hydration with duplicate identity validation"
+  ],
   "files": [
     {
       "path": "packages/ai/src/api/openai-responses-shared.ts",

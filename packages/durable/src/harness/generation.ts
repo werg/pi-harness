@@ -31,6 +31,7 @@ import { applyBoundary, prepareBoundary } from "./inbox.ts";
 import { assignJson, jsonEqual, type PinnedMessages, type PinnedModel, pinMessages, pinModel } from "./json.ts";
 import { endRun, LiveDoc, type LiveState, type ToolSlot } from "./live.ts";
 import { planSystemEntries, renderSections, replaySections } from "./prompt.ts";
+import { ensureProviderSessionId } from "./provider.ts";
 import { appendToolResult, harnessError, ToolTask, type ToolTaskResult } from "./tool.ts";
 import type {
 	CompactionPolicy,
@@ -227,6 +228,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				return failNoModel(runtime, { provider: model.provider, modelId: model.id }, context);
 			const options = {
 				...streamOptions,
+				sessionId: await ensureProviderSessionId(runtime, context),
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
 			} satisfies SimpleStreamOptions;
 			const response = await runtime.withModelRequest(

@@ -51,6 +51,7 @@ export {
 	WakeDoc,
 	type WakeSchedule,
 } from "./harness/live.ts";
+export { ProviderDoc, type ProviderState } from "./harness/provider.ts";
 export { createRegistry } from "./harness/registry.ts";
 export type { TaskGraph, TaskGraphNode, TaskGraphState, TaskGraphWatch } from "./harness/task-graph.ts";
 export {
