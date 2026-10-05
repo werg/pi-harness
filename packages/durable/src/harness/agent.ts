@@ -10,6 +10,7 @@ import type {
 	ConversationStreamOptions,
 	Extension,
 	HarnessSettings,
+	ProgressPolicy,
 	PromptSection,
 	RegistrySnapshot,
 	Settings,
@@ -28,6 +29,11 @@ export const DEFAULT_COMPACTION_POLICY: CompactionPolicy = {
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 	backgroundTokens: 32768,
+};
+
+export const DEFAULT_PROGRESS_POLICY: ProgressPolicy = {
+	partialIntervalMs: 100,
+	outputIntervalMs: 100,
 };
 
 /** The reserved section key of the agent's `instructions`. */
@@ -52,6 +58,7 @@ export function resolveSettings(settings: HarnessSettings | undefined): Settings
 		stream: { ...settings?.stream },
 		retry: { ...DEFAULT_RETRY_POLICY, ...settings?.retry },
 		compaction: { ...DEFAULT_COMPACTION_POLICY, ...settings?.compaction },
+		progress: { ...DEFAULT_PROGRESS_POLICY, ...settings?.progress },
 		toolExecution: settings?.toolExecution ?? "parallel",
 		steeringMode: settings?.steeringMode ?? "one-at-a-time",
 		followUpMode: settings?.followUpMode ?? "one-at-a-time",

@@ -23,7 +23,14 @@ import type {
 import { toolMatches } from "./define.ts";
 import { assignJson, snapshotError } from "./json.ts";
 import { clearProgress, finishSlot, LiveDoc, type ToolSlot, toolSlot } from "./live.ts";
-import { boundOutput, OutputBuffer, type OutputCheckpoint, type OutputLimits, Progress } from "./output.ts";
+import {
+	boundOutput,
+	OutputBuffer,
+	type OutputCheckpoint,
+	type OutputLimits,
+	PROGRESS_BYTES_PER_SECOND,
+	Progress,
+} from "./output.ts";
 import type {
 	ToolBinding,
 	ToolControl,
@@ -336,10 +343,19 @@ async function run(
 		continuation,
 		registry: runtime.registry,
 		agent: runtime.agent,
-		output: (chunk) => {
+		output: (chunk, skipped) => {
 			assertLive();
-			if (reported.output.push(chunk)) progress.mark();
+			if (reported.output.push(chunk, skipped)) progress.mark();
 		},
+		outputWindow:
+			limits.retain === "tail"
+				? {
+						maxBytes: limits.maxBytes,
+						maxLines: limits.maxLines,
+						minIntervalMs: runtime.settings.progress.outputIntervalMs,
+						bytesPerSecond: PROGRESS_BYTES_PER_SECOND,
+					}
+				: undefined,
 		diagnostic: (diagnostic) => {
 			assertLive();
 			reported.diagnostics.push(copyJson(diagnostic, { omitUndefinedProperties: true }) as ToolDiagnostic);
@@ -564,6 +580,7 @@ function publishProgress(runtime: Runtime, reported: Reported, context: Context)
 			// Rejections after an abort mark or close are expected; the committed state stays consistent.
 			if (!runtime.signal.aborted) runtime.report(error);
 		},
+		runtime.settings.progress.outputIntervalMs,
 	);
 }
 
