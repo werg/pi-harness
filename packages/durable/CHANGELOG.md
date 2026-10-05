@@ -4,6 +4,7 @@
 
 ### Breaking Changes
 
+- Adopted upstream's required bounded binary and directory readers, line scanning, filesystem watches, argv shell execution, and shell output stream information for custom environments.
 - The portable SQLite facade in `@earendil-works/pi-durable/storage/sqlite` is asynchronous: `SqliteDatabase` extends the new `SqliteExecutor` (`exec`, `run`, `get`, `all` by SQL text), `prepare` and `SqliteStatement` are removed, `transaction` takes an async callback that receives a transaction handle, and `close()` returns a promise. Custom adapters must be rewritten ([#10232](https://github.com/earendil-works/pi/pull/10232) by [@christianklotz](https://github.com/christianklotz)).
 - The registry holds named extensions: `registry.install(extension)` and `uninstall()` replace `tools`, `hooks`, `tasks`, `systemPrompt`, `conversations`, `batch()`, wrappers by key, and hook scopes. Build extensions with `defineExtension()`, `defineTool()`, `section()`, `hook()`, `wrapTool()`, and `wrapSection()`.
 - The per-conversation `pi.conversation.config` document and the `Conversation` getters and setters are replaced by the rewindable `pi.agent` document (model, thinking level, extension and tool selection, `instructions`, `cwd`), `Conversation.agent()`, `Conversation.configure()`, `configure(tx, id, change)`, and the `agent` option of `root()`, `createConversation()`, and `fork()`. A task-owned conversation starts as a copy of its owner's conversation's agent.
@@ -16,6 +17,9 @@
 
 ### Added
 
+- `Conversation.flush()` interrupts and joins the native run before consuming steering input or admitting one follow-up, preserving queued submission identities.
+- `HarnessCommit.task()` exposes the frozen candidate task state to commit preparation.
+- Configurable model partial and tool output progress intervals, bounded file reads, counted shell-output skips, and portable environment conformance checks from upstream 1.0.3.
 - `CodingTools` extension in `@earendil-works/pi-durable/tools` with `read`, `write`, `edit`, and `bash`.
 - `AgentDoc`, `configure()`, `DEFAULT_RETRY_POLICY`, and `DEFAULT_COMPACTION_POLICY` exports.
 - `HarnessOptions.conversationCreated(tx, conversation)` runs in every commit that creates or forks a conversation, after the built-in documents, so applications can create their own documents in every conversation.
@@ -25,6 +29,8 @@
 
 ### Fixed
 
+- Tail output retention remains stable across progress snapshots; environment decoding preserves BOM characters at chunk boundaries.
+- Platform filesystem flush, watch readiness, and conformance resource cleanup repairs from upstream 1.0.3.
 - `TaskRuntime.now()` and `report()` throw after the invocation ended, like every other runtime operation.
 - A commit that only migrates a document to a newer version publishes it, so states and watches acquired with the older token receive the migrated value.
 - A failed `Harness.open()` closes the Session without the caller's context and rethrows the original error; a cancelled context no longer masks it or leaves Storage open.

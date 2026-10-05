@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Adopted upstream's Azure provider identity `azure`, replacing `azure-openai-responses`; the Responses API identifier and Azure environment variables are unchanged.
+
+### Added
+
+- Azure Foundry Chat Completions deployments, including DeepSeek V4 Pro, through upstream 1.0.3.
+
+### Fixed
+
+- Persist rotated OAuth tokens even when the requesting operation is cancelled or superseded.
+- Retry HTTP/2 pending stream cancellation errors.
+
 ## [0.99.2] - 2026-09-30
 
 ### Added
