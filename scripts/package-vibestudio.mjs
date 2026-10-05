@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(process.argv[2] ?? join(root, ".artifacts/vibestudio"));
-const version = "0.99.2-vibestudio.11";
+const version = "0.99.2-vibestudio.12";
 const packages = [
 	["telemetry", "@earendil-works/pi-telemetry", "@panticonic/pi-telemetry"],
 	["chord", "@earendil-works/chord", "@panticonic/pi-chord"],
@@ -77,7 +77,9 @@ const artifacts = [];
 for (const [directory, upstream, name] of packages) {
 	const packageRoot = join(root, "packages", directory);
 	await rm(join(packageRoot, "dist"), { recursive: true, force: true });
-	process.stdout.write(run("npm", ["run", directory === "ai" ? "build:offline" : "build"], packageRoot));
+	if (directory === "ai") process.stdout.write(run(process.execPath, ["--experimental-strip-types", "scripts/check-model-data.ts"], packageRoot));
+	process.stdout.write(run(process.execPath, [join(root, "node_modules/typescript/bin/tsc"), "-p", "tsconfig.build.json"], packageRoot));
+	if (directory === "ai") await cp(join(packageRoot, "src/providers/data"), join(packageRoot, "dist/providers/data"), { recursive: true });
 	const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
 	const stage = await mkdtemp(join(output, `${directory}-stage-`));
 	try {

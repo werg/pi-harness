@@ -507,6 +507,16 @@ export class Transaction implements Tx {
 		return records;
 	}
 
+	/** Internal preparation view: candidate when staged, otherwise committed, detached from kernel ownership. */
+	prepareTask(id: TaskId): Promise<AnyTaskRecord | undefined> {
+		this.#assertOpen();
+		return this.#track(
+			this.#currentTask(id).then((record) =>
+				record === undefined ? undefined : (copyJson(record, TABLE_JSON_COPY_OPTIONS) as unknown as AnyTaskRecord),
+			),
+		);
+	}
+
 	/** Internal: complete submission candidates, including placement/settlement, before product preparation. */
 	async stagedSubmissions(): Promise<SubmissionRecord[]> {
 		await this.#resolveSubmissionChanges();

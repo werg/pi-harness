@@ -44,7 +44,13 @@ export type CompactionStatus = {
 /** Built-in live conversation state: run control and presentation of the current generation and tool round. */
 export type LiveState = {
 	/** Run control: the task that settles the run's inputs, and those inputs; present exactly while busy. */
-	run?: { taskId: TaskId; inputs: SubmissionId[]; requestSelection?: GenerationRetrySelection };
+	run?: {
+		taskId: TaskId;
+		inputs: SubmissionId[];
+		requestSelection?: GenerationRetrySelection;
+		/** Admitted intervention, consumed only after the old invocation and its tools have joined. */
+		interruption?: { kind: "flush" };
+	};
 	/** Presentation of the current generation attempt. */
 	generation?: {
 		attempt: number;

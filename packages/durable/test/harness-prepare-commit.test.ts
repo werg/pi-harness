@@ -193,6 +193,10 @@ describe("transactional harness preparation", () => {
 			expect(Reflect.set(staged.entries[0]!.data as object, "text", "changed")).toBe(false);
 			expect(Object.isFrozen(staged.tasks[0]!.input)).toBe(true);
 			expect(Object.isFrozen(staged.tasks[0]!.state)).toBe(true);
+			const candidate = await staged.task(staged.tasks[0]!.id);
+			expect(candidate).toEqual(staged.tasks[0]);
+			expect(Object.isFrozen(candidate?.state)).toBe(true);
+			expect(await staged.task(-1 as TaskId)).toBeUndefined();
 			await tx.appendEntry(staged.entries[0]!.conversationId, { kind: "derived" });
 			await tx.createTask(
 				Deliver,

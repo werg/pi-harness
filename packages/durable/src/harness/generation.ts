@@ -385,13 +385,30 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				? await readCalls(runtime, checkpoint.assistant, checkpoint.pending.flat(), context)
 				: [];
 		await runtime.commit(async (tx) => {
+			const boundary = await prepareBoundary(tx, conversationId, {
+				...runtime.settings,
+				followUpMode: "one-at-a-time",
+			});
 			const live = await tx.doc(LiveDoc, conversationId);
 			await convertPartial(tx, live, conversationId);
 			for (const call of unstarted) {
 				const result = harnessError("aborted", `Tool ${call.name} was aborted`);
 				await appendToolResult(tx, conversationId, call, result, runtime.now());
 			}
-			endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "aborted" });
+			if (live.run?.taskId === runtime.taskId && live.run.interruption?.kind === "flush") {
+				const steering = boundary.inbox.items.some((item) => item.mode === "steer");
+				const { users, reset } = await applyBoundary(tx, boundary, steering ? "postTools" : "final", runtime.now());
+				if (steering && users.length > 0 && !reset) {
+					live.run.inputs.push(...users);
+					delete live.run.interruption;
+					delete live.generation;
+					delete live.tools;
+					handOver(live, runtime.taskId, await createGeneration(tx, conversationId));
+				} else {
+					endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "aborted" });
+					if (users.length > 0) await startRun(tx, conversationId, live, users);
+				}
+			} else endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "aborted" });
 			return { status: "terminal", outcome: { status: "aborted" } };
 		}, context);
 	},

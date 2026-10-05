@@ -24,8 +24,9 @@ import { AgentDoc, configure, createAgent, resolveAgent, resolveSettings } from 
 import { createCompaction } from "./compaction.ts";
 import { readContext } from "./context.ts";
 import { bindTool } from "./define.ts";
+import { startRun } from "./generation.ts";
 import { exportConversationHistory, importConversationHistory, prepareConversationHistory } from "./history.ts";
-import { InboxDoc, withdrawQueuedInputs } from "./inbox.ts";
+import { applyBoundary, InboxDoc, prepareBoundary, withdrawQueuedInputs } from "./inbox.ts";
 import { LiveDoc, settleSchedulerOutcome } from "./live.ts";
 import { ProviderDoc } from "./provider.ts";
 import { BUILTIN_TASKS } from "./registry.ts";
@@ -172,6 +173,10 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 		return this.#host.tasks.abortConversation(this.id, options?.background === true, context);
 	}
 
+	flush(context: Context): Promise<void> {
+		return this.#host.harness.flushConversation(this.id, context);
+	}
+
 	waitForIdle(context: Context): Promise<void> {
 		this.#host.tasks.resume();
 		return this.#host.tasks.waitForIdle(this.id, context);
@@ -301,11 +306,19 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 
 	protected override async prepareCommit(tx: Transaction, context: Context): Promise<void> {
 		if (this.#options.prepareCommit !== undefined) {
-			const staged = copyJson({
+			const candidates = copyJson({
 				entries: tx.stagedEntries(),
 				submissions: await tx.stagedSubmissions(),
 				tasks: tx.stagedTasks(),
-			}) as unknown as HarnessCommit;
+			}) as unknown as Omit<HarnessCommit, "task">;
+			const staged = {
+				...candidates,
+				task: async (id: TaskId) => {
+					const record = await tx.prepareTask(id);
+					if (record !== undefined) freezeCommit(record);
+					return record;
+				},
+			} as unknown as HarnessCommit;
 			freezeCommit(staged);
 			await this.#options.prepareCommit(tx, staged, context);
 			tx.assertCallbackSettled();
@@ -343,6 +356,35 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 
 	abortTask(id: TaskId, context: Context): Promise<"marked" | "terminal"> {
 		return this.#tasks.abort(id, context);
+	}
+
+	async flushConversation(conversationId: ConversationId, context: Context): Promise<void> {
+		this.#tasks.resume();
+		const taskId = await this.commitWith(
+			async (tx) => {
+				const live = await tx.doc(LiveDoc, conversationId);
+				if (live.run === undefined) {
+					const boundary = await prepareBoundary(tx, conversationId, {
+						...resolveSettings(this.#options.settings),
+						followUpMode: "one-at-a-time",
+					});
+					const { users } = await applyBoundary(tx, boundary, "final", this.#host.now());
+					if (users.length > 0) await startRun(tx, conversationId, live, users);
+					return undefined;
+				}
+				const task = await tx.task(live.run.taskId);
+				if (task === undefined || task.state.status === "terminal")
+					throw new Error("Active input run has no live generation");
+				if (!task.abortRequested) {
+					live.run.interruption = { kind: "flush" };
+					tx.setTask({ ...task, abortRequested: true });
+				}
+				return task.id;
+			},
+			context,
+			{ conversationId },
+		);
+		if (taskId !== undefined) await this.#tasks.waitForTask(taskId, context);
 	}
 
 	retryTask(id: TaskId, incident: EntryId, context: Context): Promise<"queued" | "stale" | "terminal"> {

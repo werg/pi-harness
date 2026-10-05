@@ -555,6 +555,8 @@ export type HarnessCommit = {
 	readonly entries: readonly EntryRecord[];
 	readonly submissions: readonly SubmissionRecord[];
 	readonly tasks: readonly TaskRecord<JsonValue, JsonValue, JsonValue>[];
+	/** Candidate task view on this mutation line, including unchanged dependencies. Not a committed table read. */
+	readonly task: (id: TaskId) => Promise<TaskRecord<JsonValue, JsonValue, JsonValue> | undefined>;
 };
 
 export type HarnessOptions<Tool extends ToolRegistration = ToolRegistration> = {
@@ -714,6 +716,12 @@ export interface Conversation {
 	 * signal them, and resolve once the scope is idle. Background subtrees survive unless `background` is set.
 	 */
 	abort(context: Context, options?: ConversationAbortOptions): Promise<void>;
+	/**
+	 * Interrupt the active generation and join its owned work without withdrawing queued inputs. Queued steers resume
+	 * the original input run; otherwise exactly one follow-up starts a new run. An idle conversation advances its queue.
+	 * Resolves once the old generation is terminal and the next input boundary is committed, not after the new answer.
+	 */
+	flush(context: Context): Promise<void>;
 	/**
 	 * Resolve when the ordinary ownership scope has no live non-background task: this conversation and the conversations
 	 * owned, transitively, by its non-background tasks.
