@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(process.argv[2] ?? join(root, ".artifacts/vibestudio"));
-const version = "0.99.2-vibestudio.12";
+const version = "1.1.0-vibestudio.1";
 const packages = [
 	["telemetry", "@earendil-works/pi-telemetry", "@panticonic/pi-telemetry"],
 	["chord", "@earendil-works/chord", "@panticonic/pi-chord"],

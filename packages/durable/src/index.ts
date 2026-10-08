@@ -189,6 +189,7 @@ export type {
 	RewindableConversationDocToken,
 	RewindableConversationSemantics,
 	RunningTask,
+	ScanOrder,
 	Seq,
 	Session,
 	SessionDocFamilyToken,

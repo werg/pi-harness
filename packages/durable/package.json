@@ -66,7 +66,13 @@
 			"import": "./dist/testing/index.js",
 			"default": "./dist/testing/index.js"
 		},
-		"./package.json": "./package.json"
+		"./package.json": "./package.json",
+		"./storage/sqlite/cloudflare": {
+			"source": "./src/storage/sqlite/cloudflare.ts",
+			"types": "./dist/storage/sqlite/cloudflare.d.ts",
+			"import": "./dist/storage/sqlite/cloudflare.js",
+			"default": "./dist/storage/sqlite/cloudflare.js"
+		}
 	},
 	"sideEffects": false,
 	"files": [

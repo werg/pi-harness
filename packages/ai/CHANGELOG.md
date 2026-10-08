@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Integrated upstream 1.1.0 provider schemas, pricing tiers, classifiers and native Anthropic callback-port handling.
+
 ### Breaking Changes
 
 - Adopted upstream's Azure provider identity `azure`, replacing `azure-openai-responses`; the Responses API identifier and Azure environment variables are unchanged.

@@ -201,7 +201,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 		},
 		bind: async (task, runtime, context) => {
 			const { phase: _, ...request } = task.state.checkpoint;
-			const view = await runtime.context(runtime.conversationId, context, request.cutoff);
+			const view = await runtime.context(runtime.conversationId, context, { at: request.cutoff });
 			let messages = view.messages;
 			await runtime.hooks.each("beforeRequest", async (hook) => {
 				const replaced = await hook({ messages }, runtime, context);
@@ -661,7 +661,7 @@ async function classify(
 	const overflow = message.stopReason === "error" && isContextOverflow(message);
 	if (overflow && compacted === undefined && settings.compaction.enabled) {
 		const policy = settings.compaction;
-		const view = await runtime.context(conversationId, context, cutoff);
+		const view = await runtime.context(conversationId, context, { at: cutoff });
 		if (selectCut(view, policy.keepRecentTokens) !== undefined) {
 			const text = message.errorMessage ?? "Context overflow";
 			await runtime.commit(async (tx): Promise<Next> => {

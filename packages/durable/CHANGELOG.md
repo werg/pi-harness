@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Integrated upstream 1.1.0 incremental context, ordered scans and execution durations while retaining workerd payloads, pinned request inputs and owned continuation cancellation.
+
 ### Breaking Changes
 
 - Adopted upstream's required bounded binary and directory readers, line scanning, filesystem watches, argv shell execution, and shell output stream information for custom environments.

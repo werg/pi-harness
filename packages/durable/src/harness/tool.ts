@@ -343,6 +343,7 @@ async function run(
 		continuation,
 		registry: runtime.registry,
 		agent: runtime.agent,
+		models: runtime.models,
 		output: (chunk, skipped) => {
 			assertLive();
 			if (reported.output.push(chunk, skipped)) progress.mark();
@@ -413,22 +414,29 @@ async function run(
 
 	let result: ToolExecutionResult | ToolExecutionWait;
 	let ending = COMPLETED;
+	// Execution time of this attempt; a rerun after recovery measures only itself.
+	let durationMs: number | undefined;
 	try {
 		// Built for this call, so a rerun after recovery gets the conversation's environment at that time.
 		const env = await runtime.env(context);
-		result = await (cancelling ? tool.cancel! : tool.execute)(
-			args,
-			{
-				...api,
-				env,
-				get executionData() {
-					return binding.data === undefined ? undefined : immutableData(copyJson(binding.data));
+		const startedAt = performance.now();
+		try {
+			result = await (cancelling ? tool.cancel! : tool.execute)(
+				args,
+				{
+					...api,
+					env,
+					get executionData() {
+						return binding.data === undefined ? undefined : immutableData(copyJson(binding.data));
+					},
 				},
-			},
-			context,
-		);
-		if ("wait" in result && tool.cancel === undefined)
-			throw new Error(`External tool ${call.name} has no cancellation contract`);
+				context,
+			);
+			if ("wait" in result && tool.cancel === undefined)
+				throw new Error(`External tool ${call.name} has no cancellation contract`);
+		} finally {
+			durationMs = Math.round(performance.now() - startedAt);
+		}
 	} catch (error) {
 		// A failed observation or cleanup does not establish the admitted operation's terminal outcome.
 		if (cancelling || retainedContinuation !== undefined || runtime.signal.aborted) {
@@ -484,7 +492,7 @@ async function run(
 	const pending = await progress.stop();
 	try {
 		const settled = await finalResult(runtime, call, result, reported, context);
-		await settle(runtime, call, cancelling ? { status: "aborted" } : ending, () => settled, context);
+		await settle(runtime, call, cancelling ? { status: "aborted" } : ending, () => settled, context, durationMs);
 	} catch (error) {
 		for (const waiter of pending) waiter.reject(error);
 		if (retainedContinuation !== undefined && !runtime.signal.aborted) {
@@ -628,6 +636,7 @@ async function settle(
 	ending: Ending,
 	build: (slot: Readonly<ToolSlot> | undefined) => ToolExecutionResult,
 	context: Context,
+	durationMs?: number,
 ): Promise<void> {
 	await runtime.commit(async (tx) => {
 		const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
@@ -648,8 +657,8 @@ async function settle(
 		const input = task.input as ToolTaskInput;
 		const entry =
 			input.source.kind === "direct"
-				? await appendDirectToolResult(tx, runtime.conversationId, input.source.entryId, call, result)
-				: await appendToolResult(tx, runtime.conversationId, call, result, runtime.now());
+				? await appendDirectToolResult(tx, runtime.conversationId, input.source.entryId, call, result, durationMs)
+				: await appendToolResult(tx, runtime.conversationId, call, result, runtime.now(), durationMs);
 		if (slot !== undefined) finishSlot(slot, entry.id);
 		const entryId = entry.id;
 		if (ending.status === "aborted")
@@ -722,6 +731,7 @@ export async function appendToolResult(
 	call: ToolCall,
 	result: ToolExecutionResult,
 	timestamp: number,
+	durationMs?: number,
 ): Promise<TypedEntry<{ diagnostics: ToolDiagnostic[] }>> {
 	const diagnostics = [...(result.diagnostics ?? [])];
 	const content: Content = [...(result.content ?? [])];
@@ -734,6 +744,7 @@ export async function appendToolResult(
 		...(result.details === undefined ? {} : { details: result.details }),
 		...(result.usage === undefined ? {} : { usage: result.usage }),
 		isError: result.isError ?? false,
+		...(durationMs === undefined ? {} : { durationMs }),
 		timestamp,
 	} as ToolResultMessage;
 	if (result.usage !== undefined) await recordUsage(tx, conversationId, "tools", call.name, result.usage);
@@ -747,6 +758,7 @@ async function appendDirectToolResult(
 	sourceEntryId: EntryId,
 	call: ToolCall,
 	result: ToolExecutionResult,
+	durationMs?: number,
 ) {
 	if (result.usage !== undefined) await recordUsage(tx, conversationId, "tools", call.name, result.usage);
 	return tx.appendEntry(DirectToolResultEntry, conversationId, {
@@ -754,6 +766,7 @@ async function appendDirectToolResult(
 			sourceEntryId,
 			callId: call.id,
 			name: call.name,
+			...(durationMs === undefined ? {} : { durationMs }),
 			result: copyJson(result as JsonValue, { omitUndefinedProperties: true }),
 		},
 	});

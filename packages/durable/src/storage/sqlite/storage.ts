@@ -20,6 +20,7 @@ import type {
 	Id,
 	JsonObject,
 	Page,
+	ScanOrder,
 	Seq,
 	Storage,
 	StorageWrite,
@@ -31,6 +32,7 @@ import type {
 	TaskQuery,
 	TaskRecord,
 } from "../../types.ts";
+import { nextCursor, type ScanStart, scanStart } from "../scan.ts";
 import type { SqliteDatabase, SqliteExecutor, SqliteValue } from "./database.ts";
 import { applySqliteMigrations } from "./migrations.ts";
 import { readJsonRow, readJsonRows, writeJsonPayload } from "./payload.ts";
@@ -70,11 +72,21 @@ const cursorId = <I extends Id<string>>(cursor: Cursor | undefined): I | undefin
 	return idFromNumber<I>(after);
 };
 
-const page = <T extends { readonly id: Id<string> }>(values: readonly T[], limit: number): Page<T, Cursor> => {
+const page = <T extends { readonly id: Id<string> }>(
+	values: readonly T[],
+	limit: number,
+	order: ScanOrder = "ascending",
+): Page<T, Cursor> => {
 	const items = values.slice(0, limit);
 	if (values.length <= limit) return { items };
-	return { items, next: { after: items.at(-1)!.id } };
+	return { items, next: nextCursor(items.at(-1)!.id, order) };
 };
+
+/** The ID condition, its parameter, and the `ORDER BY` direction of a table scan. */
+const scanSql = (start: ScanStart): { readonly clause: string; readonly param: number; readonly direction: string } =>
+	start.order === "ascending"
+		? { clause: "id > ?", param: start.after ?? -1, direction: "ASC" }
+		: { clause: "id < ?", param: start.after ?? Number.MAX_SAFE_INTEGER, direction: "DESC" };
 
 const scopeColumns = (scope: DocumentRecord["scope"]): ScopeColumns => {
 	switch (scope.kind) {
@@ -206,8 +218,10 @@ export class SqliteStorage implements Storage {
 		_context: Context,
 	): Promise<Page<ConversationRecord, Cursor>> {
 		this.assertOpen();
-		const clauses = ["id > ?"];
-		const params: SqliteValue[] = [cursorId(cursor) ?? -1];
+		const start = scanStart(query.order, cursor, "ascending");
+		const scan = scanSql(start);
+		const clauses = [scan.clause];
+		const params: SqliteValue[] = [scan.param];
 		if (query.ownerConversationId !== undefined) {
 			clauses.push("owner_conversation_id = ?");
 			params.push(query.ownerConversationId);
@@ -219,12 +233,14 @@ export class SqliteStorage implements Storage {
 		params.push(limit + 1);
 		const rows = await readJsonRows<JsonRow>(
 			this.db,
-			`SELECT id FROM conversations WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
+			`SELECT id FROM conversations WHERE ${clauses.join(" AND ")} ORDER BY id ${scan.direction} LIMIT ?`,
 			[...params],
+			{ descending: start.order === "descending" },
 		);
 		return page(
 			rows.map((row) => parseJson<ConversationRecord>(row.record)),
 			limit,
+			start.order,
 		);
 	}
 
@@ -326,9 +342,10 @@ export class SqliteStorage implements Storage {
 		limit: number,
 		cursor: Cursor | undefined,
 	): Promise<Page<EntryRecord, Cursor>> {
+		const { order, after } = scanStart(query.order, cursor, "descending");
+		if (order === "ascending") return this.readEntriesAscending(query, limit, after);
 		let conversation = await this.readConversation(query.conversationId);
 		if (conversation === undefined) throw new Error(`Unknown conversation: ${query.conversationId}`);
-		const after = cursorId(cursor);
 		let upper: number | undefined = query.maxEntryId;
 		if (after !== undefined) upper = Math.min(upper ?? Number.MAX_SAFE_INTEGER, after - 1);
 		const values: EntryRecord[] = [];
@@ -356,7 +373,50 @@ export class SqliteStorage implements Storage {
 			if (query.minEntryId !== undefined && upper < query.minEntryId) break;
 			conversation = (await this.readConversation(conversation.parent.conversationId))!;
 		}
-		return page(values, limit);
+		return page(values, limit, "descending");
+	}
+
+	/** Oldest first: the fork chain's segments from the root conversation forward, each up to its fork point. */
+	private async readEntriesAscending(
+		query: EntryQuery,
+		limit: number,
+		after: number | undefined,
+	): Promise<Page<EntryRecord, Cursor>> {
+		const segments: { readonly conversationId: ConversationId; readonly upper: number | undefined }[] = [];
+		let conversation = await this.readConversation(query.conversationId);
+		if (conversation === undefined) throw new Error(`Unknown conversation: ${query.conversationId}`);
+		let upper: number | undefined = query.maxEntryId;
+		while (true) {
+			segments.push({ conversationId: conversation.id, upper });
+			if (conversation.parent === undefined) break;
+			upper = upper === undefined ? conversation.parent.at : Math.min(upper, conversation.parent.at);
+			if (query.minEntryId !== undefined && upper < query.minEntryId) break;
+			conversation = (await this.readConversation(conversation.parent.conversationId))!;
+		}
+		let lower: number | undefined = query.minEntryId;
+		if (after !== undefined) lower = Math.max(lower ?? after + 1, after + 1);
+		const values: EntryRecord[] = [];
+		for (const segment of segments.reverse()) {
+			const clauses = ["conversation_id = ?"];
+			const params: SqliteValue[] = [segment.conversationId];
+			if (lower !== undefined) {
+				clauses.push("id >= ?");
+				params.push(lower);
+			}
+			if (segment.upper !== undefined) {
+				clauses.push("id <= ?");
+				params.push(segment.upper);
+			}
+			params.push(limit + 1 - values.length);
+			const rows = await readJsonRows<JsonRow>(
+				this.db,
+				`SELECT id FROM entries WHERE ${clauses.join(" AND ")} ORDER BY id ASC LIMIT ?`,
+				params,
+			);
+			values.push(...rows.map((row) => parseJson<EntryRecord>(row.record)));
+			if (values.length > limit) break;
+		}
+		return page(values, limit, "ascending");
 	}
 
 	async task(id: TaskId, _context: Context): Promise<StoredTask | undefined> {
@@ -372,8 +432,10 @@ export class SqliteStorage implements Storage {
 		_context: Context,
 	): Promise<Page<StoredTask, Cursor>> {
 		this.assertOpen();
-		const clauses = ["id > ?"];
-		const params: SqliteValue[] = [cursorId(cursor) ?? -1];
+		const start = scanStart(query.order, cursor, "ascending");
+		const scan = scanSql(start);
+		const clauses = [scan.clause];
+		const params: SqliteValue[] = [scan.param];
 		if (query.conversationId !== undefined) {
 			clauses.push("conversation_id = ?");
 			params.push(query.conversationId);
@@ -397,12 +459,14 @@ export class SqliteStorage implements Storage {
 		params.push(limit + 1);
 		const rows = await readJsonRows<JsonRow>(
 			this.db,
-			`SELECT id FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
+			`SELECT id FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY id ${scan.direction} LIMIT ?`,
 			[...params],
+			{ descending: start.order === "descending" },
 		);
 		return page(
 			rows.map((row) => parseJson<StoredTask>(row.record)),
 			limit,
+			start.order,
 		);
 	}
 
@@ -419,8 +483,10 @@ export class SqliteStorage implements Storage {
 		_context: Context,
 	): Promise<Page<SubmissionRecord, Cursor>> {
 		this.assertOpen();
-		const clauses = ["id > ?"];
-		const params: SqliteValue[] = [cursorId(cursor) ?? -1];
+		const start = scanStart(query.order, cursor, "ascending");
+		const scan = scanSql(start);
+		const clauses = [scan.clause];
+		const params: SqliteValue[] = [scan.param];
 		if (query.conversationId !== undefined) {
 			clauses.push("conversation_id = ?");
 			params.push(query.conversationId);
@@ -432,12 +498,14 @@ export class SqliteStorage implements Storage {
 		params.push(limit + 1);
 		const rows = await readJsonRows<JsonRow>(
 			this.db,
-			`SELECT id FROM submissions WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`,
+			`SELECT id FROM submissions WHERE ${clauses.join(" AND ")} ORDER BY id ${scan.direction} LIMIT ?`,
 			[...params],
+			{ descending: start.order === "descending" },
 		);
 		return page(
 			rows.map((row) => parseJson<SubmissionRecord>(row.record)),
 			limit,
+			start.order,
 		);
 	}
 

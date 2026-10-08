@@ -1,50 +1,476 @@
 {
   "baseline": "0f8740bb65638180403a225ad7ec4d0cc1f8dedf",
-  "reviewedRelease": "d78dc83d633229d12f8b79631384c4c2717c399f",
-  "reviewedMain": "5b6c792b424e73edefbfa558b901bcd64788dad2",
-  "previousReviewedMain": "200387122ca450d6387f033949423114a270b96c",
-  "mode": "Three-way library integration through upstream 1.0.3 and HTTP/2 retry fix; workspace baseline versions retained",
+  "reviewedRelease": "abe508e1b89912adde45528136c3221eb69acdd7",
+  "reviewedMain": "ce950d78f424dcaf9f5d6a03ce80ab141130eb1d",
+  "previousReviewedMain": "5b6c792b424e73edefbfa558b901bcd64788dad2",
+  "mode": "Three-way integration of the four distributed libraries through upstream 1.1.0 and reviewed main; upstream workspace versions retained",
   "adoptedChangesSincePreviousReview": [
-    "bde882c7: persist rotated OAuth tokens when a request or model refresh is cancelled",
-    "a37306d4: Azure Foundry Chat Completions deployments and canonical azure provider identity",
-    "5b6c792b: retry HTTP/2 pending stream cancellation",
-    "4748c627, a19c09d9: bounded binary and directory readers, argv exec, stream info and bounded read tool",
-    "674d64f0, cdf79797: configurable progress intervals and exact shell-output skip accounting",
-    "a8451081, 864777ba, 1965a806, be882f3f: filesystem watches and platform conformance repairs",
-    "1543dd8f, f5d20047, acfc6019: platform flush and conformance resource cleanup",
-    "Regenerated the catalog with the adopted generator; 1539 chat models including Azure DeepSeek"
+    "All source, tests, generators and library documentation changes in AI, Durable, Chord and Telemetry since 5b6c792b through ce950d78",
+    "Anthropic native browser/copy-code login and dynamic loopback port binding; preserved exact authorization and token-exchange callback identity",
+    "Incremental committed context reads, ordered storage scans, task and tool duration, model schemas, image classifiers, provider cost tiers and transport fixes",
+    "Retained pinned provider request inputs, workerd chunked payloads, dormant failure waits, external continuation cancellation, direct tools and executable offer waves"
   ],
   "files": [
     {
-      "path": "packages/ai/src/api/openai-responses-shared.ts",
-      "sha256": "09100e0bfe8fa4ad212312956930f4a9e70cd29ca823d2e1f1c97f87b4541afe",
-      "mode": "complete reviewed file"
+      "path": "packages/ai/CHANGELOG.md",
+      "sha256": "0639983b38aa9c21b88f86c742fc4302b185de38a6b46d116bf68ea712fa4b2f",
+      "mode": "reviewed upstream library integration"
     },
     {
-      "path": "packages/ai/test/constrained-sampling.test.ts",
-      "sha256": "6ea43195759d9f284f2ecdbaab99b89444ef630c8821407ede914ce5a7fe0a5e",
-      "mode": "complete reviewed file"
+      "path": "packages/ai/README.md",
+      "sha256": "57f671ccf4b507645f4339e927a5dda2b4172b542ba83b8eda1f573c1de2aced",
+      "mode": "reviewed upstream library integration"
     },
     {
-      "path": "packages/chord/src/types.ts",
-      "sha256": "49ecf6a5dd354c97d068ca57d280c9080d3274c8b04fe720d68742e9216114fb",
-      "mode": "complete reviewed file"
+      "path": "packages/ai/scripts/ai-gateway-pricing.ts",
+      "sha256": "0984c93bac625cb4f5fc50b826ff4c91128983aa7b3cae92f6d4fae3f6728e62",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/scripts/generate-models.ts",
+      "sha256": "08619c71e480531e5fd3ea0282599d01e3c6414c1bc15d608960e74cd5d832b8",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/scripts/openrouter-catalog.ts",
+      "sha256": "d76912150a9d6097d0ae96acbf26fa59eef1d68795c0225fc0c44440469fe4ce",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/bedrock-converse-stream.ts",
+      "sha256": "122b26fdcd1671cc885e37b5410a418b056cf43cc49856f6ae421017beff3097",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/classifier-shared.ts",
+      "sha256": "8a0799a8be599181789c8c6cf3b29f7ea3c6f6f3ffcac5817fcf6e5d0a0a6436",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/cloudflare-workers-ai-system-one.ts",
+      "sha256": "5077f6ab825c638cd1a9ff61b2a46abcf794e2f5edd1691aac34d3c41bf88c61",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/lazy.ts",
+      "sha256": "1d38468b570b179dc404be7d13b737cb1d001bd96a0a9b3626d8c3f0bf9a49be",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/llama-cpp-classify.ts",
+      "sha256": "1e602f8dd389d7eff80128db9091282473d87b50b2b01771e841aefd0bb9a386",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/mistral-conversations.ts",
+      "sha256": "9cd5378daeaa38111bc5f06142859811c83f518d4103aaaa9566570677a42e75",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/openai-codex-responses.ts",
+      "sha256": "5b9e41af974b25d1854a0b2e47ad677a55f583876dd24cc7779d24177c537860",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/openai-decisions.lazy.ts",
+      "sha256": "909c94d3399f7984d659a63efa239f776f9eacbddbb754958e4a4d01544dfd9d",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/openai-decisions.ts",
+      "sha256": "5ee58f0e99805aee09f1b4edbf3f7ef68bf5fb7aa2b36d131518c836809b0724",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/system-one-shared.ts",
+      "sha256": "50e17ed4467d410b3fea8e7e735123b73a3a8be65a7354d75c55c75e5106b042",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/api/typesafe-system-one.ts",
+      "sha256": "424efadf5f33ac600fb894b9edbbf76fb7731dc737a0c3ed771d08feba708260",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/auth/oauth/anthropic.ts",
+      "sha256": "f72cd3bdb5d4fc8cc647487a69ed38464548c397062fbc2acfcef6431c9c0b0c",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/auth/oauth/openai-chatgpt.ts",
+      "sha256": "ad9dbdd7ffa52fcbaff1d1be2d0ba97b643476aaf8930e6dd67147bf35c837de",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/auth/oauth/openai-codex.ts",
+      "sha256": "2b73b65d0a65b770708a4aead7d89c11f3656c4c2a1b055acd98a4186bab0865",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/auth/types.ts",
+      "sha256": "2d14d659f1c62f11cc942b1c2d681f2218c0b671cc37a1df59a5e1a1ee37aef5",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/models.ts",
+      "sha256": "3b48631cdabe885ed846cb29f0a71abe8e3effc682c63d0b612eef648d40e9f5",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/providers/compat-schema.ts",
+      "sha256": "7cc0d438f21b565ede6a00f41a530fd660f040f5dce2a33a71789f29b6fe9e34",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/providers/faux.ts",
+      "sha256": "aeaa8df95399776587ad0cfccccd3b498891a20c5c5846f935e04d9d09dd84a1",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/providers/model-schema.ts",
+      "sha256": "6cfdcf0368299300af277d1952781ed701be55ab6a900454fc3eeeffbe07e178",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/providers/openai.ts",
+      "sha256": "899573159312b94f4ae53a3af25d3b92c86b583f7635dd3c14d95395b46f4644",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/providers/radius.ts",
+      "sha256": "40acce75f4f5c99cbeb03247cbf0fbdde9e911b097af3c25132cdf1f75346c32",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/types.ts",
+      "sha256": "2355c99c3247c9d5be3a351bafd1155fbd3ef554269eee3dc6785abafca1d9e5",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/utils/estimate.ts",
+      "sha256": "b1fb184f293167b9f270567a09bf43e296ff7dd809e26fa4bc5c1f968946eaed",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/utils/event-stream.ts",
+      "sha256": "9fd5e33a8e295d88b5911af71d7afbfd437c9620288808d18331f16811e24dac",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/utils/model-operations.ts",
+      "sha256": "d8a7bb663ad3b97253f03b424c6d9e821ed066c8c0449aa00e1f06b75f41115b",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/utils/provider-retry.ts",
+      "sha256": "91350009509d50845ff0c609bf98bd8818081b6fcc64d034e6d45522f41db9ab",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/src/utils/retry.ts",
+      "sha256": "6a6ef19b697a91b6f4c72d6b6f87ff1d063ea16ed7c206808cba7376a710be1b",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/anthropic-adaptive-thinking-models.test.ts",
+      "sha256": "0bd37c067ab03d47a6c94187389772ef45c386d052bfc29126aa0d79a86c1f34",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/anthropic-oauth.test.ts",
+      "sha256": "ba29fb5a43485901f73e1e9410f8ccebc3f3b92bb4ec092a448557cbe96bd9f8",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/bedrock-thinking-payload.test.ts",
+      "sha256": "f15266b2ee51b81611c4a91f8f6f418f8391cd2875ffbf022827572b9fab945a",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/classifier-models.test.ts",
+      "sha256": "cb2b019a79111d8af2070a5dac8a3ca41ff9da62b78c64706172f09986cac881",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/compat-schema.test.ts",
+      "sha256": "b1d8468bf6e1d1c192bcd65b60e7e004b2c72a4eba1f3348822a192279fd6c9f",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/context-estimate.test.ts",
+      "sha256": "ea24bb2285fd3364a9712ab39a13937a93acac7efafa7533547d559ac43003ea",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/event-stream.test.ts",
+      "sha256": "3e8e8bc39b33c79be9858bd3210212658d75de196222c69b61a5a183737ab6d9",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/faux-provider.test.ts",
+      "sha256": "01795d13318acabb737b4be8d2766d2db11fe814602fd1df27b20ac3afb915f0",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/mistral-http-transport.test.ts",
+      "sha256": "e0aaf43f1f78d74a7a4daf2cd570751ef23667b1b323430dd3ccca3b25d25507",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/mistral-raw-stop-reason.test.ts",
+      "sha256": "cbda7f2b6479f11bf186e65e072442067ab2a20abbf8332bbe1fb6e59bcf3db1",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/model-cost-tiers.test.ts",
+      "sha256": "fcc61178fbf9b1813b46f04d6aab2bb23c1a447f06a171ad1e6b892e9ebb83f3",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/openai-chatgpt-oauth.test.ts",
+      "sha256": "9605bc7f0d912af2d2afb9a15cbeca47488f08ae8644a67efc7fbdaa060451f9",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/openai-codex-oauth.test.ts",
+      "sha256": "a8546d718e3d69e2b42109b9cf61d3bb080767c63be2d9afcdbdf558c963f9c9",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/openai-codex-stream.test.ts",
+      "sha256": "0a6e6a7e93802f5cf72f399cc9a8f50b8a6fc7010fb6e32becb3bd11f10525e0",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/openai-completions-empty-tools.test.ts",
+      "sha256": "6646beeecdafb7577ce104e005e5ca7a33e98972d243f0a5024515c0de32389c",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/openai-decisions.test.ts",
+      "sha256": "84ace61e59d0aa7f3c6c42c60942db90e1ff444e781c8c5ba0f189bdd5f12d94",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/provider-retry.test.ts",
+      "sha256": "f2fc80d84b92038b40dac0cc0dbe3ac8f5542d84c574eaf98177bc4c02e15441",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/radius-provider.test.ts",
+      "sha256": "a4214deca29be57b8a5239ebae780dabb3a13f725d8992eb1cf87f32f1b6b322",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/supports-xhigh.test.ts",
+      "sha256": "a5e44b009169e1910c5e551433185ae2416d1db87bc4c3dfb915f6d52f750288",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/ai/test/typesafe-system-one.test.ts",
+      "sha256": "267f62341d4944faa85b6dc8773d07a11fda745f5d5ceee7796182259e9f3fa9",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/CHANGELOG.md",
+      "sha256": "9dfaa7c210e0d8d7dce6d633716cc31fc0c601a2be249515def353fb9deb9f1e",
+      "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/README.md",
-      "sha256": "4a648847d0704382eed58c904340e9941ac5a02524153270a177ca218fc6216e",
-      "mode": "complete reviewed file"
+      "sha256": "121824f6d433b4d9d113cb965e40b0119ee1dd3c1c662669ec8ee7f0a942cd9e",
+      "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/package.json",
-      "mode": "default export conditions and packaged documentation only; workspace baseline version retained"
+      "sha256": "f484deb28923ef72c67399ebdf9ea567eac0b5137c6cb56c2be47c78cec139fc",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/env/node-watch.ts",
+      "sha256": "f3a9b9d186489166ffb7ab6ab0032f46ca3e8d05943c1db386be1fd17106cefa",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/agent.ts",
+      "sha256": "5d22902d8be3cdb92ca84b1305269a1af4b6c7607c5c72995dddb3ee0e7c5027",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/context.ts",
+      "sha256": "d661dc3b89f1c831c40ecbd36c4e60831bd8d091b170798e23063eb5b8010da5",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/generation.ts",
+      "sha256": "bfd23c5229c43e9e659c94635ea8017506880d23118879b80d6cd3d51557de59",
+      "mode": "integrated with retained Vibestudio contracts"
+    },
+    {
+      "path": "packages/durable/src/harness/harness.ts",
+      "sha256": "b122e31b2e98280061d6ac16d3eb01ebab464ab014f20d1aa402684b4b543871",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/output.ts",
+      "sha256": "f5970fece1cfbd7fb8d99c159e6abbd3927d5f3ced8ef67123e843bd078e606a",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/scheduler.ts",
+      "sha256": "17d47f5e5b16bce55abd6822183f38d46899a2c6afb7bbd4c1b3cebc7e78542a",
+      "mode": "integrated with retained Vibestudio contracts"
+    },
+    {
+      "path": "packages/durable/src/harness/tool.ts",
+      "sha256": "1cd921493e0cf43c63e7153ee67b2c7e5cc40212531ba79986e23748e549924a",
+      "mode": "integrated with retained Vibestudio contracts"
+    },
+    {
+      "path": "packages/durable/src/harness/types.ts",
+      "sha256": "39d4b8bc9326b1472eecab6f6821adfaff0d7888505377af70cb9e37966bda1e",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/index.ts",
+      "sha256": "19897644d9c546bc3d4bf3d00f77e38248563d95ecbcafb929b5a083c35b796f",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/session/session.ts",
+      "sha256": "9ba81057cf554e060e3a2e7c6c20383b171938a27135cd948a8ec77cdfe58f09",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/session/transaction.ts",
+      "sha256": "442ae273282fd2a45851b6a7774f1f9f143dbd8eb67aadd721c35b2e4488170d",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/storage/memory.ts",
+      "sha256": "5c885f3f06b3e53689c8a75be2545a5845af60fdf036bad309f0760990d12830",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/storage/scan.ts",
+      "sha256": "c877b0d33d681212994387abdace219bc85557a2fa574a885a74020189be481e",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/storage/sqlite/cloudflare.ts",
+      "sha256": "a12cfd3f2e686814483367a047537c638739a1ee4320a2b146427c68a338dcd3",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/storage/sqlite/storage.ts",
+      "sha256": "956330ab9690b83e152d2dc87734d594886fc3a81faa5c36f5a2244147e2772a",
+      "mode": "integrated with retained Vibestudio contracts"
+    },
+    {
+      "path": "packages/durable/src/testing/env-conformance.ts",
+      "sha256": "aab506df9b05e266e72b8eb0c0c620939717951c699f77c73922113cfa00fc57",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/testing/storage-conformance.ts",
+      "sha256": "6589c6190319ec13f438a537ee96f7a36ac23cbb5ffd6096d9e1a4b92946ab94",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/tools/bash.ts",
+      "sha256": "01ae16bb7538f8d614d866dd2a350699a706b084f26aebe8d899fa9e45b76490",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/tools/index.ts",
+      "sha256": "5ef9eea292f2197bd46ab51a5782c54dd81bae6fe9444aaf41bea5758ef4bea7",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/tools/read.ts",
+      "sha256": "6490ac0357941239499eded28108ada260a6d9657c625d71e76f9ed43185eac2",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/types.ts",
+      "sha256": "93f7fca90f4c67d782975f477fed26d3915f05413cef6d0add1ab9562c19d184",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-compaction.test.ts",
+      "sha256": "203ba2387b5723253cac995c3c667269edc4e1e6fe7c4450a44980dac82ad575",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-context.test.ts",
+      "sha256": "60900cc42febc8d6f6abff0dac1fa102ccff0f612b64e6e0046385f11f5632c9",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-conversations.test.ts",
+      "sha256": "fcbdb9ac1dc81bf372a2a3cbd646ed9051b157f877fa318b7a9c17f23f45c50e",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-generation-recovery.test.ts",
+      "sha256": "36fbb18b1153e092a1b87aa8df3827f2f3d54436ff40ab3d0bd6f253b405c667",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-generation.test.ts",
+      "sha256": "06b52195328a614e5a936bad524a15f1c8a46006556f430d2c49895a74616649",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-inbox.test.ts",
+      "sha256": "96864ae8da06bd4a8768571c8cef4392a6fadb8226c651569d5ead0f4d6e240e",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-output.test.ts",
+      "sha256": "a1e341e0beec47b941057948d3e3e784c64292868f83051a3ccd95e95c6d80ed",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-registry.test.ts",
+      "sha256": "73f38b26880658eada13513c383b3fb1c3d9e29775a22d5eb4a434f6f24f238c",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-tasks-recovery.test.ts",
+      "sha256": "72cdc4a9e144171b513e8c299f5c731602968f0d77637e772d4b1b4e8d08320a",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-tasks.test.ts",
+      "sha256": "ae5131b1b10fd135bcc26a14af980ef2b200d5d79b4934bcc710e97c6312a449",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-tools.test.ts",
+      "sha256": "d1847fe4284446c5da261fec9630a93146d0bf4437690038d9f8f31f35cd3103",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/sqlite-cloudflare.test.ts",
+      "sha256": "00fef5dec18f07222eef7276c31730545274ca96cffb67dbf522b02eb3d3375c",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/system-order-cache-e2e.test.ts",
+      "sha256": "4a4f30dac08e9bcbce3ab36759df02ee8593760ca3197d63365f24ba707ece33",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/tools.test.ts",
+      "sha256": "988a56c34187e23340a3a6c83456ab286ef391f6fab761a9c5e29604c22db898",
+      "mode": "reviewed upstream library integration"
     }
   ],
   "retained": "Vibestudio workerd storage, dormant waits, execution pins, tool waves, provider transport changes, queue flush and prepared commit task inspection",
   "notAdopted": [
-    "CLI/client/server/example changes outside the four distributed libraries, except the required Azure identity in the CLI model resolver",
-    "Cosmetic OAuth logo",
-    "Released changelog history rewrite and version-only changes",
-    "Source-only specification rename; packaged README links to upstream documentation"
+    "CLI/client/server/example changes outside the four distributed libraries, apart from necessary compile-time API migrations",
+    "Released changelog history and workspace version-only changes",
+    "Removed source-only durable specification; README continues to link to upstream specification"
   ]
 }

@@ -46,7 +46,8 @@ const BUDGETS = {
 			// The built-in tool task validates arguments with pi-ai's TypeBox-based validation, so TypeBox is allowed.
 			// Knowledge-only history transfer and protected model preparation add two single-path native modules.
 			// Provider-session creation adds its document and pi-ai's lean UUID utility.
-			maxFiles: 64,
+			// Upstream 1.1.0 adds the shared storage/scan module for ordered cursors (upstream budget 62 -> 63).
+			maxFiles: 65,
 			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
 		},
 	},

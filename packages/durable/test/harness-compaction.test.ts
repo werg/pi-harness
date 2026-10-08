@@ -182,6 +182,11 @@ function userText(message: Message | undefined): string {
 	return textOf(message) ?? "";
 }
 
+/** Text of the first user message; a leading baseline system message comes before it. */
+function firstUserText(messages: readonly Message[]): string {
+	return userText(messages.find((message) => message.role === "user"));
+}
+
 // ─── Range selection ──────────────────────────────────────────────────────
 
 let nextId = 1;
@@ -484,7 +489,7 @@ describe("manual compaction", () => {
 		await result(chat, await chat.root.compact(undefined, context));
 		expect((await followUp.wait(context)).status).toBe("done");
 		const request = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(request[0])).toContain("SUMMARY");
+		expect(firstUserText(request)).toContain("SUMMARY");
 		expect(request.some((message) => userText(message) === "follow-up")).toBe(true);
 		await chat.harness.close(context);
 	});
@@ -524,7 +529,7 @@ describe("manual compaction", () => {
 		// Placed and answered immediately with the uncompacted context, not queued behind the compaction.
 		expect((await input.status(context)).status).toBe("placed");
 		await answerReached.promise;
-		expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toBe(text("u1", 100));
+		expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toBe(text("u1", 100));
 		// The summary is ready while the run is busy, so it queues and lands after the answer.
 		summaryGate.resolve();
 		const outcome = await result(chat, id);
@@ -584,7 +589,7 @@ describe("manual compaction", () => {
 			status: "unanswered",
 			reason: "stale",
 		});
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("SECOND");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("SECOND");
 		await chat.harness.close(context);
 	});
 
@@ -601,13 +606,13 @@ describe("manual compaction", () => {
 		chat.setup.settings.compaction = { ...MANUAL, keepRecentTokens: 350 };
 		chat.faux.summaries.push(summary("B"));
 		await result(chat, await chat.root.compact(undefined, context));
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("B");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("B");
 		gate.resolve();
 		const outcome = await result(chat, a);
 		const submissionId = outcome.status === "completed" ? outcome.result.submissionId! : undefined;
 		expect((await (await chat.harness.submission(submissionId!, context))!.status(context)).status).toBe("done");
 		const messages = (await chat.root.context(context)).messages;
-		expect(userText(messages[0])).toContain("<summary>\nA\n</summary>");
+		expect(firstUserText(messages)).toContain("<summary>\nA\n</summary>");
 		expect(messages.slice(1).map(userText)).toEqual([text("u3", 100), text("a3", 100)]);
 		await chat.harness.close(context);
 	});
@@ -740,7 +745,7 @@ describe("compaction outcomes", () => {
 		const outcome = await result(chat, await chat.root.compact("why", context));
 		expect(outcome.status).toBe("completed");
 		expect(chat.faux.summaryRequests).toHaveLength(0);
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("<summary>\nFROM HOOK\n</summary>");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("<summary>\nFROM HOOK\n</summary>");
 		expect(chat.setup.reports).toEqual([expect.objectContaining({ message: "hook broke" })]);
 		const compaction = seen[0] as { entries: EntryRecord[]; messages: Message[]; firstKept: number };
 		expect(compaction).toMatchObject({ reason: "manual", instructions: "why" });
@@ -940,7 +945,7 @@ describe("background threshold compaction", () => {
 		const outcome = await result(chat, task!.id as TaskId<CompactionResult>);
 		expect(outcome.status).toBe("completed");
 		expect((await kinds(chat.root)).at(-1)).toBe("pi.compaction");
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("SUMMARY");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("SUMMARY");
 		await chat.harness.close(context);
 	});
 
@@ -1024,7 +1029,7 @@ describe("blocking threshold compaction", () => {
 		expect((await result(chat, child!.id as TaskId<CompactionResult>)).status).toBe("completed");
 		expect((await kinds(chat.root)).slice(-3)).toEqual(["pi.compaction", "pi.system", "pi.assistant"]);
 		const request = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(request[0])).toContain("SUMMARY");
+		expect(firstUserText(request)).toContain("SUMMARY");
 		const systems = request.filter((message) => message.role === "system");
 		expect(systems).toHaveLength(1);
 		expect(systems[0]).toMatchObject({
@@ -1058,7 +1063,7 @@ describe("blocking threshold compaction", () => {
 			prepare(chat);
 			await turn(chat, text("u4", 200), "a4");
 			expect((await kinds(chat.root)).includes("pi.compaction")).toBe(false);
-			expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toBe(text("u1", 100));
+			expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toBe(text("u1", 100));
 			await chat.harness.close(context);
 		});
 	}
@@ -1115,7 +1120,7 @@ describe("blocking threshold compaction", () => {
 		const [background] = await compactionTasks(chat);
 		chat.faux.summaries.push(summary("BLOCKING"));
 		await turn(chat, text("u5", 1000), "a5");
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("BLOCKING");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("BLOCKING");
 		gate.resolve();
 		const outcome = await result(chat, background!.id as TaskId<CompactionResult>);
 		const submissionId = outcome.status === "completed" ? outcome.result.submissionId! : undefined;
@@ -1279,7 +1284,7 @@ describe("compaction estimates and interactions", () => {
 			// The summary landed at postTools; the successor saw a small context and did not compact again.
 			expect(chat.faux.summaryRequests).toHaveLength(1);
 			expect(await compactionTasks(chat)).toEqual([]);
-			expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toContain("SUMMARY");
+			expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toContain("SUMMARY");
 			await chat.harness.close(context);
 		});
 	}
@@ -1333,7 +1338,7 @@ describe("compaction estimates and interactions", () => {
 		});
 		chat.faux.summaries.push(summary());
 		await result(chat, await chat.root.compact(undefined, context));
-		expect(userText(messages[0])).toBe("REDACTED");
+		expect(firstUserText(messages)).toBe("REDACTED");
 		expect(userText(chat.faux.summaryRequests[0]!.messages[1])).toContain("[User]: REDACTED");
 		await chat.harness.close(context);
 	});
@@ -1403,7 +1408,7 @@ describe("compaction estimates and interactions", () => {
 			statuses.push((await (await chat.harness.submission(id!, context))!.status(context)).status);
 		}
 		expect(statuses).toEqual(["done", "done"]);
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("CURRENT");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("CURRENT");
 		await chat.harness.close(context);
 	});
 
@@ -1741,7 +1746,7 @@ describe("compaction and the inbox", () => {
 		await turn(chat, "again", "ok");
 		expect((await submission.status(context)).status).toBe("done");
 		const request = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(request[0])).toContain("SUMMARY");
+		expect(firstUserText(request)).toContain("SUMMARY");
 		expect(request.map(userText)).toContain("again");
 		await chat.harness.close(context);
 	});
@@ -1976,7 +1981,7 @@ describe("compaction edge cases", () => {
 		expect((await submission.status(context)).status).toBe("queued");
 		chat.setup.settings.compaction = { ...BACKGROUND, reserveTokens: 1500, keepRecentTokens: 50 };
 		expect((await input.wait(context)).status).toBe("done");
-		expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toContain("BLOCKING");
+		expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toContain("BLOCKING");
 		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "stale" });
 		await chat.harness.close(context);
 	});
@@ -1993,7 +1998,7 @@ describe("compaction edge cases", () => {
 		const prompt = userText(chat.faux.summaryRequests[1]!.messages[1]);
 		expect(prompt).toMatch(/^<conversation>\n\[User\]: The conversation history before this point was compacted/);
 		expect(prompt).toContain("FIRST");
-		expect(userText((await chat.root.context(context)).messages[0])).toContain("SECOND");
+		expect(firstUserText((await chat.root.context(context)).messages)).toContain("SECOND");
 		await chat.harness.close(context);
 	});
 
@@ -2048,13 +2053,13 @@ describe("blocking and manual compaction together", () => {
 		run.gate.resolve();
 		expect((await run.input.wait(context)).status).toBe("done");
 		// The request after the blocking compaction used its summary; the manual one landed at the final boundary.
-		expect(userText(chat.faux.agentRequests.at(-1)!.messages[0])).toContain("BLOCKING");
+		expect(firstUserText(chat.faux.agentRequests.at(-1)!.messages)).toContain("BLOCKING");
 		expect((await submission.wait(context)).status).toBe("done");
 		const markers = (await allEntries(chat.root)).filter((record) => record.kind === "pi.compaction");
 		expect(markers).toHaveLength(2);
 		expect(markers[1]!.head).toBe(markers[0]!.head);
 		const messages = (await chat.root.context(context)).messages;
-		expect(userText(messages[0])).toContain("MANUAL");
+		expect(firstUserText(messages)).toContain("MANUAL");
 		expect(messages.some((message) => userText(message).includes("BLOCKING"))).toBe(false);
 		await chat.harness.close(context);
 	});
@@ -2115,7 +2120,7 @@ describe("blocking and manual compaction together", () => {
 		await turn(chat, "u5", "a5");
 		expect((await submission.status(context)).status).toBe("done");
 		const request = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(request[0])).toContain("SUMMARY");
+		expect(firstUserText(request)).toContain("SUMMARY");
 		expect(request.map(userText)).toContain("u5");
 		const tail = (await allEntries(chat.root)).slice(-4).map((record) => record.kind);
 		expect(tail).toEqual(["pi.compaction", "pi.user", "pi.system", "pi.assistant"]);
