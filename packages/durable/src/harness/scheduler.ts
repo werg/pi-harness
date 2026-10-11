@@ -408,7 +408,8 @@ export class TaskScheduler {
 				}
 			}
 			if (this.#closing) return projection;
-			if (schedule === undefined) return projection;
+			// Publication still runs for host repair, but an acknowledged snapshot needs no mutation-line work.
+			if (schedule === undefined || schedule.publishedRevision === projection.revision) return projection;
 			await this.#session.commitWith(async (tx) => {
 				const current = await tx.doc(WakeDoc);
 				if (current.revision === projection.revision) current.publishedRevision = projection.revision;

@@ -5,6 +5,7 @@
 ### Changed
 
 - Integrated upstream 1.1.0 incremental context, ordered scans and execution durations while retaining workerd payloads, pinned request inputs and owned continuation cancellation.
+- Wake publication still repairs the host schedule but skips acknowledgement transactions for already acknowledged revisions.
 
 ### Breaking Changes
 

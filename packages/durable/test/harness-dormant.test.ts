@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OutputBuffer } from "../src/harness/output.ts";
+import { SessionImpl } from "../src/session/session.ts";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { waitFor } from "./chat-support.ts";
 import { context } from "./session-support.ts";
@@ -289,6 +290,81 @@ describe("durable dormant scheduling", () => {
 		expect(after).toMatchObject({ revision: before.revision, wakeAt: before.wakeAt });
 		expect((await harness.snapshot(WakeDoc, context))!.publishedRevision).toBe(after.revision);
 		expect(schedules.at(-1)).toEqual(after);
+	});
+
+	it("repairs acknowledged host schedules without entering another acknowledgement transaction", async () => {
+		const publishWake = vi.fn(async (_schedule: WakeSchedule) => {});
+		const harness = await open(await database(), { publishWake });
+		const root = await harness.root(context);
+		await root.commit(
+			(tx) => tx.createTask(Timed, { until: Date.now() + 60_000 }, { ownership: { kind: "conversation" } }),
+			context,
+		);
+		const schedule = await harness.runPass(context);
+		const acknowledged = await harness.snapshot(WakeDoc, context);
+		expect(acknowledged?.publishedRevision).toBe(schedule.revision);
+		publishWake.mockClear();
+		const commit = vi.spyOn(SessionImpl.prototype, "commitWith");
+		try {
+			await Promise.all([harness.flushWake(context), harness.flushWake(context)]);
+			expect(publishWake.mock.calls).toEqual([[schedule], [schedule]]);
+			expect(commit).not.toHaveBeenCalled();
+			expect(await harness.snapshot(WakeDoc, context)).toEqual(acknowledged);
+			const failure = new Error("host schedule repair failed");
+			publishWake.mockRejectedValueOnce(failure);
+			await expect(harness.flushWake(context)).rejects.toBe(failure);
+			expect(commit).not.toHaveBeenCalled();
+			await expect(harness.flushWake(context)).resolves.toEqual(schedule);
+		} finally {
+			commit.mockRestore();
+		}
+	});
+
+	it("leaves a revision changed during acknowledged host repair pending for its own publication", async () => {
+		const path = await database();
+		let harness = await open(path);
+		let root = await harness.root(context);
+		await root.commit(
+			(tx) => tx.createTask(Timed, { until: Date.now() + 60_000 }, { ownership: { kind: "conversation" } }),
+			context,
+		);
+		const acknowledged = await harness.runPass(context);
+		await harness.close(context);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let hold = true;
+		harness = await open(path, {
+			publishWake: async () => {
+				if (!hold) return;
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		root = await harness.root(context);
+		const repairing = harness.flushWake(context);
+		try {
+			await entered.promise;
+			await root.commit(
+				(tx) => tx.createTask(Timed, { until: Date.now() + 30_000 }, { ownership: { kind: "conversation" } }),
+				context,
+			);
+			const pending = (await harness.snapshot(WakeDoc, context))!;
+			expect(pending.revision).toBeGreaterThan(acknowledged.revision);
+			expect(pending.publishedRevision).toBe(acknowledged.revision);
+			hold = false;
+			release.resolve();
+			await expect(repairing).resolves.toEqual(acknowledged);
+			expect(await harness.snapshot(WakeDoc, context)).toEqual(pending);
+			await expect(harness.flushWake(context)).resolves.toEqual({
+				revision: pending.revision,
+				wakeAt: pending.wakeAt,
+			});
+			expect((await harness.snapshot(WakeDoc, context))?.publishedRevision).toBe(pending.revision);
+		} finally {
+			hold = false;
+			release.resolve();
+			await repairing;
+		}
 	});
 
 	it("derives input readiness from staged eligible entries in the same atomic commit", async () => {
