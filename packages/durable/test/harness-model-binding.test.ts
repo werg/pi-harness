@@ -3,14 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { copyJson, type JsonValue } from "@earendil-works/chord";
 import { type Api, fauxAssistantMessage, type Model } from "@earendil-works/pi-ai";
-import {
-	CompactionTask,
-	GenerationTask,
-	LiveDoc,
-	MemoryStorage,
-	StorageRejected,
-	type Task,
-} from "@earendil-works/pi-durable";
+import { CompactionTask, GenerationTask, LiveDoc, MemoryStorage, type Task } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat, waitFor } from "./chat-support.ts";
@@ -281,22 +274,19 @@ describe("committed model request binding", () => {
 	it("does not send a model request if storing the actual hook input fails", async () => {
 		const setup = chatSetup();
 		const storage = new ControlledStorage();
+		const failure = new Error("binding commit rejected");
 		addHooks(setup.registry, GenerationTask, {
 			beforeRequest: () => {
-				storage.failNextCommit(new StorageRejected("binding commit rejected"));
+				storage.failNextCommit(failure);
 				return undefined;
 			},
 		});
 		setup.faux.setResponses([fauxAssistantMessage("must not run")]);
 		const opened = await openChat(storage, setup);
 		try {
-			expect(
-				await (await opened.root.submit({ type: "input", content: "go" }, context)).wait(context),
-			).toMatchObject({
-				status: "unanswered",
-				reason: "faulted",
-				detail: "binding commit rejected",
-			});
+			const submission = await opened.root.submit({ type: "input", content: "go" }, context);
+			await expect(submission.wait(context)).rejects.toMatchObject({ name: "SessionFailed", cause: failure });
+			expect(await opened.harness.closed).toEqual({ reason: "failed", error: failure });
 			expect(setup.faux.state.callCount).toBe(0);
 		} finally {
 			await opened.harness.close(context);

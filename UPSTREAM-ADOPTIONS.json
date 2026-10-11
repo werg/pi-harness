@@ -1,14 +1,15 @@
 {
   "baseline": "0f8740bb65638180403a225ad7ec4d0cc1f8dedf",
   "reviewedRelease": "abe508e1b89912adde45528136c3221eb69acdd7",
-  "reviewedMain": "ce950d78f424dcaf9f5d6a03ce80ab141130eb1d",
-  "previousReviewedMain": "5b6c792b424e73edefbfa558b901bcd64788dad2",
-  "mode": "Three-way integration of the four distributed libraries through upstream 1.1.0 and reviewed main; upstream workspace versions retained",
+  "reviewedMain": "96abe9a5ad45005cae34ed1c52d42f71fc88bedc",
+  "previousReviewedMain": "ce950d78f424dcaf9f5d6a03ce80ab141130eb1d",
+  "mode": "Three-way integration of all four distributed libraries through upstream 1.1.0 and reviewed main 96abe9a5a; existing fork source workspace versions preserved, coherent distribution version 1.1.0-vibestudio.2 assigned by the canonical packaging script",
   "adoptedChangesSincePreviousReview": [
-    "All source, tests, generators and library documentation changes in AI, Durable, Chord and Telemetry since 5b6c792b through ce950d78",
-    "Anthropic native browser/copy-code login and dynamic loopback port binding; preserved exact authorization and token-exchange callback identity",
-    "Incremental committed context reads, ordered storage scans, task and tool duration, model schemas, image classifiers, provider cost tiers and transport fixes",
-    "Retained pinned provider request inputs, workerd chunked payloads, dormant failure waits, external continuation cancellation, direct tools and executable offer waves"
+    "Complete source, tests and library documentation changes in AI, Durable, Chord and Telemetry since ce950d78f through 96abe9a5a; this interval changes Durable only",
+    "Incremental scheduler ownership, waiter and runnable indexes bounded by live work; per-call nested tool documents and structured output; tool caller filters",
+    "Fatal Session storage failure ownership and propagation, commit-listener isolation, bounded document-cache retention, display-only immediate writes and application input entries",
+    "Optional Photon image preparation with lazy WASM loading and a Node worker-thread image processor; image-valued read results",
+    "Retained workerd storage and image injection boundary, execution pins including nested admissions, external continuation cancellation, direct tools, executable offer waves, dormant scheduling and acknowledged host-wake repair"
   ],
   "files": [
     {
@@ -273,17 +274,17 @@
     },
     {
       "path": "packages/durable/CHANGELOG.md",
-      "sha256": "9dfaa7c210e0d8d7dce6d633716cc31fc0c601a2be249515def353fb9deb9f1e",
+      "sha256": "87df5b98cbd12320b68e67fe5745e1c210eb02929c237a47fb064d8dbfcbaa17",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/README.md",
-      "sha256": "121824f6d433b4d9d113cb965e40b0119ee1dd3c1c662669ec8ee7f0a942cd9e",
+      "sha256": "8980f8b6e0ed940531c2ee9e15c3599fe95047b9ca46614a3f7febf20187afa8",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/package.json",
-      "sha256": "f484deb28923ef72c67399ebdf9ea567eac0b5137c6cb56c2be47c78cec139fc",
+      "sha256": "b5f34dd6962a8c6edf7b31cd760a6912559545b34190188ff2efae287e0ff3cf",
       "mode": "reviewed upstream library integration"
     },
     {
@@ -292,8 +293,13 @@
       "mode": "reviewed upstream library integration"
     },
     {
+      "path": "packages/durable/src/errors.ts",
+      "sha256": "f2212d6d097af81e87af88553e7f474d54fc88041255b7bb4b42701df178a04d",
+      "mode": "reviewed upstream library integration"
+    },
+    {
       "path": "packages/durable/src/harness/agent.ts",
-      "sha256": "5d22902d8be3cdb92ca84b1305269a1af4b6c7607c5c72995dddb3ee0e7c5027",
+      "sha256": "f964388eea3c379bfc331033fa9f97b45b6a1e253aab6a8de310f31981a80399",
       "mode": "reviewed upstream library integration"
     },
     {
@@ -302,13 +308,38 @@
       "mode": "reviewed upstream library integration"
     },
     {
+      "path": "packages/durable/src/harness/define.ts",
+      "sha256": "babb79630e950bb788b2218d4f2dece5b792822271a6b4f5d30d2aa3387c817e",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/events.ts",
+      "sha256": "4fc86f64874f46781907cf67c03bed7735c731684353ddbc954bc2b64055271d",
+      "mode": "reviewed upstream library integration"
+    },
+    {
       "path": "packages/durable/src/harness/generation.ts",
-      "sha256": "bfd23c5229c43e9e659c94635ea8017506880d23118879b80d6cd3d51557de59",
-      "mode": "integrated with retained Vibestudio contracts"
+      "sha256": "d5ea265f8d0a059022a032f6749e5d342cf681231c4467700780fd3a98478f79",
+      "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/harness/harness.ts",
-      "sha256": "b122e31b2e98280061d6ac16d3eb01ebab464ab014f20d1aa402684b4b543871",
+      "sha256": "30dd604f9beef92dae19eb76bd58f87d2f9b37b0d1f01e65452e717a719419ce",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/inbox.ts",
+      "sha256": "f5b4bea3facc7583f9cb833e3a6eec2fdc37192920441cc9d7a50bd415ea2b6b",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/json.ts",
+      "sha256": "27a01835b66d387957b5e44905868640f689fb7bd2c740fab9105e1a32b9c0af",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/live.ts",
+      "sha256": "12cb06cc1274aee8c95ebe0242bb038b356c7c37071bd8cae731b62745f869c2",
       "mode": "reviewed upstream library integration"
     },
     {
@@ -318,42 +349,107 @@
     },
     {
       "path": "packages/durable/src/harness/scheduler.ts",
-      "sha256": "17d47f5e5b16bce55abd6822183f38d46899a2c6afb7bbd4c1b3cebc7e78542a",
-      "mode": "integrated with retained Vibestudio contracts"
+      "sha256": "2768a60f61c33f5a42a45adc61c38ca4b9f4a15fe0dcd644e8a979c116e01420",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/submissions.ts",
+      "sha256": "9c6fb4dff229a555b49aa80e02e633e8c7d3f0cd87063694b79f8086601ed3f0",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/task-graph.ts",
+      "sha256": "2fbbe44eb44c6add00ba3230d7365135d9450e3d675e57b509f808b2d8835743",
+      "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/harness/tool.ts",
-      "sha256": "1cd921493e0cf43c63e7153ee67b2c7e5cc40212531ba79986e23748e549924a",
-      "mode": "integrated with retained Vibestudio contracts"
+      "sha256": "562dddd3b6ef84caebb6925574e7fe1ecd56d92420f2e6a4cf14790de2de3705",
+      "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/harness/types.ts",
-      "sha256": "39d4b8bc9326b1472eecab6f6821adfaff0d7888505377af70cb9e37966bda1e",
+      "sha256": "dc512dd1495cc114ce3fcf64a352c0c5ec0e93dd0fd447fca96bdcf6b9cbf152",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/util.ts",
+      "sha256": "5af765463e0cecf4db6cab89172845be2e65dfdbf1003647aab6bae68543f0f0",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/view.ts",
+      "sha256": "e9d8e017089060a6deab7465630471b0405f563861094971cc10ea351d3a6823",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/harness/wake-index.ts",
+      "sha256": "a1b65bd6fb81d4f020cd7534b6bb25e77a20d0b478aca50ac099433709c5fe57",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/images/cloudflare.ts",
+      "sha256": "0afbc97a56dde8153ddc47cf2aa2c7069c3664a91e1808ebcc6a855e182c62d1",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/images/exif.ts",
+      "sha256": "8a078cd7829ce5bc4ed1fc78372384add9f868b3c3dc1a8f3ba5761bfa124808",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/images/index.ts",
+      "sha256": "dbe59efe444d9816a74088ea27cd74c40b254efbd479e420ea8b723b5d5eeaf3",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/images/node-worker.ts",
+      "sha256": "494cfe3c40c66c32e3b77c2292e743c0d234ccf4972979922d31a548f93b028e",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/images/node.ts",
+      "sha256": "1450617d47f42a5b56c67af0c45d5a56734e5ca43495cda271915d6b02593406",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/images/photon-wasm.d.ts",
+      "sha256": "6505003776af0d1d6c8427ce6e0537ab5a3c5609929025256c5b4f48ab717b6d",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/index.ts",
-      "sha256": "19897644d9c546bc3d4bf3d00f77e38248563d95ecbcafb929b5a083c35b796f",
+      "sha256": "7cb1202591f03e529ebf2914fe22bb1c78c2ffd57ae56d5de1605f037cc41a34",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/session/observation.ts",
+      "sha256": "68feebb9f960bd514703be34e185373ef2315ec2b13b2b4f02dbec24eea7b485",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/session/session.ts",
-      "sha256": "9ba81057cf554e060e3a2e7c6c20383b171938a27135cd948a8ec77cdfe58f09",
+      "sha256": "83626f4d5833b1c93bc6e3bc16f2804cf5ea09e736970d92e278f992f1ccb9d5",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/session/transaction.ts",
-      "sha256": "442ae273282fd2a45851b6a7774f1f9f143dbd8eb67aadd721c35b2e4488170d",
+      "sha256": "05bbedf30423ce67fff4c7cd6724fcfc0a50b919c1aa3cda77bcce964f070832",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/storage/jsonl/storage.ts",
+      "sha256": "302e9d1f78e19d279408d51261eb7d30b6aae86f5a7a4c36e01617ba3818480a",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/storage/memory.ts",
-      "sha256": "5c885f3f06b3e53689c8a75be2545a5845af60fdf036bad309f0760990d12830",
+      "sha256": "7967310b92dd04fa0cb04afe67435b73dc3e7ada71e074aa018c9a35d8feaeb5",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/storage/scan.ts",
-      "sha256": "c877b0d33d681212994387abdace219bc85557a2fa574a885a74020189be481e",
+      "sha256": "5982cf5a390987c196d074bef35f170c7d3fb6b552b0bba056792d661eb2b881",
       "mode": "reviewed upstream library integration"
     },
     {
@@ -363,8 +459,8 @@
     },
     {
       "path": "packages/durable/src/storage/sqlite/storage.ts",
-      "sha256": "956330ab9690b83e152d2dc87734d594886fc3a81faa5c36f5a2244147e2772a",
-      "mode": "integrated with retained Vibestudio contracts"
+      "sha256": "789b08c021ef69727c928d5a6d8d7d742de731583f7407d959012f0faa052b1e",
+      "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/testing/env-conformance.ts",
@@ -373,32 +469,102 @@
     },
     {
       "path": "packages/durable/src/testing/storage-conformance.ts",
-      "sha256": "6589c6190319ec13f438a537ee96f7a36ac23cbb5ffd6096d9e1a4b92946ab94",
+      "sha256": "7312d02a1d0a266c2af41f786f3542c908ae4d554237b039f3c4b86696ac1cf5",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/tools/bash.ts",
-      "sha256": "01ae16bb7538f8d614d866dd2a350699a706b084f26aebe8d899fa9e45b76490",
+      "sha256": "abf2c18f21e93a2a25d271dff28a83c199196b7095cf6671fa65e1f0419728cc",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/tools/edit.ts",
+      "sha256": "311cd88b4ef3466c654658ded861e3b0ad12ae8d0c722ef87ccfadd387064d48",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/tools/image-processor.ts",
+      "sha256": "c6ad2f1683785a1fb4cdfaca0e26c8a234bb87767518834a5614cc94c057a5fb",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/tools/image.ts",
+      "sha256": "b7f7eff7af7a36ea6633e5323ee7184d2de6814743e0a54ce0040d576be38f98",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/tools/index.ts",
-      "sha256": "5ef9eea292f2197bd46ab51a5782c54dd81bae6fe9444aaf41bea5758ef4bea7",
+      "sha256": "b5b01979671afd1b7d300ac8149919ac00bb248caa88a7fb98b7ada3aab9e960",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/tools/read.ts",
-      "sha256": "6490ac0357941239499eded28108ada260a6d9657c625d71e76f9ed43185eac2",
+      "sha256": "db9ed7872f2699066e668b59e4ee8244a887441d70e7c6a135a92ee364aad399",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/src/tools/write.ts",
+      "sha256": "15ae90d34f684b7777acdc1a3eb2904da34df36d229f0456ef4bc24e81f867a8",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/src/types.ts",
-      "sha256": "93f7fca90f4c67d782975f477fed26d3915f05413cef6d0add1ab9562c19d184",
+      "sha256": "b6337ddffe608b323e38f5f783dd148d5d0117c3c7c9c9414bb57bfa95618446",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/examples/06-harness.ts",
+      "sha256": "6b00399d8bf9346b56d947a71c565b42bbe73f17d5d5f16afe46577b76d14ced",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/examples/07-configuration.ts",
+      "sha256": "297f794b4647f0970815252ba1f8050100f472399892706692ab0a79e72415eb",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/examples/10-registry-reload.ts",
+      "sha256": "581b93786c6c5fdcf0ce2e09c2008d35cd7ba649bba2f05a76c7cb697cc533bf",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/examples/11-extension-state.ts",
+      "sha256": "deaa3606c88d0fc8531557323da3c5cf2aa4f3bdcbc32efc070eea4472f3d03c",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/examples/22-subagent-foreground.ts",
+      "sha256": "5441431df4e2f0801f0d3bfcedde768d821e8fa0217728e2c5b68925b94bce22",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/examples/27-plan-mode.ts",
+      "sha256": "eecca3e71dd5919ca1566d0639ccce1b6b088091aaa2afb5be85a999d52a0914",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/examples/31-reload-and-restart.ts",
+      "sha256": "1eb8f5573b6905003d1ffe51a47012ddcf6ffaa9b4a4c3041eb552864d9c0788",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-callers.test.ts",
+      "sha256": "b35ad471f8be27ef9116396a82cbfde4ded30517c0501fe87360dd6bdd7b0355",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-cancellation-barrier.test.ts",
+      "sha256": "969306846f6b0fb010c20886a1e661a145a62864461d5bda96ad4fbf6f1858c5",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-cleanup-failure.test.ts",
+      "sha256": "a62223c1e31017f46b07d067a56c92138c92ee2b18d6c1aefb49b677e5265228",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/test/harness-compaction.test.ts",
-      "sha256": "203ba2387b5723253cac995c3c667269edc4e1e6fe7c4450a44980dac82ad575",
+      "sha256": "ac21206cd73f00e70c90c6c978bca8449cd24260003badab78c944bac2294d57",
       "mode": "reviewed upstream library integration"
     },
     {
@@ -408,7 +574,27 @@
     },
     {
       "path": "packages/durable/test/harness-conversations.test.ts",
-      "sha256": "fcbdb9ac1dc81bf372a2a3cbd646ed9051b157f877fa318b7a9c17f23f45c50e",
+      "sha256": "8ada79f9ac7b55f8ed86a73103553f49ace79760a5742831c569ef39f25f0c3a",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-direct-tool.test.ts",
+      "sha256": "182881ea8034479956de5cba188ac19d967ac986eb6dff6b34a32b2c1b528b59",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-dormant.test.ts",
+      "sha256": "719baac219b0da00211c765d8c3e6a3f0b63ac966a993b3505b7d9addff7321c",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-events.test.ts",
+      "sha256": "0bea1bf50e6ef4bdfc4571c9de55425fcc5233d9ddde21aa087da57fa0df76c4",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-flush.test.ts",
+      "sha256": "0b19a24e0ce0afa1aff935327e610772cba7c5349ed4fac001c139fb2742ab32",
       "mode": "reviewed upstream library integration"
     },
     {
@@ -418,12 +604,52 @@
     },
     {
       "path": "packages/durable/test/harness-generation.test.ts",
-      "sha256": "06b52195328a614e5a936bad524a15f1c8a46006556f430d2c49895a74616649",
+      "sha256": "b17efd57cfc762905bf1efcf6f5c174148be88321b85b69e0eea95b81669bbff",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-history.test.ts",
+      "sha256": "ff4c2a1a5d407acd7fbcd339e7a17c97fe66a75b17c6ad25b317832c42141b8b",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/test/harness-inbox.test.ts",
-      "sha256": "96864ae8da06bd4a8768571c8cef4392a6fadb8226c651569d5ead0f4d6e240e",
+      "sha256": "cddc201e293aa56d4dbbca46fcbb76344d7b1a9872ec88ccdada7e1723af78ae",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-input-entries.test.ts",
+      "sha256": "943b4c459da117c91afd33862e804942d6a77a5e2199526f7469d86b2af3bd57",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-lifecycle.test.ts",
+      "sha256": "de6937c42000aada6b2dcd623a17a59dfa63e0a4c7103467a51c37cd29842959",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-live-deltas.test.ts",
+      "sha256": "05dc033afa2ee4e1b755b51fa7c50c37c207a794cbc390e908360c14e8e37359",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-model-binding.test.ts",
+      "sha256": "baec8fb96e7532e5816ae9bdd95912d1021a2d6003e503bf205707f5e0783f11",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-model-preparation.test.ts",
+      "sha256": "97ea354fdf95cc8fa32c68b76be0dbcb2fb0068f050b7aa422353b973a406a69",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-nested-tools-restart.test.ts",
+      "sha256": "5189619568de7ec067a99721b3a854c936b8d4a06e38ec79da3a9f5d0d5855a8",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-nested-tools.test.ts",
+      "sha256": "1d0275e5e0fe211c71439282276f52f4f005a67fa4cd3ee874917872f89efc0c",
       "mode": "reviewed upstream library integration"
     },
     {
@@ -432,23 +658,188 @@
       "mode": "reviewed upstream library integration"
     },
     {
+      "path": "packages/durable/test/harness-ownership.test.ts",
+      "sha256": "28935998766da33364d1b1e35974cfd458e6bc78d840fbf001ae92759da3ae99",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-poll-failure.test.ts",
+      "sha256": "04152557853812252bef28670f3a7dc4eeea46cd5dfa002b5b427e686d66065f",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-prepare-commit.test.ts",
+      "sha256": "946a96ce125c624ac36329a0bb0abbd2a0ad15eeda90a83ce29da7b5b2fc871c",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-prompt.test.ts",
+      "sha256": "a5f08cb962292d3524953cbb18a991f014bbddfa44e7a3da963ba9d8cec64ec6",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-queued-input-revision.test.ts",
+      "sha256": "1587fde6c013396981d9add2cbedf357e8bbf61ab3a6a70d57260662998ee64d",
+      "mode": "reviewed upstream library integration"
+    },
+    {
       "path": "packages/durable/test/harness-registry.test.ts",
-      "sha256": "73f38b26880658eada13513c383b3fb1c3d9e29775a22d5eb4a434f6f24f238c",
+      "sha256": "cc4aa6cd81c920463bec4b05fdd85de8dbf29ae8f04cfd0ead3d594a4d3cdf27",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-scheduler-indexes.test.ts",
+      "sha256": "48d3d2ce7b1dff6ea78a60f3307bcd9e07a152a8f34dfe9e09434b7ade6d6033",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-scheduler-retention.test.ts",
+      "sha256": "75d36f1130a5e7e4ae53246e7eec091864aaa341637272cec8385fea4a43f730",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-storage-failure.test.ts",
+      "sha256": "3d188ed3d18367cf0b66a627072a96f2a482b50c6574fe1dfadbe53551180d2f",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-structured-output.test.ts",
+      "sha256": "aa6642b49c47014f0981dfb9009da13fa7b0276e08d0dca5f196534f510236e8",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-structured.test.ts",
+      "sha256": "d78b15b3eed7e975516f70bb0ff7a118587b127f14d346513edd2cfd4d138952",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-submission-prepare.test.ts",
+      "sha256": "4fa6a9c66b301f41d66be2070b1dbb1f8d5a37528803667b7b6bbaccf3e1bd6d",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-support.ts",
+      "sha256": "f9951297d5920e93aa38aca211537eb19c23a13a4fadf311e53afedb3b66bbc9",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/test/harness-tasks-recovery.test.ts",
-      "sha256": "72cdc4a9e144171b513e8c299f5c731602968f0d77637e772d4b1b4e8d08320a",
+      "sha256": "35fee4623d8000f65d9be65ad4f608f4604aa73e5bca798cb0861872576fc5c9",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/test/harness-tasks.test.ts",
-      "sha256": "ae5131b1b10fd135bcc26a14af980ef2b200d5d79b4934bcc710e97c6312a449",
+      "sha256": "87234b6f5932b827a380b64791c83118ef9b4eda9c3db6ff69e69832c388816b",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-tool-admission.test.ts",
+      "sha256": "1df66d48955ddebe64e401c428e3d7fc82740b8aa9c6d6ffc8182a932ad66fea",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-tool-binding.test.ts",
+      "sha256": "dacc118b2324415d697270d8f5080d5240040bea9f66a170450e14aa8b62aabf",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-tool-bindings.test.ts",
+      "sha256": "3bf3fd9f45d1028acaf0d8c4372143b9344110760a55890231da6892e6df657e",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-tool-failure.test.ts",
+      "sha256": "a2144bc16ee67d6318da2c38ece5ca99f02237258f61274ba41e1848fc9c17bf",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-tool-waves.test.ts",
+      "sha256": "dcee92cf656d4c174167521eae28ff79f53efcffaec78de0d6d87988dd1993cf",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-tools-recovery.test.ts",
+      "sha256": "9bb1d8354d6167c7d4fa535a97c493bded87c68cc2fb06a44b93289d1361e4e7",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/test/harness-tools.test.ts",
-      "sha256": "d1847fe4284446c5da261fec9630a93146d0bf4437690038d9f8f31f35cd3103",
+      "sha256": "2e475afaf79d049125b44e3bf8c688c3197bb411243a07abac3649f6603ab0c8",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/harness-wake-index.test.ts",
+      "sha256": "7e93711bd9e1f54d6a8493278b0c62c528dd20cf78178b4a4aec0f38730751dc",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/heap-retained.ts",
+      "sha256": "d545b3abb3c3bf6033df2f91a8bfd987635b596216723b0252925e1e0b355360",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/images-wasm-module.test.ts",
+      "sha256": "53cc856094ba97638f1af4c18c908481a76d517710080666840127443756cd72",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/nested-images-bench.ts",
+      "sha256": "438c7fccd9b052ab65bb8ccb2f75498e77c96f203cec0dabc9f0cc16a21c1cd5",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/nested-tools-bench.ts",
+      "sha256": "34e586071550ee1c90e110b93e0adabd01e1107da2483534f85845b742d5c1ed",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/persistent-storage-support.ts",
+      "sha256": "2d5abd571359f2f0e6ee5376708c01d792bb5c774b2b3974ac03f1a9b60b480c",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/scheduler-fanout-bench.ts",
+      "sha256": "8ac5993e126ffef3571d85f3e47c7186238f2087592d70e7c5d2d8220b580968",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/scheduler-memory-bench.ts",
+      "sha256": "973d12fc936737122b0922c95391b40520001a9ca998550fc02e2b30c7eb39fb",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/session-document-cache-bench.ts",
+      "sha256": "0ace49b9449f567da137d5ce4a02f37f6ea59d7fb4984add51dc2df0fb5586c9",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/session-document-retention.test.ts",
+      "sha256": "2483417511e7bab33323171c5fe81830b97e1b12113d91bcd8b837019acd3692",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/session-documents.test.ts",
+      "sha256": "cb4758726334f5807a443368f1a3c8d93aab07539ad2143b3352a711e208aff9",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/session-forks.test.ts",
+      "sha256": "5f8f9246dc4c0c5a724e65eedc3b195f51439f38715d900bfcfc4c5f8113e916",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/session-support.ts",
+      "sha256": "35a5920c04105268ce3e32dc98b0d08d5264a4af7414104b504fc88cc985c2d3",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/setup-document-retention.ts",
+      "sha256": "48936565bf35afc78025d1b3b60d95f85851f20d6003fbc4d54a72e4d411ac65",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/spec-usage.test.ts",
+      "sha256": "9c48cc632ebef7198dfd612d1e73ea461ed97a71fa0451cfce829369075f798b",
       "mode": "reviewed upstream library integration"
     },
     {
@@ -457,20 +848,52 @@
       "mode": "reviewed upstream library integration"
     },
     {
+      "path": "packages/durable/test/sqlite-facade.test.ts",
+      "sha256": "744c9def0fc98e836d02e3aef376a8607b329c93fbe1f2aab3e3bc69b9063c92",
+      "mode": "reviewed upstream library integration"
+    },
+    {
       "path": "packages/durable/test/system-order-cache-e2e.test.ts",
-      "sha256": "4a4f30dac08e9bcbce3ab36759df02ee8593760ca3197d63365f24ba707ece33",
+      "sha256": "066175530ea5009e46937731f3bca483184a50d41fe37748acdb492121e06289",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/tools-images.test.ts",
+      "sha256": "044d545e2e440b779983a2747c4994b8d4283660c18e54354a7e2dc8e133587b",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/tools-read-differential.test.ts",
+      "sha256": "a423c7452ce903bc0b93704d05eb9af4da2599be7008dd773c9df81671d8e777",
       "mode": "reviewed upstream library integration"
     },
     {
       "path": "packages/durable/test/tools.test.ts",
-      "sha256": "988a56c34187e23340a3a6c83456ab286ef391f6fab761a9c5e29604c22db898",
+      "sha256": "1b2bb2277f4465fac766cad7f33aa9fc74fa43f7d6328fb81f3b2d90e1816182",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/test/types.test.ts",
+      "sha256": "44b0a2be8faddab3b798a7255611503760a816b98828331a510b2c47ca76e19b",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/tsconfig.build.json",
+      "sha256": "e8519ca76ce93b398e249399e9393c4b114fe3c3ce4debc89f21b4a6d442eda1",
+      "mode": "reviewed upstream library integration"
+    },
+    {
+      "path": "packages/durable/vitest.config.ts",
+      "sha256": "41ca9ba8a11658625eb933709ad3f84c1973bf92bf6048d00ab8cd13cb438fd1",
       "mode": "reviewed upstream library integration"
     }
   ],
-  "retained": "Vibestudio workerd storage, dormant waits, execution pins, tool waves, provider transport changes, queue flush and prepared commit task inspection",
+  "retained": "Vibestudio workerd storage, dormant and retained cleanup waits, exact execution pins, direct/model/nested task provenance, external continuations, tool waves, provider transports, queue flush, prepared admissions, task inspection and acknowledged host schedule repair",
   "notAdopted": [
     "CLI/client/server/example changes outside the four distributed libraries, apart from necessary compile-time API migrations",
     "Released changelog history and workspace version-only changes",
-    "Removed source-only durable specification; README continues to link to upstream specification"
+    "Removed source-only durable specification; README continues to link to upstream specification",
+    "Legacy ToolTask v1 migration: self-contained pre-release state is reset rather than carrying a backward-compatibility task contract",
+    "Terminal orphaning of unavailable abort handlers: cleanup ownership remains retained and waiting callers receive the authoritative failure until the exact definition returns"
   ]
 }

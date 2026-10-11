@@ -19,16 +19,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { addTask, addTool } from "./harness-support.ts";
 import { ControlledStorage, context, flush } from "./session-support.ts";
-import {
-	aborted,
-	abortedWith,
-	completed,
-	countingReader,
-	deferred,
-	eventually,
-	openTasks,
-	settled,
-} from "./task-support.ts";
+import { aborted, abortedWith, completed, countingReader, deferred, eventually, openTasks } from "./task-support.ts";
 
 const directories = new Set<string>();
 
@@ -624,16 +615,16 @@ describe("blocked tasks", () => {
 			abortRequested: true,
 			state: { status: "pending" },
 		});
-		const idle = opened.harness.waitForIdle(context);
+		const idle = expect(opened.harness.waitForIdle(context)).rejects.toThrow("cleanup is unavailable: missing_task");
 		await opened.harness.runPass(context);
-		expect(await settled(idle)).toBe(false);
+		await idle;
 		expect(await opened.harness.getTask(id, context)).toMatchObject({
 			abortRequested: true,
 			state: { status: "waiting", mode: "abort", checkpoint: { phase: "run" }, condition: { kind: "registry" } },
 		});
 		addTask(opened.registry, versioned(1, "x"));
 		await opened.harness.runPass(context);
-		await idle;
+		await opened.harness.waitForIdle(context);
 		expect((await opened.harness.getTask(id, context))?.state).toEqual({
 			status: "terminal",
 			outcome: { status: "aborted", reason: "x" },

@@ -1,24 +1,24 @@
 import { copyJson, isJsonValue, type JsonRepresentation, type JsonValue } from "@earendil-works/chord";
 import type { Api, Message, Model } from "@earendil-works/pi-ai";
+import { errorMessage } from "../errors.ts";
 import type { TaskOutcomeError } from "../types.ts";
 
 /** Detach original error diagnostics for the canonical failure record and terminal outcome. */
 export function snapshotError(error: unknown, ancestors = new Set<Error>()): TaskOutcomeError {
-	const message = error instanceof Error ? error.message : String(error);
+	const message = errorMessage(error);
 	if (!(error instanceof Error)) return { message };
 	if (ancestors.has(error)) return { message, detail: { circularCause: true } };
 	ancestors.add(error);
 	try {
 		const detail: Record<string, JsonValue> = {};
-		if (error instanceof AggregateError)
-			detail.errors = error.errors.map((value: unknown) => (value instanceof Error ? value.message : String(value)));
+		if (error instanceof AggregateError) detail.errors = error.errors.map((value: unknown) => errorMessage(value));
 		if (error.cause !== undefined)
 			detail.cause =
 				error.cause instanceof Error
 					? snapshotError(error.cause, ancestors)
 					: isJsonValue(error.cause)
 						? copyJson(error.cause)
-						: String(error.cause);
+						: errorMessage(error.cause);
 		return { message, ...(Object.keys(detail).length === 0 ? {} : { detail }) };
 	} finally {
 		ancestors.delete(error);

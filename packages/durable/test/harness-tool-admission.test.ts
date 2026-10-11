@@ -10,24 +10,27 @@ import {
 	LiveDoc,
 	ReceiptDoc,
 	type Storage,
-	StorageRejected,
 	type ToolExecutionApi,
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { chatSetup, toolsNamed, waitFor } from "./chat-support.ts";
-import { ControlledStorage, context } from "./session-support.ts";
+import { createPersistentStorage, type PersistentControlledStorage } from "./persistent-storage-support.ts";
+import { context } from "./session-support.ts";
 
 const sessions: Harness[] = [];
 const directories: string[] = [];
+const persistent: Awaited<ReturnType<typeof createPersistentStorage>>[] = [];
 afterEach(async () => {
 	await Promise.all(sessions.splice(0).map((session) => session.close(context)));
+	await Promise.all(persistent.splice(0).map((fixture) => fixture.close()));
 	await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
-function scenario(storage?: ControlledStorage, loseHeap = false) {
+function scenario(storage?: Pick<PersistentControlledStorage, "failNextCommit">, loseHeap = false) {
 	const setup = chatSetup();
 	const original = new Error("original start acknowledgement lost");
 	const cleanup = new Error("original cancellation readback failed");
+	const admission = new Error("original continuation batch rejected");
 	const state = { dispatches: 0, cancellations: 0, preparations: 0, repaired: false };
 	const identities: unknown[] = [];
 	let captured: ToolExecutionApi | undefined;
@@ -43,7 +46,7 @@ function scenario(storage?: ControlledStorage, loseHeap = false) {
 		execute: async (args, api, ctx) => {
 			captured = api;
 			if (api.continuation === undefined) {
-				storage?.failNextCommit(new StorageRejected("original continuation batch rejected"));
+				storage?.failNextCommit(admission);
 				await api.retainContinuation(
 					{ operation: api.callId },
 					(tx) => bindReceipt(tx, api.callId, `binding:${args.value}`),
@@ -62,13 +65,13 @@ function scenario(storage?: ControlledStorage, loseHeap = false) {
 				throw original;
 			}
 			identities.push({ taskId: api.taskId, callId: api.callId, args, continuation: api.continuation });
-			return { content: [{ type: "text" as const, text: "actual domain result" }] };
+			return { output: [{ type: "text" as const, text: "actual domain result" }] };
 		},
 		cancel: async (args, api) => {
 			state.cancellations++;
 			identities.push({ taskId: api.taskId, callId: api.callId, args, continuation: api.continuation });
 			if (!state.repaired) throw cleanup;
-			return { content: [] };
+			return { output: [] };
 		},
 	});
 	setup.registry.install(defineExtension({ name: "external", tools: [tool] }));
@@ -89,7 +92,7 @@ function scenario(storage?: ControlledStorage, loseHeap = false) {
 		await root.configure({ tools: toolsNamed(setup, tool.name) }, context);
 		return { harness, root };
 	}
-	return { open, state, original, cleanup, identities, captured: () => captured };
+	return { open, state, original, cleanup, admission, identities, captured: () => captured };
 }
 describe("external tool initial admission", () => {
 	it("reattaches the committed original operation after losing the dispatching heap", async () => {
@@ -165,16 +168,25 @@ describe("external tool initial admission", () => {
 		expect(f.state).toMatchObject({ dispatches: 1, cancellations: 2, preparations: 1 });
 	});
 	it("rolls original identity and continuation back before dispatch, and refuses a settled capability", async () => {
-		const storage = new ControlledStorage();
-		const f = scenario(storage);
-		const opened = await f.open(storage);
+		const database = await createPersistentStorage();
+		persistent.push(database);
+		const f = scenario(database.storage);
+		let opened = await f.open(database.storage);
 		const submission = await opened.root.submit({ type: "input", content: "go" }, context);
-		await opened.harness.runPass(context);
-		expect(await submission.wait(context)).toMatchObject({ status: "done" });
+		await expect(opened.harness.runPass(context)).rejects.toMatchObject({ cause: f.admission });
+		expect(await opened.harness.closed).toEqual({ reason: "failed", error: f.admission });
 		expect(f.state.dispatches).toBe(0);
-		expect(await opened.harness.snapshot(ReceiptDoc, "run:one", context)).toBeUndefined();
 		await expect(f.captured()!.retainContinuation({ operation: "late" }, async () => {}, context)).rejects.toThrow(
 			"settled",
 		);
+		opened = await f.open(await database.reopen());
+		expect(await opened.harness.snapshot(ReceiptDoc, "run:one", context)).toBeUndefined();
+		expect(await (await opened.harness.submission(submission.id, context))!.status(context)).toMatchObject({
+			status: "placed",
+		});
+		expect(
+			(await opened.harness.inspect(context)).tasks.find((task) => task.record.kind === "pi.tool")!.record,
+		).toMatchObject({ state: { status: "pending", checkpoint: { phase: "execute" } } });
+		expect(f.state.dispatches).toBe(0);
 	});
 });

@@ -1,15 +1,9 @@
 import { fauxAssistantMessage, fauxToolCall, Type } from "@earendil-works/pi-ai";
-import {
-	defineExtension,
-	defineTool,
-	InboxDoc,
-	LiveDoc,
-	MemoryStorage,
-	StorageRejected,
-} from "@earendil-works/pi-durable";
+import { defineExtension, defineTool, Harness, InboxDoc, LiveDoc, MemoryStorage } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
 import { chatSetup, openChat, unanswered } from "./chat-support.ts";
-import { ControlledStorage, context } from "./session-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
+import { context } from "./session-support.ts";
 import { deferred, settled } from "./task-support.ts";
 
 describe("native queue flush", () => {
@@ -26,7 +20,7 @@ describe("native queue flush", () => {
 				ctx.abortSignal!.addEventListener("abort", () => cancelled.resolve(), { once: true });
 				entered.resolve();
 				await release.promise;
-				return { content: [] };
+				return { output: [] };
 			},
 		});
 		const extension = defineExtension({ name: "held", tools: [tool] });
@@ -57,24 +51,33 @@ describe("native queue flush", () => {
 		}
 	});
 
-	it("rolls back a rejected flush admission without withdrawing inputs or cancelling the request", async () => {
+	it("rolls back a rejected flush admission without withdrawing inputs and joins the failed request", async () => {
 		const setup = chatSetup(),
 			first = unanswered();
 		setup.faux.setResponses([first.step]);
-		const storage = new ControlledStorage();
-		const { harness, root } = await openChat(storage, setup);
+		const persisted = await createPersistentStorage();
+		const storage = persisted.storage;
+		let { harness, root } = await openChat(storage, setup);
 		try {
 			const original = await root.submit({ type: "input", content: "original" }, context);
 			await first.reached;
 			const follow = await root.submit({ type: "input", content: "later", whenBusy: "followUp" }, context);
-			const failure = new StorageRejected("Flush admission rejected");
+			const failure = new Error("Flush admission rejected");
 			storage.failNextCommit(failure);
 			await expect(root.flush(context)).rejects.toBe(failure);
-			expect(await original.status(context)).toMatchObject({ status: "placed" });
-			expect(await follow.status(context)).toMatchObject({ status: "queued" });
+			expect(await harness.closed).toEqual({ reason: "failed", error: failure });
+			harness = await Harness.open(await persisted.reopen(), setup, context);
+			root = (await harness.conversation(root.id, context))!;
+			expect(await (await harness.submission(original.id, context))!.status(context)).toMatchObject({
+				status: "placed",
+			});
+			expect(await (await harness.submission(follow.id, context))!.status(context)).toMatchObject({
+				status: "queued",
+			});
 			expect((await harness.snapshot(LiveDoc, root.id, context))?.run?.interruption).toBeUndefined();
 		} finally {
 			await harness.close(context);
+			await persisted.close();
 		}
 	});
 	it("joins the old request, advances exactly one follow-up, and retains later queued inputs", async () => {

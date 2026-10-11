@@ -1,7 +1,6 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Context } from "@earendil-works/chord";
 import { createModels, fauxAssistantMessage, fauxToolCall, Type } from "@earendil-works/pi-ai";
 import {
 	bindReceipt,
@@ -10,26 +9,27 @@ import {
 	defineTool,
 	type EntryId,
 	Harness,
-	type Id,
 	LiveDoc,
 	MemoryStorage,
 	type ModelRequestPort,
-	StorageRejected,
-	type StorageWrite,
 	type TaskId,
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { type ChatSetup, chatSetup, toolsNamed } from "./chat-support.ts";
-import { ControlledStorage, context } from "./session-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
+import { context } from "./session-support.ts";
 import { openTasks } from "./task-support.ts";
 
 const harnesses = new Set<Harness>();
 const directories = new Set<string>();
+const persistent = new Set<Awaited<ReturnType<typeof createPersistentStorage>>>();
 
 afterEach(async () => {
 	const closed = await Promise.allSettled([...harnesses].map((harness) => harness.close(context)));
 	harnesses.clear();
+	await Promise.all([...persistent].map((fixture) => fixture.close()));
+	persistent.clear();
 	for (const directory of directories) await rm(directory, { recursive: true, force: true });
 	directories.clear();
 	for (const result of closed) if (result.status === "rejected") throw result.reason;
@@ -89,7 +89,7 @@ describe("failed cleanup ownership", () => {
 			cancel: async (args, api) => {
 				cancellations.push(structuredClone({ args, continuation: api.continuation }));
 				if (!repaired) throw original;
-				return { content: [{ type: "text" as const, text: "cancelled operation" }] };
+				return { output: [{ type: "text" as const, text: "cancelled operation" }] };
 			},
 		});
 		setup.registry.install(defineExtension({ name: "cleanup-tool", tools: [tool] }));
@@ -151,23 +151,17 @@ describe("failed cleanup ownership", () => {
 			const original = new Error("resource cleanup failed");
 			const writeFailure =
 				stage === "commit"
-					? new StorageRejected("cleanup failure storage rejected")
+					? new Error("cleanup failure storage rejected")
 					: new Error("cleanup failure identity refused");
 			let attempts = 0;
-			const storage = new (class extends ControlledStorage {
-				override mintId<I extends Id<string>>(): Promise<I> {
-					if (stage === "entry" && attempts > 0) return Promise.reject(writeFailure);
-					return super.mintId<I>();
-				}
-				override async commit(writes: readonly StorageWrite[], ctx: Context) {
-					if (
-						stage === "commit" &&
-						writes.some((write) => write.type === "entry" && write.value.kind === "pi.failure")
-					)
-						throw writeFailure;
-					return super.commit(writes, ctx);
-				}
-			})();
+			const database = await createPersistentStorage();
+			persistent.add(database);
+			database.storage.rejectMint(() => (stage === "entry" && attempts > 0 ? writeFailure : undefined));
+			database.storage.rejectCommit((writes) =>
+				stage === "commit" && writes.some((write) => write.type === "entry" && write.value.kind === "pi.failure")
+					? writeFailure
+					: undefined,
+			);
 			const task = defineTask<null, { phase: "work" }, null>({
 				name: "test.cleanup-write-failure",
 				version: 1,
@@ -188,7 +182,7 @@ describe("failed cleanup ownership", () => {
 					throw original;
 				},
 			});
-			const { harness, reports } = await openTasks(storage, [task], { now: () => 1_000 });
+			const { harness, reports } = await openTasks(database.storage, [task], { now: () => 1_000 });
 			harnesses.add(harness);
 			const root = await harness.root(context);
 			const id = await root.commit(
@@ -197,14 +191,21 @@ describe("failed cleanup ownership", () => {
 			);
 			await harness.runPass(context);
 			const caller = root.abort(context);
-			await expect(caller).rejects.toMatchObject({ errors: [original, writeFailure] });
-			await expect(harness.runPass(context)).rejects.toMatchObject({ errors: [original, writeFailure] });
-			expect(await harness.getTask(id, context)).toMatchObject({
+			await expect(caller).rejects.toMatchObject({ cause: writeFailure });
+			expect(await harness.closed).toEqual({ reason: "failed", error: writeFailure });
+			await expect(harness.runPass(context)).rejects.toMatchObject({ cause: writeFailure });
+			const recovered = await openTasks(await database.reopen(), [task], { now: () => 1_000 });
+			harnesses.add(recovered.harness);
+			expect(await recovered.harness.getTask(id, context)).toMatchObject({
 				abortRequested: true,
-				state: { status: "running", checkpoint: { phase: "work" } },
+				state: { status: "pending", checkpoint: { phase: "work" } },
 			});
 			expect(attempts).toBe(1);
-			expect(reports).toContainEqual(expect.objectContaining({ errors: [original, writeFailure] }));
+			expect(reports).toContain(writeFailure);
+			expect(
+				(await (await recovered.harness.conversation(root.id, context))!.entries({}, 100, undefined, context))
+					.items,
+			).toEqual([]);
 		},
 	);
 

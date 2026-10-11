@@ -3,6 +3,7 @@ import { awaitWithContext, withAbortSignal, withoutAbortSignal } from "@earendil
 import type { Models } from "@earendil-works/pi-ai";
 import { defineEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
+import { SessionFailed } from "../errors.ts";
 import type { SessionImpl } from "../session/session.ts";
 import type { Transaction } from "../session/transaction.ts";
 import type {
@@ -47,6 +48,7 @@ import type {
 	TaskInspection,
 } from "./types.ts";
 import { closedError, scanAll, Waiters } from "./util.ts";
+import { WakeIndex } from "./wake-index.ts";
 
 type AnyTaskRecord = TaskRecord<JsonValue, JsonValue, JsonValue>;
 /** A record that can still run code: pending, running, or waiting. */
@@ -145,7 +147,25 @@ type Step =
 type Overlay = {
 	readonly tasks: ReadonlyMap<TaskId, AnyTaskRecord>;
 	readonly edges: ReadonlyMap<ConversationId, TaskId | null>;
+	/** Links to the staged tasks `#below` does not list, by parent node, for walks down; built at first use. */
+	links?: ReadonlyMap<Node, ReadonlySet<Node>>;
 };
+
+/** A node of the downward index: a task, or a conversation as `c<id>`. */
+type Node = TaskId | `c${number}`;
+
+function conversationNode(id: ConversationId): Node {
+	return `c${id}`;
+}
+
+function conversationOf(node: `c${number}`): ConversationId {
+	return Number(node.slice(1)) as ConversationId;
+}
+
+/** The node a task hangs from: its owner task, or its conversation. */
+function parentNode(node: TaskNode): Node {
+	return node.owner ?? conversationNode(node.conversationId);
+}
 
 /** Where ordinary ownership traversal starts: one conversation, or every ownerless conversation. */
 type Scope = { readonly conversation: ConversationId } | { readonly roots: true };
@@ -186,8 +206,14 @@ export type TaskSchedulerOptions = {
  * commit listener updates it on the Session line, so code running on the line reads exactly the committed state from it.
  *
  * Tasks and conversations form one ownership tree (spec §5.5): a task's parent is its owner task, or its conversation;
- * a conversation's parent is its owner task, if any. Walks up that tree decide cascades, idle scopes, and whether a
- * task's ordinary owned work is live, which holds its outcome as `completing` and delays its abort handler.
+ * a conversation's parent is its owner task, if any. Walks up that tree decide what reaches one task: a cancelling
+ * owner, a scope. `#below` lists the tree downward around live work, so what lies below one node is a walk down from
+ * it: a task's live ordinary owned work, which holds its outcome as `completing` and delays its abort handler, a
+ * scope's tasks, a cascade's reach. No pass visits every live task; the sets below hold each pass's candidates.
+ *
+ * The ownership indexes are bounded by live work: an owner edge and an ended task's ownership fields are kept only while
+ * something is listed below them in `#below`, so only the chains above live tasks are known, whole. Work that appears
+ * later below a dropped node finds it unknown and loads its chain from storage again.
  *
  * Invariant: every task transition is decided and written by one callback serialized on the Session line. That covers
  * reservation, marks, runtime commits, finalization, and the synchronous step before each phase, which applies the
@@ -210,6 +236,14 @@ export class TaskScheduler {
 	readonly #conversation: TaskSchedulerOptions["conversation"];
 	readonly #context: Context;
 	readonly #live = new Map<TaskId, AnyTaskRecord>();
+	readonly #wakeIndex = new WakeIndex();
+	readonly #wakeDirty = new Set<TaskId>();
+	readonly #receiptWaiters = new Map<string, Set<TaskId>>();
+	readonly #inputWaiters = new Map<ConversationId, Set<TaskId>>();
+	readonly #registryWaiters = new Set<TaskId>();
+	readonly #abortWake = new Set<TaskId>();
+	#preparedWake: { revision: RegistrySnapshot["revision"]; values: Map<TaskId, number | null> } | undefined;
+	readonly #incidents = new Set<TaskId>();
 	/**
 	 * Context range last read through a task runtime, per conversation: a later read, by any of its tasks, scans only
 	 * newer entries. `idleSince` is the Harness time it was first seen idle. Derived and never persisted; dropped at the
@@ -227,23 +261,48 @@ export class TaskScheduler {
 	/** Definition whose migration failed per task; retried only once the registry resolves another definition. */
 	readonly #blocked = new Set<TaskId>();
 	readonly #failedMigrations = new Map<TaskId, { readonly task: AnyTask; readonly error: unknown }>();
-	/** Owner task of each loaded conversation, `null` when ownerless. */
+	/** Owner task of each known conversation, `null` when ownerless. */
 	readonly #edges = new Map<ConversationId, TaskId | null>();
-	/** Tasks that own a loaded conversation; their nodes stay in `#settled` once terminal. */
-	readonly #conversationOwners = new Set<TaskId>();
-	/** Ownership fields of terminal tasks that walks pass through. */
+	/** Ownership fields of the known terminal tasks, which walks pass through. */
 	readonly #settled = new Map<TaskId, TaskNode>();
+	/**
+	 * Ended tasks and conversations found unneeded, dropped by `#sweep()` at the end of the commit's publication unless
+	 * needed again by then: a chain load installs nodes before the work below them is listed.
+	 */
+	readonly #dropQueue = new Set<Node>();
+	/**
+	 * The tree downward around live work: each node's child nodes that are live tasks or have nodes listed below them.
+	 * A conversation's parent is its owner task; ownerless ones with work are in `#roots`.
+	 */
+	readonly #below = new Map<Node, Set<Node>>();
+	readonly #roots = new Set<ConversationId>();
+	/** Known tasks whose chain may not be loaded; every other known task's chain is, and stays, loaded. */
+	readonly #unloaded = new Set<TaskId>();
+	/** Live tasks with cancellation intent, the sources of abort cascades (spec §5.4). */
+	readonly #intent = new Set<TaskId>();
+	/** Live tasks that are not `completing`, the candidates of a reservation pass; ones found waiting leave it. */
+	readonly #runnable = new Set<TaskId>();
+	/** `completing` tasks the next finalize pass checks: those that started holding, and holders of ended work. */
+	readonly #finalizeChecks = new Set<TaskId>();
+	/** Live waiting tasks by each task in their `on`. */
+	readonly #waiters = new Map<TaskId, Set<TaskId>>();
 	/**
 	 * `failFast` waiters the next reconcile checks for a failed task in `on`: at open, when they start waiting, and when
 	 * one of their tasks fails.
 	 */
 	readonly #failFastChecks = new Set<TaskId>();
+	/**
+	 * Live tasks with `abandonOnRestart` found at open, from an earlier Harness. The first reservation pass abort-marks
+	 * them with reason `restart`, so nothing of them or below them runs a phase again.
+	 */
+	readonly #abandoned = new Set<TaskId>();
 	#reconcileScheduled = false;
+	#sweepScheduled = false;
 	#cascadePending = false;
 	#unsubscribeRegistry: () => void = () => {};
 	#enabled = false;
 	#closing = false;
-	#closeReason: unknown = closedError();
+	#closeReason: unknown = new Error("Harness is closed");
 	#dirty = false;
 	#draining = false;
 	#remainingStarts = 0;
@@ -262,7 +321,15 @@ export class TaskScheduler {
 		this.#settings = options.settings;
 		this.#env = options.env;
 		this.#now = options.now;
-		this.#report = options.report;
+		this.#report = (error) => {
+			const failure = this.#session.failure;
+			if (
+				failure !== undefined &&
+				(error === failure.error || (error instanceof SessionFailed && error.cause === failure.error))
+			)
+				return;
+			options.report(error);
+		};
 		this.#publishWake = options.publishWake;
 		this.#settleOutcome = options.settleOutcome;
 		this.#withdrawInputs = options.withdrawInputs;
@@ -272,10 +339,19 @@ export class TaskScheduler {
 
 	/** Load live tasks and change surviving `running` tasks back to `pending`. Dispatches nothing. */
 	async open(context: Context): Promise<void> {
-		this.#session.subscribeCommits((publication) => this.#observe(publication));
+		this.#session.observeCommits((publication) => this.#observe(publication));
 		this.#session.subscribeClose(() => this.#seal());
 		this.#unsubscribeRegistry = this.#registry.subscribe(() => {
+			for (const id of this.#registryWaiters) {
+				this.#wakeDirty.add(id);
+				this.#runnable.add(id);
+			}
+			const blocked = [...this.#blocked];
 			this.#blocked.clear();
+			for (const id of blocked) {
+				const record = this.#live.get(id);
+				if (record !== undefined) this.#indexWake(record);
+			}
 			this.#kick();
 		});
 		await this.#session.commitWith(async (tx) => {
@@ -286,7 +362,8 @@ export class TaskScheduler {
 			}
 			for (const records of scans) {
 				for (const record of records) {
-					this.#live.set(record.id, record);
+					this.#track(undefined, record);
+					if (record.abandonOnRestart === true) this.#abandoned.add(record.id);
 					if (record.state.status === "running") {
 						tx.setTask(withState(record, { status: "pending", checkpoint: record.state.checkpoint }));
 					}
@@ -309,26 +386,42 @@ export class TaskScheduler {
 	resume(): void {
 		this.#enabled = true;
 		this.#remainingStarts = SCAN_PAGE_SIZE;
+		for (const id of this.#wakeIndex.ready(this.#now())) this.#runnable.add(id);
 		this.#kick();
 	}
 
 	/** Derive the schedule from the final task/input/receipt candidates on the Session line. */
 	async prepare(tx: Transaction): Promise<void> {
-		const live = new Map(this.#live);
-		for (const record of tx.stagedTasks()) {
-			if (record.state.status === "terminal") live.delete(record.id);
-			else live.set(record.id, record);
-		}
+		this.#preparedWake = undefined;
 		const overlay = overlayOf(tx);
-		await this.#loadScopes(false);
-		for (const record of tx.stagedTasks()) await this.#loadChain(parentOf(record), overlay);
-		const owned = this.#ownedLive(overlay);
-		let wakeAt: number | null = null;
-		for (const record of live.values()) {
+		// Terminal publications release owners through their known chains. New runnable work need not load them here:
+		// reservation/reconciliation loads them before deciding ownership, without blocking its initial commit.
+		if ([...overlay.tasks.values()].some((record) => record.state.status === "terminal"))
+			await this.#loadScopes(false);
+		const candidates = new Set([...overlay.tasks.keys(), ...this.#wakeDirty, ...this.#abortWake]);
+		for (const record of overlay.tasks.values()) {
+			if (record.state.status !== "terminal") continue;
+			for (const id of this.#waiters.get(record.id) ?? []) candidates.add(id);
+		}
+		for (const entry of tx.stagedEntries())
+			for (const id of this.#inputWaiters.get(entry.conversationId) ?? []) candidates.add(id);
+		for (const address of tx.stagedDocumentAddresses()) {
+			if (address.kind !== ReceiptDoc.definition.kind || address.key === undefined) continue;
+			for (const id of this.#receiptWaiters.get(address.key) ?? []) candidates.add(id);
+		}
+		const prepared = { revision: this.#registry.snapshot().revision, values: new Map<TaskId, number | null>() };
+		let wakeAt = this.#wakeIndex.minimumWithout(candidates);
+		for (const id of candidates) {
+			prepared.values.set(id, null);
+			const record = overlay.tasks.get(id) ?? this.#live.get(id);
+			if (record === undefined) continue;
 			const state = record.state;
-			if (state.status === "completing") continue;
-			if (record.abortRequested && owned.has(record.id)) continue;
-			if (!record.abortRequested && this.#blocked.has(record.id)) continue;
+			if (state.status === "terminal" || state.status === "completing") continue;
+			if (record.abortRequested) {
+				await this.#loadScopes(false);
+				await this.#loadChain(parentOf(record), overlay);
+				if (this.#hasOwnedLive(record.id, overlay)) continue;
+			} else if (this.#blocked.has(record.id)) continue;
 			let at: number | null = null;
 			if (record.abortRequested && !(state.status === "waiting" && state.mode === "abort")) at = 0;
 			else if (state.status !== "waiting") at = 0;
@@ -343,7 +436,13 @@ export class TaskScheduler {
 						at = state.condition.until;
 						break;
 					case "tasks":
-						if (state.condition.on.every((id) => !live.has(id))) at = 0;
+						if (
+							state.condition.on.every((on) => {
+								const candidate = overlay.tasks.get(on);
+								return candidate === undefined ? !this.#live.has(on) : candidate.state.status === "terminal";
+							})
+						)
+							at = 0;
 						break;
 					case "receipt": {
 						const receipt = await tx.doc(ReceiptDoc, state.condition.key, null);
@@ -369,7 +468,9 @@ export class TaskScheduler {
 					}
 				}
 			if (at !== null && (wakeAt === null || at < wakeAt)) wakeAt = at;
+			prepared.values.set(id, at);
 		}
+		this.#preparedWake = prepared;
 		const existing = await tx.docIfPresent(WakeDoc);
 		if (existing === undefined && wakeAt === null) return;
 		const schedule = existing ?? (await tx.doc(WakeDoc));
@@ -438,6 +539,7 @@ export class TaskScheduler {
 
 	/** Wait for every invocation signalled by `#seal()`. Writes nothing. */
 	async join(): Promise<void> {
+		for (const invocation of this.#invocations.values()) invocation.controller.abort();
 		await Promise.allSettled([...this.#invocations.values()].map((invocation) => invocation.done));
 	}
 
@@ -445,17 +547,21 @@ export class TaskScheduler {
 	 * Commit the abort mark and join the active run. Missing cleanup code and failed cleanup remain owned; a repeat
 	 * cancellation is not permission to retry a failed attempt. Cleanup starts after ordinary owned work drains.
 	 */
-	async abort(id: TaskId, context: Context): Promise<"marked" | "terminal"> {
+	async abort(id: TaskId, context: Context, keepRestart = false): Promise<"marked" | "terminal"> {
 		const marked = await this.#session.commitWith(async (tx) => {
 			const current = await tx.task(id);
 			if (current === undefined) throw new Error(`Task ${id} does not exist`);
 			if (current.state.status === "terminal") return { result: "terminal" as const };
 			const invocation = this.#invocations.get(id);
-			if (!current.abortRequested) tx.setTask({ ...current, abortRequested: true });
+			if (keepRestart && current.abortReason === "restart") return { result: "marked" as const };
+			if (!current.abortRequested || current.abortReason !== undefined) tx.setTask(withAbortMark(current));
 			return { result: "marked" as const, run: invocation?.mode === "run" ? invocation : undefined };
 		}, context);
-		// The commit listener signalled the run; join it.
-		if (marked.run !== undefined) await awaitWithContext(marked.run.done, context);
+		// The commit listener signalled the run; join it. A run that ignores its signal can outlive a failed Session,
+		// which ends the wait instead.
+		if (marked.run !== undefined) {
+			await awaitWithContext(Promise.race([marked.run.done, this.#session.failed]), context);
+		}
 		return marked.result;
 	}
 
@@ -525,11 +631,11 @@ export class TaskScheduler {
 			const queued = await this.#loadScopes(true);
 			const scope = { conversation: conversationId };
 			const reached: TaskId[] = [];
-			for (const record of this.#live.values()) {
-				if (record.background && !background) continue;
-				if (this.#inScope(parentOf(record), scope, background) !== true) continue;
-				reached.push(record.id);
-				if (!record.abortRequested) tx.setTask({ ...record, abortRequested: true });
+			const walk = this.#walkDown(conversationNode(conversationId), { crossBackground: background });
+			for (const { node, live } of walk) {
+				if (live === undefined || (node.background && !background)) continue;
+				reached.push(live.id);
+				if (!live.abortRequested || live.abortReason !== undefined) tx.setTask(withAbortMark(live));
 			}
 			for (const id of queued) {
 				if (this.#inScope({ conversation: id }, scope, background) === true) await this.#withdrawInputs(tx, id);
@@ -561,11 +667,19 @@ export class TaskScheduler {
 			publication.changes.every(
 				(change) => change.type === "document" && change.record.kind === WakeDoc.definition.kind,
 			)
-		)
+		) {
+			this.#adoptWake();
 			return;
+		}
 		const updated: AnyTaskRecord[] = [];
 		const failed: TaskId[] = [];
 		let changed = false;
+		// Edges first, so the tasks a commit creates in a new conversation hang from it.
+		for (const change of publication.changes) {
+			if (change.type === "conversation" && !this.#edges.has(change.value.id)) {
+				this.#setEdge(change.value.id, change.value.owner?.taskId ?? null);
+			}
+		}
 		for (const change of publication.changes) {
 			if (change.type !== "task") {
 				if (
@@ -587,11 +701,10 @@ export class TaskScheduler {
 			)
 				this.#failureErrors.delete(previous.state.condition.incident);
 			if (failedOutcome(record) && (previous === undefined || !failedOutcome(previous))) failed.push(record.id);
+			this.#track(previous, record);
 			if (record.state.status === "terminal") {
-				this.#live.delete(record.id);
 				this.#failedMigrations.delete(record.id);
 				this.#failFastChecks.delete(record.id);
-				if (this.#conversationOwners.has(record.id)) this.#settled.set(record.id, nodeOf(record));
 				this.#taskWaiters.resolve(record.id, record as SettledTask<JsonValue>);
 				// Its owner may finalize now.
 				this.#scheduleReconcile();
@@ -603,6 +716,8 @@ export class TaskScheduler {
 				const invocation = this.#invocations.get(record.id);
 				if (invocation?.mode === "run") invocation.controller.abort();
 			}
+			// A request replacing a `restart` mark upgrades the marks of the work below.
+			if (previous?.abortReason !== undefined && record.abortReason === undefined) this.#cascadePending = true;
 			const status = record.state.status;
 			if (status === "completing" && previous?.state.status !== "completing") {
 				if (cancellationIntent(record)) this.#cascadePending = true;
@@ -617,48 +732,62 @@ export class TaskScheduler {
 				this.#failFastChecks.add(record.id);
 				this.#scheduleReconcile();
 			}
-			if (record.state.status === "running") this.#live.delete(record.id);
-			this.#live.set(record.id, record);
-			updated.push(record);
+			// Its owners and place never change: what is above it is checked once, when it becomes live.
+			if (previous === undefined) updated.push(record);
 		}
+		// Prepared candidates describe this exact committed overlay. A rejected transaction never reaches publication;
+		// its candidates are discarded at the next prepare. Registry updates during admission remain dirty.
+		this.#adoptWake();
 		for (const id of failed) {
-			for (const record of this.#live.values()) {
-				const state = record.state;
+			for (const waiter of this.#waiters.get(id) ?? []) {
+				const state = this.#live.get(waiter)?.state;
 				if (
-					state.status === "waiting" &&
+					state?.status === "waiting" &&
 					state.condition.kind === "tasks" &&
-					state.condition.policy === "failFast" &&
-					state.condition.on.includes(id)
+					state.condition.policy === "failFast"
 				) {
-					this.#failFastChecks.add(record.id);
+					this.#failFastChecks.add(waiter);
 					this.#scheduleReconcile();
 				}
-			}
-		}
-		for (const change of publication.changes) {
-			if (change.type === "conversation" && !this.#edges.has(change.value.id)) {
-				this.#setEdge(change.value.id, change.value.owner?.taskId ?? null);
 			}
 		}
 		for (const change of publication.changes) {
 			// A queued input below a cancelled owner is withdrawn, even after its cascade.
 			if (change.type !== "submission" || change.value.status !== "queued" || change.value.type !== "input")
 				continue;
-			const up = { conversation: change.value.conversationId };
-			if (!this.#chainKnown(up) || this.#belowCancelled(up)) this.#cascadePending = true;
+			// Only an owner with cancellation intent withdraws it; a later intent's mark runs the cascade then.
+			if (this.#intent.size === 0) continue;
+			const conversation = change.value.conversationId;
+			if (!this.#known(conversationNode(conversation)) || this.#belowCancelled({ conversation })) {
+				this.#cascadePending = true;
+			}
 		}
 		for (const record of updated) {
 			// Work created below a cancelled owner, even after its cascade, is aborted too.
-			if (!this.#chainKnown(parentOf(record))) this.#scheduleReconcile();
+			if (this.#unloaded.has(record.id)) this.#scheduleReconcile();
 			else if (!record.background && !record.abortRequested && this.#belowCancelled(parentOf(record))) {
 				this.#cascadePending = true;
 			}
 		}
-		// Also retries, with the next commit of any kind, a cascade whose commit failed.
+		// A cascade that a reservation or step found pending runs with the next commit of any kind.
 		if (this.#cascadePending) this.#scheduleReconcile();
+		this.#sweep();
 		if (!changed) return;
 		this.#settleIdle();
 		this.#kick();
+	}
+
+	#adoptWake(): void {
+		const prepared = this.#preparedWake;
+		this.#preparedWake = undefined;
+		if (prepared === undefined) return;
+		for (const [id, at] of prepared.values) {
+			if (!this.#live.has(id)) continue;
+			this.#wakeIndex.set(id, at);
+			if (at !== null && at <= this.#now()) this.#runnable.add(id);
+			if (!this.#registryWaiters.has(id) || prepared.revision === this.#registry.snapshot().revision)
+				this.#wakeDirty.delete(id);
+		}
 	}
 
 	/**
@@ -737,6 +866,20 @@ export class TaskScheduler {
 	#invocationFailure(record: AnyTaskRecord): { error: unknown } | undefined {
 		// Cancellation supersedes the run incident, not a subsequent failure of cleanup.
 		if (record.abortRequested && record.state.status === "waiting" && record.state.mode === "run") return undefined;
+		if (
+			record.state.status === "waiting" &&
+			record.state.mode === "abort" &&
+			record.state.condition.kind === "registry" &&
+			record.state.condition.after === this.#registry.snapshot().revision
+		) {
+			const reason = record.state.condition.reason;
+			return {
+				error: new Error(
+					`Task ${record.id} cleanup is unavailable: ${String(reason.code)} (${String(reason.name ?? reason.task ?? record.kind)})`,
+					{ cause: reason },
+				),
+			};
+		}
 		if (record.state.status !== "waiting" || record.state.condition.kind !== "failure") return undefined;
 		const { incident, error } = record.state.condition;
 		return {
@@ -747,7 +890,8 @@ export class TaskScheduler {
 	}
 
 	#taskFailure(id: TaskId): { error: unknown } | undefined {
-		for (const record of this.#live.values()) {
+		for (const incidentId of this.#incidents) {
+			const record = this.#live.get(incidentId)!;
 			const failure = this.#invocationFailure(record);
 			if (failure === undefined) continue;
 			if (record.id === id) return failure;
@@ -763,10 +907,12 @@ export class TaskScheduler {
 
 	#scopeFailure(conversationId: ConversationId | undefined): { error: unknown } | undefined {
 		const scope: Scope = conversationId === undefined ? { roots: true } : { conversation: conversationId };
-		for (const record of this.#live.values()) {
-			if (record.background || this.#inScope(parentOf(record), scope) === false) continue;
+		for (const id of this.#incidents) {
+			const record = this.#live.get(id)!;
+			if (record.background) continue;
 			const failure = this.#invocationFailure(record);
-			if (failure !== undefined) return failure;
+			if (failure === undefined || this.#inScope(parentOf(record), scope) === false) continue;
+			return failure;
 		}
 		return undefined;
 	}
@@ -795,15 +941,25 @@ export class TaskScheduler {
 			await this.#session.commitWith(async (tx) => {
 				if (this.#closing) return;
 				const queued = await this.#loadScopes(cascade);
-				const marked = new Set<TaskId>();
-				const mark = (record: AnyTaskRecord): void => {
-					if (record.abortRequested || marked.has(record.id)) return;
-					marked.add(record.id);
-					tx.setTask({ ...record, abortRequested: true });
+				// A cascade from an abandoned owner passes its `restart` reason on; any other intent marks, or upgrades a
+				// `restart` mark, as a request. Collected first, so a request wins over a `restart` mark of the same pass.
+				const marks = new Map<TaskId, { readonly record: AnyTaskRecord; readonly reason: "restart" | undefined }>();
+				const mark = (record: AnyTaskRecord, reason: "restart" | undefined): void => {
+					const staged = marks.get(record.id);
+					if (staged !== undefined && staged.reason === undefined) return;
+					if (record.abortRequested && (record.abortReason === undefined || reason !== undefined)) return;
+					marks.set(record.id, { record, reason });
 				};
-				// Loading edges can reveal a cancelled owner, so marks are derived on every pass.
-				for (const record of this.#live.values()) {
-					if (!record.background && this.#belowCancelled(parentOf(record))) mark(record);
+				// Every live foreground task below a live owner with cancellation intent, which is its nearest one: a walk down
+				// from each owner with intent does not enter another, whose own walk covers what is below it. Derived again on
+				// every pass, as loading edges can reveal a cancelled owner.
+				for (const id of this.#intent) {
+					const owner = this.#live.get(id)!;
+					// Only an owner abandoned after a restart, and nothing else, passes its reason on.
+					const restart = owner.abortReason === "restart" && !failedOutcome(owner);
+					for (const { node, live } of this.#walkDown(id, { enter: (below) => !this.#intent.has(below) })) {
+						if (live !== undefined && !node.background) mark(live, restart ? "restart" : undefined);
+					}
 				}
 				for (const id of checks) {
 					const waiter = this.#live.get(id);
@@ -816,17 +972,17 @@ export class TaskScheduler {
 					// Every other live task: the failed one keeps its own outcome.
 					for (const member of waiter.state.condition.on) {
 						const record = this.#live.get(member);
-						if (record !== undefined && !failedOutcome(record)) mark(record);
+						if (record !== undefined && !failedOutcome(record)) mark(record, undefined);
 					}
 				}
+				for (const { record, reason } of marks.values()) tx.setTask(withAbortMark(record, reason));
 				for (const id of queued) if (this.#belowCancelled({ conversation: id })) await this.#withdrawInputs(tx, id);
 				await this.#finalize(tx);
 			}, this.#context);
 		} catch (error) {
-			// Any pass may have staged marks, so a failed one is retried with the next commit.
-			this.#cascadePending = true;
-			for (const id of checks) this.#failFastChecks.add(id);
-			if (!this.#closing) this.#report(error);
+			// No extension code runs in this commit: a throw is a storage failure, a host callback, or a bug. None is fixed by
+			// running the pass again, so it fails the Session, which reports it.
+			this.#failSession(error);
 		}
 		this.#settleIdle();
 	}
@@ -846,53 +1002,80 @@ export class TaskScheduler {
 	 * Harness cleanup here.
 	 */
 	async #finalize(tx: Transaction): Promise<void> {
-		for (;;) {
-			const overlay = overlayOf(tx);
-			const owned = this.#ownedLive(overlay);
-			const done = [...this.#liveRecords(overlay)].filter(
-				(record) => record.state.status === "completing" && !owned.has(record.id),
-			);
-			if (done.length === 0) return;
-			for (const record of done) {
-				const outcome = (record.state as { readonly outcome: TaskOutcome<JsonValue> }).outcome;
-				tx.setTask(withState(record, { status: "terminal", outcome }));
+		// A worklist: the tasks that started holding, and the holders of work that ended. Finalizing one can free the
+		// nearest live task above it, which goes on the list. Tasks finalized here have no live work below them, so walks
+		// down skip them.
+		// In rounds: the holders the tasks of one round free are checked once, in the next, so a holder of many tasks that
+		// end together is walked once, not once per task.
+		let round = [...this.#finalizeChecks];
+		this.#finalizeChecks.clear();
+		const done = new Set<TaskId>();
+		const overlay = overlayOf(tx);
+		while (round.length > 0) {
+			const next = new Set<TaskId>();
+			for (const id of round) {
+				const record = overlay.tasks.get(id) ?? this.#live.get(id);
+				if (record?.state.status !== "completing" || done.has(id)) continue;
+				if (this.#hasOwnedLive(id, overlay, done)) continue;
+				const outcome = record.state.outcome;
+				const terminal = withState(record, { status: "terminal", outcome });
+				tx.setTask(terminal);
+				(overlay.tasks as Map<TaskId, AnyTaskRecord>).set(id, terminal);
+				done.add(id);
 				// REMINDER: only the scheduler writes `faulted` and `orphaned` (spec §5.4); their cleanup waits for this commit.
 				if (outcome.status === "faulted" || outcome.status === "orphaned") {
 					await this.#settleOutcome(tx, record, outcome);
 				}
+				const above = this.#nearestLiveAbove(record, overlay);
+				if (above?.state.status === "completing") next.add(above.id);
 			}
+			round = [...next];
 		}
 	}
 
 	/**
-	 * Load the owner chains of every live task and, with `queued`, of every conversation with queued submissions, on the
-	 * Session line; returns the latter. Reads committed Storage directly, so it may run inside a commit callback.
+	 * Load the owner chains of the tasks in `#unloaded` and, with `queued`, of every conversation with queued inputs,
+	 * on the Session line; returns the latter. Reads committed Storage directly, so it may run inside a commit callback.
 	 */
 	async #loadScopes(queued: boolean): Promise<ConversationId[]> {
-		for (const record of [...this.#live.values()]) {
-			if (!this.#chainKnown(parentOf(record))) await this.#loadChain(parentOf(record));
+		for (const id of [...this.#unloaded]) {
+			// An earlier load in this loop may have passed it.
+			if (this.#unloaded.has(id)) await this.#loadChain({ task: id });
 		}
 		if (!queued) return [];
 		const submissions = await scanAll((cursor) =>
 			this.#storage.scanSubmissions({ status: "queued" }, SCAN_PAGE_SIZE, cursor, this.#context),
 		);
-		const conversations = [...new Set(submissions.map((submission) => submission.conversationId))];
+		const inputs = submissions.filter((submission) => submission.type === "input");
+		const conversations = [...new Set(inputs.map((submission) => submission.conversationId))];
 		for (const id of conversations) await this.#loadChain({ conversation: id });
 		return conversations;
 	}
 
-	/** Load the owner edges and task nodes from `start` up to its ownerless root. */
+	/**
+	 * Load the owner edges and task nodes from `start` up to its ownerless root. A known task outside `#unloaded` ends the
+	 * walk, as its chain is loaded; the `#unloaded` tasks passed have a loaded chain afterwards. Loading a node can reveal
+	 * a cancelled owner, so it makes the next reconcile derive cascade marks.
+	 */
 	async #loadChain(start: Up, overlay?: Overlay): Promise<void> {
+		const passed: TaskId[] = [];
 		let at: Up | undefined = start;
 		while (at !== undefined) {
 			if ("task" in at) {
-				let node = this.#node(at.task, overlay);
+				const id: TaskId = at.task;
+				let node: TaskNode | undefined = this.#live.get(id) ?? this.#settled.get(id);
+				// Created in this commit: the load from its own record covers what is above it.
+				if (node === undefined && overlay?.tasks.has(id) === true) break;
+				if (node !== undefined && !this.#unloaded.has(id)) break;
 				if (node === undefined) {
-					const record = await this.#storage.task(at.task, this.#context);
+					const record = await this.#storage.task(id, this.#context);
 					if (record === undefined) return;
 					node = nodeOf(record);
-					if (record.state.status === "terminal") this.#settled.set(record.id, node);
+					if (record.state.status === "terminal") this.#settle(id, node);
+					// A loaded node can reveal a cancelling owner: the next reconcile derives marks again.
+					this.#scheduleReconcile();
 				}
+				passed.push(id);
 				at = parentOf(node);
 			} else {
 				let edge = this.#edge(at.conversation, overlay);
@@ -900,15 +1083,226 @@ export class TaskScheduler {
 					const record = await this.#storage.conversation(at.conversation, this.#context);
 					edge = record?.owner?.taskId ?? null;
 					this.#setEdge(at.conversation, edge);
+					// A loaded node can reveal a cancelling owner: the next reconcile derives marks again.
+					this.#scheduleReconcile();
 				}
 				at = edge === null ? undefined : { task: edge };
 			}
 		}
+		for (const id of passed) this.#unloaded.delete(id);
 	}
 
 	#setEdge(conversationId: ConversationId, owner: TaskId | null): void {
 		this.#edges.set(conversationId, owner);
-		if (owner !== null) this.#conversationOwners.add(owner);
+		// The conversation now hangs from its owner, or is a root; with nothing below it, it waits for the sweep.
+		this.#relist(conversationNode(conversationId));
+		this.#dropIfUnneeded(conversationNode(conversationId));
+	}
+
+	/** Know a terminal task a chain load read, so walks pass through it; its own chain is not loaded yet. */
+	#settle(id: TaskId, node: TaskNode): void {
+		this.#settled.set(id, node);
+		this.#unloaded.add(id);
+		this.#relist(id);
+		this.#dropIfUnneeded(id);
+	}
+
+	/** Queue an ended task or a conversation for the sweep when nothing is listed below it. */
+	#dropIfUnneeded(node: Node): void {
+		if (typeof node !== "string" && this.#live.has(node)) return;
+		if (this.#below.has(node)) return;
+		this.#dropQueue.add(node);
+		this.#scheduleSweep();
+	}
+
+	/**
+	 * Sweep in a job of its own on the Session line, after the operation underway: a rejected commit, one with nothing to
+	 * write, and a read publish nothing, so the sweep at the end of `#observe` would not run for what they loaded.
+	 */
+	#scheduleSweep(): void {
+		if (this.#sweepScheduled || this.#closing) return;
+		this.#sweepScheduled = true;
+		this.#session
+			.readOnLine(async () => {
+				this.#sweepScheduled = false;
+				this.#sweep();
+			})
+			// Rejected only once the Session is closing or failed, when nothing is kept anyway.
+			.catch(() => {});
+	}
+
+	/**
+	 * Drop the queued nodes that are still unneeded: not live, nothing listed below. Runs once a publication is fully
+	 * tracked, and as a job of its own on the line, never inside an operation: work a commit creates below a chain its
+	 * own callback loaded keeps that chain. A flat loop: unlisting already queued every node on the way up that lost its
+	 * last listed node.
+	 */
+	#sweep(): void {
+		for (const node of this.#dropQueue) {
+			if (this.#below.has(node)) continue;
+			if (typeof node === "string") {
+				this.#edges.delete(conversationOf(node));
+				this.#roots.delete(conversationOf(node));
+			} else if (!this.#live.has(node)) {
+				this.#settled.delete(node);
+				this.#unloaded.delete(node);
+			}
+		}
+		this.#dropQueue.clear();
+	}
+
+	/**
+	 * Bring the scheduler's sets in line with a task's committed record. A task that ended may free the nearest live task
+	 * above it: one holding its outcome finalizes, an abort-marked one runs its abort handler; its waiters may run.
+	 */
+	#indexWake(record: AnyTaskRecord): void {
+		const previous = this.#live.get(record.id);
+		if (previous?.state.status === "waiting") {
+			const condition = previous.state.condition;
+			if (condition.kind === "receipt") deleteFrom(this.#receiptWaiters, condition.key, record.id);
+			else if (condition.kind === "input") deleteFrom(this.#inputWaiters, condition.conversationId, record.id);
+		}
+		this.#registryWaiters.delete(record.id);
+		this.#abortWake.delete(record.id);
+		this.#wakeDirty.delete(record.id);
+		const state = record.state;
+		let at: number | null = null;
+		if (state.status !== "terminal" && state.status !== "completing") {
+			if (record.abortRequested && !(state.status === "waiting" && state.mode === "abort"))
+				this.#abortWake.add(record.id);
+			if (state.status === "waiting") {
+				const condition = state.condition;
+				if (condition.kind === "receipt") addTo(this.#receiptWaiters, condition.key, record.id);
+				else if (condition.kind === "input") addTo(this.#inputWaiters, condition.conversationId, record.id);
+				else if (condition.kind === "registry") this.#registryWaiters.add(record.id);
+				if (condition.kind !== "time" && condition.kind !== "failure") this.#wakeDirty.add(record.id);
+				else if (condition.kind === "time" && !record.abortRequested && !this.#blocked.has(record.id))
+					at = condition.until;
+				// Abort-mode time waits already ran cleanup admission; only their explicit deadline releases them.
+				else if (condition.kind === "time" && state.mode === "abort") at = condition.until;
+			} else if (!record.abortRequested && !this.#blocked.has(record.id)) at = 0;
+		}
+		this.#wakeIndex.set(record.id, at);
+	}
+
+	#track(previous: AnyTaskRecord | undefined, record: AnyTaskRecord): void {
+		const id = record.id;
+		this.#indexWake(record);
+		if (
+			record.state.status === "waiting" &&
+			(record.state.condition.kind === "failure" ||
+				(record.state.mode === "abort" && record.state.condition.kind === "registry"))
+		)
+			this.#incidents.add(id);
+		else this.#incidents.delete(id);
+		if (previous?.state.status === "waiting" && previous.state.condition.kind === "tasks")
+			for (const on of previous.state.condition.on) deleteFrom(this.#waiters, on, id);
+		if (record.state.status === "terminal") {
+			const node = nodeOf(record);
+			this.#live.delete(id);
+			this.#intent.delete(id);
+			this.#runnable.delete(id);
+			this.#finalizeChecks.delete(id);
+			this.#settled.set(id, node);
+			// Before anything is forgotten: the walk up to the task it held passes the ended tasks between them. Its chain is
+			// loaded, as every commit that ends a task loads the chains of `#unloaded` first.
+			this.#release(node);
+			for (const waiter of this.#waiters.get(id) ?? []) this.#runnable.add(waiter);
+			this.#relist(id);
+			this.#dropIfUnneeded(id);
+			return;
+		}
+		this.#live.set(id, record);
+		if (previous === undefined) {
+			if (!this.#known(parentNode(record))) this.#unloaded.add(id);
+			this.#relist(id);
+		}
+		if (cancellationIntent(record)) this.#intent.add(id);
+		else this.#intent.delete(id);
+		if (record.state.status === "completing") {
+			this.#runnable.delete(id);
+			this.#finalizeChecks.add(id);
+		} else {
+			this.#runnable.add(id);
+		}
+		if (record.state.status === "waiting" && record.state.condition.kind === "tasks")
+			for (const on of record.state.condition.on) addTo(this.#waiters, on, id);
+	}
+
+	/** The nearest live task above ended ordinary work may be free now: one holding its outcome, or an aborting one. */
+	#release(node: TaskNode, overlay?: Overlay): AnyTaskRecord | undefined {
+		const above = this.#nearestLiveAbove(node, overlay);
+		if (above?.state.status === "completing") this.#finalizeChecks.add(above.id);
+		else if (above?.abortRequested === true) {
+			this.#runnable.add(above.id);
+			this.#wakeDirty.add(above.id);
+		}
+		return above;
+	}
+
+	/**
+	 * List `start` under its parent node in `#below` while it is a live task or has nodes listed below it, and unlist it
+	 * otherwise; then its parent, as far up as that changes. So `#below` holds exactly the tree around live work; a
+	 * parent that loses its last listed node is queued for the sweep. A loop, as ownership chains can be deeper than the
+	 * call stack.
+	 */
+	#relist(start: Node): void {
+		let node: Node = start;
+		for (;;) {
+			const needed = (typeof node !== "string" && this.#live.has(node)) || this.#below.has(node);
+			let parent: Node | null | undefined;
+			if (typeof node === "string") {
+				parent = this.#edges.get(conversationOf(node));
+			} else {
+				const known = this.#live.get(node) ?? this.#settled.get(node);
+				if (known === undefined) return;
+				parent = parentNode(known);
+			}
+			if (parent === undefined) return;
+			if (parent === null) {
+				const root = conversationOf(node as `c${number}`);
+				if (needed) this.#roots.add(root);
+				else this.#roots.delete(root);
+				return;
+			}
+			if ((this.#below.get(parent)?.has(node) === true) === needed) return;
+			if (needed) {
+				const first = !this.#below.has(parent);
+				addTo(this.#below, parent, node);
+				if (!first) return;
+			} else {
+				deleteFrom(this.#below, parent, node);
+				if (this.#below.has(parent)) return;
+				this.#dropIfUnneeded(parent);
+			}
+			node = parent;
+		}
+	}
+
+	/**
+	 * The nearest live task above ended ordinary work `node`, in the overlay's view: the one that work held, if any. Work
+	 * at or below a background task holds nothing above it.
+	 */
+	#nearestLiveAbove(node: TaskNode, overlay?: Overlay): AnyTaskRecord | undefined {
+		for (let current = node; !current.background; ) {
+			const owner = current.owner ?? this.#edge(current.conversationId, overlay);
+			if (owner === undefined || owner === null) return undefined;
+			const record = overlay?.tasks.get(owner) ?? this.#live.get(owner);
+			if (record !== undefined && record.state.status !== "terminal") return record;
+			const above = record ?? this.#settled.get(owner);
+			if (above === undefined) return undefined;
+			current = above;
+		}
+		return undefined;
+	}
+
+	/** Whether the chain above `node` is loaded, without walking: known tasks outside `#unloaded` have a loaded chain. */
+	#known(node: Node): boolean {
+		if (typeof node !== "string") {
+			return (this.#live.has(node) || this.#settled.has(node)) && !this.#unloaded.has(node);
+		}
+		const owner = this.#edges.get(conversationOf(node));
+		return owner === null || (owner !== undefined && this.#known(owner));
 	}
 
 	/** Owner task of a conversation, `null` when ownerless, `undefined` while not loaded. */
@@ -944,42 +1338,100 @@ export class TaskScheduler {
 		}
 	}
 
-	/** Whether every owner above `start` is loaded. */
-	#chainKnown(start: Up, overlay?: Overlay): boolean {
-		for (const step of this.#above(start, overlay)) if ("unknown" in step) return false;
-		return true;
-	}
-
-	/** Live records, with the overlay's candidates replacing committed ones; terminal candidates are gone. */
-	*#liveRecords(overlay?: Overlay): Generator<AnyTaskRecord> {
-		for (const record of this.#live.values()) {
-			const candidate = overlay?.tasks.get(record.id) ?? record;
-			if (candidate.state.status !== "terminal") yield candidate;
-		}
-		if (overlay === undefined) return;
-		for (const record of overlay.tasks.values()) {
-			if (!this.#live.has(record.id) && record.state.status !== "terminal") yield record;
+	/**
+	 * The tasks below `start` that a walk down reaches: those `#below` lists and, under an overlay, the commit's new tasks,
+	 * with its candidates in place of committed records. Background tasks are reached but not entered, unless
+	 * `crossBackground`, and neither are the tasks `enter` rejects. A loop, as chains can be deeper than the call stack.
+	 */
+	*#walkDown(
+		start: Node,
+		options: {
+			readonly overlay?: Overlay;
+			readonly crossBackground?: boolean;
+			readonly enter?: (id: TaskId) => boolean;
+		} = {},
+	): Generator<{ readonly id: TaskId; readonly node: TaskNode; readonly live: AnyTaskRecord | undefined }> {
+		const { overlay, crossBackground = false, enter } = options;
+		const links = overlay === undefined ? undefined : this.#links(overlay);
+		const pending: Node[] = [start];
+		for (let at = pending.pop(); at !== undefined; at = pending.pop()) {
+			for (const children of [this.#below.get(at), links?.get(at)]) {
+				for (const child of children ?? []) {
+					if (typeof child === "string") {
+						pending.push(child);
+						continue;
+					}
+					const record = overlay?.tasks.get(child) ?? this.#live.get(child);
+					const node = record ?? this.#settled.get(child);
+					if (node === undefined) continue;
+					const live = record !== undefined && record.state.status !== "terminal" ? record : undefined;
+					yield { id: child, node, live };
+					if ((crossBackground || !node.background) && (enter === undefined || enter(child))) pending.push(child);
+				}
+			}
 		}
 	}
 
 	/**
-	 * Every task with live ordinary owned work (spec §5.5), mapped to that work: each live non-background task counts for
-	 * every owner task above it up to and including the first background one. Owner chains must be loaded.
+	 * The links walks down need for the commit's new tasks: each one under its parent node, then each node above it that
+	 * `#below` does not list yet, until one it lists, a live task (always listed), or the chain's end.
 	 */
-	#ownedLive(overlay?: Overlay): Map<TaskId, TaskId[]> {
-		const owned = new Map<TaskId, TaskId[]>();
-		for (const record of this.#liveRecords(overlay)) {
-			if (record.background) continue;
-			for (const step of this.#above(parentOf(record), overlay)) {
-				if ("unknown" in step) break;
-				if (!("task" in step)) continue;
-				const below = owned.get(step.task);
-				if (below === undefined) owned.set(step.task, [record.id]);
-				else below.push(record.id);
-				if (step.node.background) break;
+	#links(overlay: Overlay): ReadonlyMap<Node, ReadonlySet<Node>> {
+		if (overlay.links !== undefined) return overlay.links;
+		const links = new Map<Node, Set<Node>>();
+		for (const record of overlay.tasks.values()) {
+			if (this.#live.has(record.id) || this.#settled.has(record.id)) continue;
+			let child: Node = record.id;
+			let parent: Node | null | undefined = parentNode(record);
+			while (parent !== undefined && parent !== null && links.get(parent)?.has(child) !== true) {
+				addTo(links, parent, child);
+				if (typeof parent !== "string" && (this.#live.has(parent) || overlay.tasks.has(parent))) break;
+				let above: Node | null | undefined;
+				if (typeof parent === "string") {
+					above = this.#edge(conversationOf(parent), overlay);
+				} else {
+					const fields = this.#settled.get(parent);
+					above = fields === undefined ? undefined : parentNode(fields);
+				}
+				if (above !== undefined && above !== null && this.#below.get(above)?.has(parent) === true) break;
+				child = parent;
+				parent = above;
 			}
 		}
-		return owned;
+		overlay.links = links;
+		return links;
+	}
+
+	/**
+	 * The live ordinary owned work of `owner` (spec §5.5): the live non-background tasks below it that a walk down reaches
+	 * without entering a background task; with `first`, only the first. Candidates in `overlay` replace committed records;
+	 * the walk does not enter tasks in `done`, which have none. Owner chains must be loaded.
+	 */
+	#ownedLive(
+		owner: TaskId,
+		options: { readonly overlay?: Overlay; readonly first?: boolean; readonly done?: ReadonlySet<TaskId> } = {},
+	): TaskId[] {
+		const { overlay, first = false, done } = options;
+		const found: TaskId[] = [];
+		const walk = this.#walkDown(owner, {
+			...(overlay === undefined ? {} : { overlay }),
+			...(done === undefined ? {} : { enter: (id: TaskId) => !done.has(id) }),
+		});
+		for (const { id, node, live } of walk) {
+			if (live === undefined || node.background) continue;
+			found.push(id);
+			if (first) break;
+		}
+		return found;
+	}
+
+	#hasOwnedLive(owner: TaskId, overlay?: Overlay, done?: ReadonlySet<TaskId>): boolean {
+		const options = {
+			first: true,
+			...(overlay === undefined ? {} : { overlay }),
+			...(done === undefined ? {} : { done }),
+		};
+		return this.#ownedLive(owner, options).length > 0;
 	}
 
 	/**
@@ -1004,30 +1456,45 @@ export class TaskScheduler {
 	 * background owner without it. Terminal owners never cascade (spec §5.4).
 	 */
 	#belowCancelled(start: Up): boolean {
+		return this.#cancellingOwner(start) !== undefined;
+	}
+
+	/** The nearest live owner above `start` whose cancellation intent reaches it, if any; see `#belowCancelled`. */
+	#cancellingOwner(start: Up): AnyTaskRecord | undefined {
+		// Nothing cancels, the common case: no walk.
+		if (this.#intent.size === 0) return undefined;
 		for (const step of this.#above(start)) {
-			if ("unknown" in step) return false;
+			if ("unknown" in step) return undefined;
 			if (!("task" in step)) continue;
 			const live = this.#live.get(step.task);
-			if (live !== undefined && cancellationIntent(live)) return true;
-			if (step.node.background) return false;
+			if (live !== undefined && cancellationIntent(live)) return live;
+			if (step.node.background) return undefined;
 		}
-		return false;
+		return undefined;
+	}
+
+	/** Fail the Session, which reports it, for a throw in one of the scheduler's own commits; ignored once closing. */
+	#failSession(error: unknown): void {
+		if (!this.#closing) this.#session.fail(error);
 	}
 
 	/** Close listener: runs synchronously once admission is sealed, before `join()`. */
-	#seal(error: unknown = closedError()): void {
+	#seal(error: unknown = closedError(this.#session)): void {
 		if (this.#closing) return;
 		this.#closeReason = error;
 		this.#closing = true;
 		if (this.#wakeTimer !== undefined) clearTimeout(this.#wakeTimer);
 		this.#wakeTimer = undefined;
-		this.#unsubscribeRegistry();
+		try {
+			this.#unsubscribeRegistry();
+		} catch (error) {
+			this.#report(error);
+		}
 		this.#taskWaiters.rejectAll(error);
 		this.#idleWaiters.rejectAll(error);
 		this.#contexts.clear();
 		if (this.#expiry !== undefined) clearTimeout(this.#expiry.timer);
 		this.#expiry = undefined;
-		for (const invocation of this.#invocations.values()) invocation.controller.abort();
 	}
 
 	#kick(): void {
@@ -1045,35 +1512,64 @@ export class TaskScheduler {
 				for (const reservation of await this.#reserve()) this.#start(reservation);
 			}
 		} catch (error) {
-			if (!this.#closing) this.#report(error);
+			// As in `#reconcile()`: the reservation commit runs no extension code.
+			this.#failSession(error);
 		} finally {
 			this.#draining = false;
-			// A wakeup that arrived during a failed pass still needs its pass.
+			// A wakeup that arrived after the loop's last check still needs its pass.
 			if (this.#dirty) this.#kick();
 		}
 	}
 
-	/** Reserve eligible tasks; unavailable cleanup code parks without discarding ownership. */
+	/**
+	 * Reserve eligible tasks; unavailable cleanup code parks without discarding ownership. The first pass after open
+	 * only abort-marks abandoned tasks, so later passes see the restart marks.
+	 */
 	async #reserve(): Promise<Reservation[]> {
 		const reservations: Reservation[] = [];
+		let abandoned: TaskId[] = [];
 		try {
 			await this.#session.commitWith(async (tx) => {
 				if (!this.#enabled || this.#closing) return;
+				for (const id of this.#abandoned) {
+					const record = this.#live.get(id);
+					if (record !== undefined && !record.abortRequested) tx.setTask(withAbortMark(record, "restart"));
+				}
+				if (this.#abandoned.size > 0) {
+					abandoned = [...this.#abandoned];
+					return;
+				}
 				await this.#loadScopes(false);
-				const owned = this.#ownedLive();
 				// Taken once per pass, and only when some task is a candidate.
 				let snapshot: RegistrySnapshot | undefined;
-				for (const record of [...this.#live.values()]) {
+				for (const id of [...this.#runnable]) {
 					if (this.#remainingStarts === 0) break;
-					if (this.#invocations.has(record.id) || this.#waitingOn(record, owned).length > 0) continue;
+					const record = this.#live.get(id);
+					if (record === undefined || record.state.status === "completing" || this.#invocations.has(id)) {
+						this.#runnable.delete(id);
+						continue;
+					}
+					// It returns once what it waits for ends, its record changes, or the work below it ends.
+					if (this.#waitingOn(record, true).length > 0) {
+						this.#runnable.delete(id);
+						continue;
+					}
 					if (
 						(!record.abortRequested || (record.state.status === "waiting" && record.state.mode === "abort")) &&
 						!(await this.#conditionReady(tx, record))
-					)
+					) {
+						this.#runnable.delete(id);
 						continue;
-					if (record.state.status === "completing") continue;
+					}
 					const runnable = record as RunnableTaskRecord;
 					const mode = record.abortRequested ? "abort" : "run";
+					// Work below an owner with cancellation intent waits for its cascade mark instead of running a phase; schedule
+					// the cascade, which may not have run yet.
+					if (mode === "run" && !record.background && this.#belowCancelled(parentOf(record))) {
+						this.#cascadePending = true;
+						this.#scheduleReconcile();
+						continue;
+					}
 					snapshot ??= this.#registry.snapshot();
 					const resolution = this.#resolve(runnable, snapshot);
 					if (resolution.kind === "blocked") {
@@ -1101,7 +1597,9 @@ export class TaskScheduler {
 							}),
 						);
 					}
-					// Registered on the line, so marks and later reservations see it and close joins it.
+					// Registered on the line, so marks and later reservations see it and close joins it; `#end` makes it a
+					// candidate again.
+					this.#runnable.delete(id);
 					const invocation = this.#createInvocation(record, mode);
 					reservations.push({ invocation, task: resolution.task, snapshot });
 					this.#remainingStarts--;
@@ -1110,10 +1608,14 @@ export class TaskScheduler {
 		} catch (error) {
 			for (const { invocation } of reservations) {
 				this.#invocations.delete(invocation.taskId);
+				this.#runnable.add(invocation.taskId);
 				invocation.finish();
 			}
 			throw error;
 		}
+		// Marked, or already marked or gone: done with them. Reserve again, now seeing the marks.
+		for (const id of abandoned) this.#abandoned.delete(id);
+		if (abandoned.length > 0) this.#dirty = true;
 		return reservations;
 	}
 
@@ -1121,10 +1623,12 @@ export class TaskScheduler {
 	 * Live tasks a task waits for before its next invocation: its live ordinary owned work when abort-marked, since
 	 * abort runs bottom-up, otherwise the live part of the `on` of a wait.
 	 */
-	#waitingOn(record: AnyTaskRecord, owned: ReadonlyMap<TaskId, readonly TaskId[]>): readonly TaskId[] {
-		if (record.abortRequested) return owned.get(record.id) ?? [];
+	#waitingOn(record: AnyTaskRecord, first = false): readonly TaskId[] {
+		if (record.abortRequested) return this.#ownedLive(record.id, { first });
 		if (record.state.status !== "waiting" || record.state.condition.kind !== "tasks") return [];
-		return record.state.condition.on.filter((id) => this.#live.has(id));
+		if (!first) return record.state.condition.on.filter((id) => this.#live.has(id));
+		const live = record.state.condition.on.find((id) => this.#live.has(id));
+		return live === undefined ? [] : [live];
 	}
 
 	async #conditionReady(tx: Transaction, record: AnyTaskRecord): Promise<boolean> {
@@ -1165,6 +1669,7 @@ export class TaskScheduler {
 		const fit = this.#fit(record, snapshot.task(record.kind));
 		if ("reason" in fit) {
 			this.#blocked.add(record.id);
+			this.#wakeIndex.delete(record.id);
 			return { kind: "blocked", reason: fit.reason };
 		}
 		this.#blocked.delete(record.id);
@@ -1179,6 +1684,7 @@ export class TaskScheduler {
 		} catch (error) {
 			this.#failedMigrations.set(record.id, { task: fit.task, error });
 			this.#blocked.add(record.id);
+			this.#wakeIndex.delete(record.id);
 			this.#report(error);
 			return { kind: "blocked", reason: "migration_failed" };
 		}
@@ -1194,6 +1700,23 @@ export class TaskScheduler {
 		return { task, migrates: true };
 	}
 
+	/** Sizes of the ownership indexes, for tests that bound the scheduler's memory. */
+	get indexSizes(): Readonly<
+		Record<"live" | "settled" | "edges" | "below" | "roots" | "unloaded" | "dropQueue", number>
+	> {
+		let below = 0;
+		for (const children of this.#below.values()) below += children.size;
+		return {
+			live: this.#live.size,
+			settled: this.#settled.size,
+			edges: this.#edges.size,
+			below,
+			roots: this.#roots.size,
+			unloaded: this.#unloaded.size,
+			dropQueue: this.#dropQueue.size,
+		};
+	}
+
 	/**
 	 * Scheduling state and every live task with its derived state, read on the Session line. Runs no task code: a
 	 * pending migration shows as `ready` with `migrates`, and only a migration the scheduler already tried, or one that
@@ -1203,10 +1726,9 @@ export class TaskScheduler {
 		snapshot: RegistrySnapshot,
 	): Promise<{ scheduling: HarnessInspection["scheduling"]; tasks: TaskInspection[] }> {
 		await this.#loadScopes(false);
-		const owned = this.#ownedLive();
 		const tasks: TaskInspection[] = [];
 		for (const record of this.#live.values()) {
-			let state = this.#inspectTask(record, snapshot, owned);
+			let state = this.#inspectTask(record, snapshot);
 			if (
 				record.state.status === "waiting" &&
 				(!record.abortRequested || record.state.mode === "abort") &&
@@ -1225,14 +1747,10 @@ export class TaskScheduler {
 		return { scheduling, tasks };
 	}
 
-	#inspectTask(
-		record: AnyTaskRecord,
-		snapshot: RegistrySnapshot,
-		owned: ReadonlyMap<TaskId, readonly TaskId[]>,
-	): TaskInspection["state"] {
+	#inspectTask(record: AnyTaskRecord, snapshot: RegistrySnapshot): TaskInspection["state"] {
 		if (this.#invocations.has(record.id)) return { kind: "running" };
 		if (record.state.status === "completing") return { kind: "completing" };
-		const on = this.#waitingOn(record, owned);
+		const on = this.#waitingOn(record);
 		if (on.length > 0) return { kind: "waiting", on };
 		if (
 			record.state.status === "waiting" &&
@@ -1279,7 +1797,10 @@ export class TaskScheduler {
 			} finally {
 				this.#end(invocation);
 				await Promise.allSettled([...invocation.modelRequests]);
-				if (this.#invocations.get(invocation.taskId) === invocation) this.#invocations.delete(invocation.taskId);
+				if (this.#invocations.get(invocation.taskId) === invocation) {
+					this.#invocations.delete(invocation.taskId);
+					if (this.#live.has(invocation.taskId)) this.#runnable.add(invocation.taskId);
+				}
 				invocation.finish();
 				this.#kick();
 				if (!this.#closing && this.#invocations.size === 0) void this.flushWake(this.#context).catch(this.#report);
@@ -1333,6 +1854,12 @@ export class TaskScheduler {
 	): Decision {
 		// 3. abort mark: end; a fresh abort invocation starts once the task's ordinary owned work is gone.
 		if (current.abortRequested) return false;
+		// An owner's cancellation intent ends it too, before its cascade marks it; reservation then holds it back.
+		if (!current.background && this.#belowCancelled(parentOf(current))) {
+			this.#cascadePending = true;
+			this.#scheduleReconcile();
+			return false;
+		}
 		if (previous === undefined) return true;
 		// 4. uncaught error.
 		if (previous.failure !== undefined) return { fault: previous.failure.error };
@@ -1429,18 +1956,15 @@ export class TaskScheduler {
 			if (recordedFailure !== undefined) this.#report(recordedFailure.error);
 			return result;
 		} catch (error) {
+			// The step writes the scheduler's own decision, a fault or a terminal record; a throw there would otherwise
+			// leave the task running, to be reserved and run again.
 			this.#end(invocation);
-			if (this.#closing) return undefined;
-			if (typeof decide !== "function") {
-				if (recordedFailure !== undefined) this.#failureErrors.delete(recordedFailure.incident);
-				// The old checkpoint remains the only durable truth. Stop dispatch rather than automatically retrying
-				// cleanup whose failure could not be recorded.
-				const failure = new AggregateError([decide.park, error], "Invocation failure could not be committed");
-				this.#seal(failure);
-				this.#report(failure);
-				return undefined;
-			}
-			if (!this.#closing) this.#report(error);
+			if (recordedFailure !== undefined) this.#failureErrors.delete(recordedFailure.incident);
+			this.#failSession(
+				typeof decide !== "function"
+					? new AggregateError([decide.park, error], "Invocation failure could not be committed")
+					: error,
+			);
 			return undefined;
 		}
 	}
@@ -1451,7 +1975,7 @@ export class TaskScheduler {
 	 */
 	async #terminate(tx: Transaction, record: AnyTaskRecord, outcome: SchedulerOutcome): Promise<void> {
 		await this.#loadScopes(false);
-		if (this.#ownedLive(overlayOf(tx)).has(record.id)) {
+		if (this.#hasOwnedLive(record.id, overlayOf(tx))) {
 			tx.setTask(withState(record, { status: "completing", outcome }));
 			return;
 		}
@@ -1498,7 +2022,7 @@ export class TaskScheduler {
 			const overlay = overlayOf(tx);
 			await this.#loadScopes(false);
 			for (const record of overlay.tasks.values()) await this.#loadChain(parentOf(record), overlay);
-			if (this.#ownedLive(overlay).has(current.id)) {
+			if (this.#hasOwnedLive(current.id, overlay)) {
 				tx.setTask(withState(current, { status: "completing", outcome: next.outcome }));
 				return;
 			}
@@ -1546,8 +2070,18 @@ export class TaskScheduler {
 	/** No live non-background task in the scope; a task whose owner edges are not loaded yet counts as inside. */
 	#idle(conversationId: ConversationId | undefined): boolean {
 		const scope: Scope = conversationId === undefined ? { roots: true } : { conversation: conversationId };
-		for (const record of this.#live.values()) {
-			if (!record.background && this.#inScope(parentOf(record), scope) !== false) return false;
+		// Tasks whose chain is not loaded are not listed below their scope yet; one counts as inside unless its walk up
+		// decides otherwise.
+		for (const id of this.#unloaded) {
+			const record = this.#live.get(id);
+			if (record !== undefined && !record.background && this.#inScope(parentOf(record), scope) !== false)
+				return false;
+		}
+		const starts = conversationId === undefined ? this.#roots : [conversationId];
+		for (const start of starts) {
+			for (const { node, live } of this.#walkDown(conversationNode(start))) {
+				if (live !== undefined && !node.background) return false;
+			}
 		}
 		return true;
 	}
@@ -1652,6 +2186,35 @@ export class TaskScheduler {
 				this.#read(invocation, () =>
 					this.waitForTask(id, withAbortSignal(invocation.controller.signal, context)),
 				)) as ErasedRuntime["waitForTask"],
+			ownedTasks: (context) =>
+				this.#read(invocation, () =>
+					this.#session.readOnLine(async () => {
+						// The step that ends the invocation may have run on the line before this.
+						if (invocation.ended) throw endedError(invocation);
+						context.abortSignal?.throwIfAborted();
+						// Every live task is listed under its parent node, its owner task when it has one.
+						const owned: AnyTaskRecord[] = [];
+						for (const node of this.#below.get(invocation.taskId) ?? []) {
+							const record = typeof node === "string" ? undefined : this.#live.get(node);
+							if (record?.owner === invocation.taskId) owned.push(record);
+						}
+						// Copies, as from storage: the scheduler reads its own.
+						return owned
+							.sort((a, b) => a.id - b.id)
+							.map((record) => copyJson(record as unknown as JsonValue) as unknown as AnyTaskRecord);
+					}),
+				),
+			abortOwned: (id, context) =>
+				this.#read(invocation, async () => {
+					const bound = withAbortSignal(invocation.controller.signal, context);
+					const record = await this.#session.readOnLine(() => this.#storage.task(id, bound));
+					if (record?.owner !== invocation.taskId) {
+						throw new Error(`Task ${id} is not owned by task ${invocation.taskId}`);
+					}
+					if (record.state.status === "terminal") return;
+					await this.abort(id, bound, true);
+					await this.waitForTask(id, bound);
+				}),
 			outcomes: ((ids: readonly TaskId[], context: Context) =>
 				this.#read(invocation, () =>
 					this.#session.readOnLine(async () => {
@@ -1876,6 +2439,12 @@ export class TaskScheduler {
 	}
 }
 
+/** The record with an abort mark: `restart` for an abandonment; without a reason, a request, which replaces `restart`. */
+function withAbortMark(record: AnyTaskRecord, reason?: "restart"): AnyTaskRecord {
+	const { abortReason: _reason, ...rest } = record;
+	return { ...rest, abortRequested: true, ...(reason === undefined ? {} : { abortReason: reason }) } as AnyTaskRecord;
+}
+
 /** A live owner's durable cancellation intent: its abort mark, or a held outcome other than `completed`. */
 function cancellationIntent(record: AnyTaskRecord): boolean {
 	return record.state.status !== "terminal" && (record.abortRequested || failedOutcome(record));
@@ -1903,6 +2472,19 @@ function overlayOf(tx: Transaction): Overlay {
 	const tasks = new Map(tx.stagedTasks().map((record) => [record.id, record]));
 	const edges = new Map(tx.stagedConversations().map((record) => [record.id, record.owner?.taskId ?? null]));
 	return { tasks, edges };
+}
+
+function addTo<K, V>(map: Map<K, Set<V>>, key: K, value: V): void {
+	const values = map.get(key);
+	if (values === undefined) map.set(key, new Set([value]));
+	else values.add(value);
+}
+
+function deleteFrom<K, V>(map: Map<K, Set<V>>, key: K, value: V): void {
+	const values = map.get(key);
+	if (values === undefined) return;
+	values.delete(value);
+	if (values.size === 0) map.delete(key);
 }
 
 /** Own memo entry only; memo names such as `toString` must not resolve to inherited properties. */

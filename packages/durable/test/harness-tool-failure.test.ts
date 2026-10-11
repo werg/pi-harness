@@ -10,7 +10,6 @@ import {
 	Harness,
 	LiveDoc,
 	type Storage,
-	StorageRejected,
 	type StorageWrite,
 	type TaskId,
 	type ToolDiagnostic,
@@ -18,14 +17,18 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { chatSetup, openChat, toolsNamed } from "./chat-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
 import { ControlledStorage, context } from "./session-support.ts";
 
 const harnesses = new Set<Harness>();
 const directories = new Set<string>();
+const persistent = new Set<Awaited<ReturnType<typeof createPersistentStorage>>>();
 
 afterEach(async () => {
 	const closed = await Promise.allSettled([...harnesses].map((harness) => harness.close(context)));
 	harnesses.clear();
+	await Promise.all([...persistent].map((fixture) => fixture.close()));
+	persistent.clear();
 	await Promise.all([...directories].map((directory) => rm(directory, { recursive: true, force: true })));
 	directories.clear();
 	for (const result of closed) if (result.status === "rejected") throw result.reason;
@@ -363,40 +366,37 @@ describe("tool continuation failures retain operation ownership", () => {
 	});
 
 	it("retains the admitted operation when its terminal result commit is rejected", async () => {
-		const rejection = new StorageRejected("result transaction refused");
+		const rejection = new Error("result transaction refused");
 		let rejectResult = true;
-		const storage = new (class extends ControlledStorage {
-			override async commit(writes: readonly StorageWrite[], ctx: typeof context) {
-				if (
-					rejectResult &&
-					writes.some((write) => write.type === "entry" && write.value.kind === "pi.tool-result")
-				) {
-					rejectResult = false;
-					throw rejection;
-				}
-				return super.commit(writes, ctx);
+		const database = await createPersistentStorage();
+		persistent.add(database);
+		database.storage.rejectCommit((writes) => {
+			if (rejectResult && writes.some((write) => write.type === "entry" && write.value.kind === "pi.tool-result")) {
+				rejectResult = false;
+				return rejection;
 			}
-		})();
+			return undefined;
+		});
 		const fixture = scenario("execute");
-		const { harness, root } = await fixture.open(storage);
+		let { harness, root } = await fixture.open(database.storage);
 		const submission = await root.submit({ type: "input", content: "run operation" }, context);
 		await harness.runPass(context);
 		const taskId = (await harness.snapshot(LiveDoc, root.id, context))!.tools![0]!.taskId!;
 		fixture.state.repaired = true;
 		fixture.state.now = 2000;
-		await harness.runPass(context);
-		const incident = await failureIncident(harness, taskId);
-		await expect(root.waitForIdle(context)).rejects.toBe(rejection);
+		await expect(harness.runPass(context)).rejects.toMatchObject({ cause: rejection });
+		expect(await harness.closed).toEqual({ reason: "failed", error: rejection });
+		({ harness, root } = await fixture.open(await database.reopen()));
 		expect(await harness.getTask(taskId, context)).toMatchObject({
 			state: { checkpoint: { continuation: { operation: "accepted-operation" } } },
 		});
-		expect(await submission.status(context)).toMatchObject({ status: "placed" });
+		const recoveredSubmission = (await harness.submission(submission.id, context))!;
+		expect(await recoveredSubmission.status(context)).toMatchObject({ status: "placed" });
 		expect(
 			(await root.entries({}, 100, undefined, context)).items.some((entry) => entry.kind === "pi.tool-result"),
 		).toBe(false);
-		expect(await harness.retryTask(taskId, incident, context)).toBe("queued");
 		await harness.runPass(context);
-		expect(await submission.wait(context)).toMatchObject({ status: "done" });
+		expect(await recoveredSubmission.wait(context)).toMatchObject({ status: "done" });
 		expect(fixture.admissions).toHaveLength(1);
 		expect(fixture.observations).toHaveLength(2);
 		expect(fixture.observations[1]).toEqual(fixture.observations[0]);
@@ -406,34 +406,39 @@ describe("tool continuation failures retain operation ownership", () => {
 	});
 
 	it("rolls back continuation progress with the rejected incident and seals dispatch", async () => {
-		const rejection = new StorageRejected("failure transaction refused");
+		const rejection = new Error("failure transaction refused");
 		let attempted: readonly StorageWrite[] | undefined;
-		const storage = new (class extends ControlledStorage {
-			override async commit(writes: readonly StorageWrite[], ctx: typeof context) {
-				if (writes.some((write) => write.type === "entry" && write.value.kind === "pi.failure")) {
-					attempted = structuredClone(writes);
-					throw rejection;
-				}
-				return super.commit(writes, ctx);
+		const database = await createPersistentStorage();
+		persistent.add(database);
+		database.storage.rejectCommit((writes) => {
+			if (writes.some((write) => write.type === "entry" && write.value.kind === "pi.failure")) {
+				attempted = structuredClone(writes);
+				return rejection;
 			}
-		})();
+			return undefined;
+		});
 		const fixture = scenario("execute");
-		const { harness, root } = await fixture.open(storage);
+		let { harness, root } = await fixture.open(database.storage);
 		const submission = await root.submit({ type: "input", content: "run operation" }, context);
 		await harness.runPass(context);
 		const taskId = (await harness.snapshot(LiveDoc, root.id, context))!.tools![0]!.taskId!;
 		const before = (await harness.getTask(taskId, context))!;
 		if (before.state.status !== "waiting") throw new Error("Expected admitted operation wait");
 		fixture.state.now = 2000;
-		await expect(harness.runPass(context)).rejects.toMatchObject({ errors: [fixture.original, rejection] });
+		await expect(harness.runPass(context)).rejects.toMatchObject({ cause: rejection });
+		expect(await harness.closed).toEqual({ reason: "failed", error: rejection });
+		await expect(harness.runPass(context)).rejects.toMatchObject({ cause: rejection });
+		({ harness, root } = await fixture.open(await database.reopen()));
 		expect(await harness.getTask(taskId, context)).toMatchObject({
-			state: { status: "running", checkpoint: before.state.checkpoint },
+			state: { status: "pending", checkpoint: before.state.checkpoint },
 		});
 		expect((await harness.snapshot(LiveDoc, root.id, context))!.tools![0]!.details).toEqual({
 			operation: "accepted-operation",
 			stage: "admitted",
 		});
-		expect(await submission.status(context)).toMatchObject({ status: "placed" });
+		expect(await (await harness.submission(submission.id, context))!.status(context)).toMatchObject({
+			status: "placed",
+		});
 		expect(attempted).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ type: "document.change" }),
@@ -457,7 +462,6 @@ describe("tool continuation failures retain operation ownership", () => {
 				(entry) => entry.kind === "pi.failure" || entry.kind === "pi.tool-result",
 			),
 		).toBe(false);
-		await expect(harness.runPass(context)).rejects.toMatchObject({ errors: [fixture.original, rejection] });
 		expect(fixture.admissions).toHaveLength(1);
 		expect(fixture.observations).toHaveLength(1);
 	});

@@ -13,13 +13,13 @@ import {
 	type HarnessCommit,
 	type HarnessOptions,
 	ReadAfterWrite,
-	StorageRejected,
 	type TaskId,
 	WakeDoc,
 } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { allEntries, chatSetup } from "./chat-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
 import { ControlledStorage, context } from "./session-support.ts";
 import { completed, deferred, settled } from "./task-support.ts";
 
@@ -233,23 +233,28 @@ describe("transactional harness preparation", () => {
 			await harness.close(context);
 		}
 	});
-	it("propagates StorageRejected without retaining an assistant entry or publication debt", async () => {
-		const storage = new ControlledStorage();
+	it("propagates the original storage error without retaining an assistant entry or publication debt", async () => {
+		const persisted = await createPersistentStorage();
+		const storage = persisted.storage;
 		const config = options(preparePublication);
-		const harness = await Harness.open(storage, config.options, context);
+		let harness = await Harness.open(storage, config.options, context);
 		try {
-			const root = await harness.root(context);
-			const failure = new StorageRejected("atomic batch rejected");
+			let root = await harness.root(context);
+			const failure = new Error("atomic batch rejected");
 			storage.failNextCommit(failure);
 			await expect(
 				root.commit((tx) => tx.appendEntry(root.id, { kind: AssistantEntry.kind }), context),
 			).rejects.toBe(failure);
+			expect(await harness.closed).toEqual({ reason: "failed", error: failure });
+			harness = await Harness.open(await persisted.reopen(), config.options, context);
+			root = (await harness.conversation(root.id, context))!;
 			expect(await allEntries(root)).toEqual([]);
 			expect(await harness.snapshot(Publication, root.id, context)).toBeUndefined();
 			expect(await harness.snapshot(WakeDoc, context)).toBeUndefined();
 			expect((await harness.inspect(context)).tasks).toEqual([]);
 		} finally {
 			await harness.close(context);
+			await persisted.close();
 		}
 	});
 	it("retains ordinary table-read restrictions in preparation", async () => {

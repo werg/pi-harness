@@ -11,13 +11,12 @@ import {
 	type ModelRequestPort,
 	type ModelRequestTarget,
 	type Storage,
-	StorageRejected,
-	type StorageWrite,
 } from "@earendil-works/pi-durable";
 import { describe, expect, it, vi } from "vitest";
 import { admitModelRequest } from "../src/harness/model-request.ts";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { type ChatSetup, chatSetup, waitFor } from "./chat-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
 import { context } from "./session-support.ts";
 import { aborted, deferred, settled } from "./task-support.ts";
 
@@ -194,48 +193,49 @@ describe("durable model endpoint preparation", () => {
 	}
 
 	it("propagates an authoritative rejected prepare commit and retains no partial effective model", async () => {
-		class FailingStorage extends MemoryStorage {
-			failure: Error | undefined;
-			override async commit(writes: readonly StorageWrite[], ctx: Parameters<Storage["commit"]>[1]) {
-				if (
-					this.failure &&
-					writes.some((write) => {
-						if (
-							(write.type !== "document.create" && write.type !== "document.change") ||
-							write.content.kind !== "base"
-						)
-							return false;
-						const model = write.content.value.model;
-						return (
-							model !== null && typeof model === "object" && !Array.isArray(model) && model.baseUrl === endpoint
-						);
-					})
-				) {
-					const error = this.failure;
-					this.failure = undefined;
-					throw error;
-				}
-				return super.commit(writes, ctx);
-			}
-		}
+		const persisted = await createPersistentStorage();
+		const storage = persisted.storage;
 		const setup = chatSetup();
-		const storage = new FailingStorage();
-		const failure = new StorageRejected("original model preparation storage refusal");
-		setup.faux.setResponses([fauxAssistantMessage("done")]);
-		const opened = await open(storage, setup, async (target, api, ctx) => {
-			storage.failure = failure;
+		const failure = new Error("original model preparation storage refusal");
+		let request: ModelRequestTarget | undefined;
+		setup.faux.setResponses([fauxAssistantMessage("must not run")]);
+		let opened = await open(storage, setup, async (target, api, ctx) => {
+			request = target;
+			storage.rejectCommit((writes) =>
+				writes.some((write) => {
+					if (
+						(write.type !== "document.create" && write.type !== "document.change") ||
+						write.content.kind !== "base"
+					)
+						return false;
+					const model = write.content.value.model;
+					return (
+						model !== null && typeof model === "object" && !Array.isArray(model) && model.baseUrl === endpoint
+					);
+				})
+					? failure
+					: undefined,
+			);
 			await expect(api.prepare({ ...target.model, baseUrl: endpoint }, ctx)).rejects.toBe(failure);
 			expect(api.prepared).toBeUndefined();
-			await api.prepare({ ...target.model, baseUrl: endpoint }, ctx);
+			await expect(api.prepare({ ...target.model, baseUrl: endpoint }, ctx)).rejects.toMatchObject({
+				name: "SessionFailed",
+				cause: failure,
+			});
 			return { status: "ready", options: {}, close: async () => {} };
 		});
 		try {
-			expect(
-				(await (await opened.root.submit({ type: "input", content: "go" }, context)).wait(context)).status,
-			).toBe("done");
-			expect(setup.faux.state.callCount).toBe(1);
+			const submission = await opened.root.submit({ type: "input", content: "go" }, context);
+			await expect(submission.wait(context)).rejects.toMatchObject({ name: "SessionFailed", cause: failure });
+			expect(await opened.harness.closed).toEqual({ reason: "failed", error: failure });
+			expect(setup.faux.state.callCount).toBe(0);
+			const harness = await Harness.open(await persisted.reopen(), setup, context);
+			opened = { harness, root: (await harness.conversation(opened.root.id, context))! };
+			const task = await harness.getTask(request!.taskId, context);
+			expect(task?.state.checkpoint).toMatchObject({ model: request!.model });
 		} finally {
 			await opened.harness.close(context);
+			await persisted.close();
 		}
 	});
 

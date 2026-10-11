@@ -420,6 +420,7 @@ export class Transaction implements Tx {
 					...(owner === undefined ? {} : { owner: owner.id }),
 					background: options.background ?? false,
 					abortRequested: false,
+					...(options.abandonOnRestart === true ? { abandonOnRestart: true } : {}),
 					state: { status: "pending", checkpoint },
 				},
 				TABLE_JSON_COPY_OPTIONS,
@@ -528,6 +529,12 @@ export class Transaction implements Tx {
 	/** Internal: entries appended by this transaction, including those eligible to release an input wait. */
 	stagedEntries(): EntryRecord[] {
 		return this.#writes.flatMap((write) => (write.type === "entry" ? [write.value] : []));
+	}
+
+	/** Internal: document addresses acquired, created, or retired so far; conservatively invalidate dependent waits. */
+	stagedDocumentAddresses(): readonly DocumentAddress[] {
+		this.#assertOpen();
+		return this.#documents.map(({ address }) => ({ ...address, scope: { ...address.scope } }));
 	}
 
 	/** Internal: conversations this transaction created or forked so far. */

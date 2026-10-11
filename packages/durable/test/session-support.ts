@@ -41,12 +41,14 @@ export class ControlledStorage extends MemoryStorage {
 	readonly commits: (readonly StorageWrite[])[] = [];
 	mintCount = 0;
 	documentReadCount = 0;
-	#commitGate: { gate: Deferred; entered: Deferred } | undefined;
+	#commitGate:
+		| { gate: Deferred; entered: Deferred; matches: (writes: readonly StorageWrite[]) => boolean }
+		| undefined;
 	#findGate: { gate: Deferred; entered: Deferred } | undefined;
 	#commitFailure: Error | undefined;
 
-	holdCommits(): Gate {
-		const held = { gate: deferred(), entered: deferred() };
+	holdCommits(matches: (writes: readonly StorageWrite[]) => boolean = () => true): Gate {
+		const held = { gate: deferred(), entered: deferred(), matches };
 		this.#commitGate = held;
 		return { entered: held.entered.promise, release: () => this.#release("commit", held) };
 	}
@@ -66,6 +68,12 @@ export class ControlledStorage extends MemoryStorage {
 		this.#commitFailure = error;
 	}
 
+	/** Reopen after `close()`, as a fresh process would reopen the same database, keeping every committed record. */
+	reopen(): this {
+		(this as unknown as { closed: boolean }).closed = false;
+		return this;
+	}
+
 	#release(kind: "commit" | "find", held: { gate: Deferred }): void {
 		if (kind === "commit" && this.#commitGate === held) this.#commitGate = undefined;
 		if (kind === "find" && this.#findGate === held) this.#findGate = undefined;
@@ -76,7 +84,7 @@ export class ControlledStorage extends MemoryStorage {
 		this.admittedCommits.push(writes);
 		this.commits.push(structuredClone(writes));
 		const held = this.#commitGate;
-		if (held !== undefined) {
+		if (held?.matches(writes)) {
 			held.entered.resolve();
 			await held.gate.promise;
 		}
@@ -119,7 +127,8 @@ export function openTestSession(): {
 	readonly publications: CommitPublication[];
 } {
 	const storage = new ControlledStorage();
-	const session = new SessionImpl(storage);
+	// These tests pin the cache's identities and loads, so documents stay as long as the default keeps them.
+	const session = new SessionImpl(storage, Date.now, () => 600_000);
 	const publications: CommitPublication[] = [];
 	session.subscribeCommits((publication) => {
 		publications.push(publication);

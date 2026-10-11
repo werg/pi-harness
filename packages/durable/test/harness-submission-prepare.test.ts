@@ -5,11 +5,11 @@ import {
 	ConversationBusy,
 	defineDoc,
 	defineTask,
+	Harness,
 	InboxDoc,
 	LiveDoc,
 	ReadAfterWrite,
 	ResetEntry,
-	StorageRejected,
 	type SubmissionId,
 	type SubmissionPrepare,
 	type TaskId,
@@ -19,6 +19,7 @@ import {
 import { describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { allEntries, chatSetup, openChat, unanswered } from "./chat-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
 import { ControlledStorage, context } from "./session-support.ts";
 import { deferred, settled } from "./task-support.ts";
 
@@ -248,15 +249,15 @@ describe("transactional submission preparation", () => {
 			);
 			const follow = await root.submit({ type: "input", whenBusy: "followUp", content: () => "follow-up" }, context);
 			const write = await root.submit({ type: "write", entry: () => ({ kind: "note", data: "passive" }) }, context);
+			expect(await write.status(context)).toMatchObject({ status: "done" });
+			expect((await allEntries(root)).some((entry) => entry.kind === "note")).toBe(true);
 			expect(await harness.snapshot(InboxDoc, root.id, context)).toEqual({
 				items: [
 					{ id: steer.id, mode: "steer", content: "steering" },
 					{ id: follow.id, mode: "followUp", content: "follow-up" },
-					{ id: write.id, mode: "write", entry: { kind: "note", data: "passive" } },
 				],
 			});
-			for (const submission of [steer, follow, write])
-				expect((await submission.status(context)).status).toBe("queued");
+			for (const submission of [steer, follow]) expect((await submission.status(context)).status).toBe("queued");
 			expect((await harness.snapshot(Feedback, root.id, context))?.accepted).toEqual([
 				{ deliveryId: "steer", submissionId: steer.id, feedbackIds: [] },
 			]);
@@ -383,11 +384,13 @@ describe("transactional submission preparation", () => {
 	});
 
 	it("propagates deterministic Storage rejection and rolls back the prepared product document", async () => {
-		const storage = new ControlledStorage();
-		const { harness, root } = await openChat(storage, chatSetup());
+		const persisted = await createPersistentStorage();
+		const storage = persisted.storage;
+		const setup = chatSetup();
+		let { harness, root } = await openChat(storage, setup);
 		try {
 			await root.commit(async (tx) => void (await tx.doc(Feedback, root.id)), context);
-			const failure = new StorageRejected("no batch admitted");
+			const failure = new Error("no batch admitted");
 			storage.failNextCommit(failure);
 			let failedId: SubmissionId | undefined;
 			await expect(
@@ -408,6 +411,9 @@ describe("transactional submission preparation", () => {
 					context,
 				),
 			).rejects.toBe(failure);
+			expect(await harness.closed).toEqual({ reason: "failed", error: failure });
+			harness = await Harness.open(await persisted.reopen(), setup, context);
+			root = (await harness.conversation(root.id, context))!;
 			expect(await harness.submission(failedId!, context)).toBeUndefined();
 			expect(await allEntries(root)).toEqual([]);
 			expect(await harness.snapshot(Feedback, root.id, context)).toEqual({ pending: [], accepted: [] });
@@ -416,6 +422,7 @@ describe("transactional submission preparation", () => {
 			).toBe("done");
 		} finally {
 			await harness.close(context);
+			await persisted.close();
 		}
 	});
 

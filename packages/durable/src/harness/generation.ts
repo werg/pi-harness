@@ -119,8 +119,9 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 	phases: {
 		/**
 		 * Render the system prompt and tool loadout and append the positional `pi.system` entries they need, then move to
-		 * `request`. The agent and settings resolved here are fixed for this request. Only the Harness writes to a busy
-		 * conversation, so the transcript read here is still the tail at the commit.
+		 * `request`. The agent and settings resolved here are fixed for this request. Only the Harness writes model
+		 * context to a busy conversation, so the context read here is still current at the commit; display-only entries
+		 * may land meanwhile.
 		 */
 		prepare: async (task, runtime, context) => {
 			const { conversationId } = runtime;
@@ -392,7 +393,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 			await convertPartial(tx, live, conversationId);
 			for (const call of unstarted) {
 				const result = harnessError("aborted", `Tool ${call.name} was aborted`);
-				await appendToolResult(tx, conversationId, call, result, runtime.now());
+				await appendToolResult(tx, conversationId, call, result, { timestamp: runtime.now() });
 			}
 			if (live.run?.taskId === runtime.taskId && live.run.interruption?.kind === "flush") {
 				const steering = boundary.inbox.items.some((item) => item.mode === "steer");
@@ -435,7 +436,7 @@ function createToolTask(
 ): Promise<TaskId<ToolTaskResult>> {
 	return tx.createTask(
 		ToolTask,
-		{ source: { kind: "assistant" as const, entryId: assistant }, callId, binding },
+		{ kind: "model", assistant, callId, binding },
 		{ ownership: { kind: "task", taskId: runtime.taskId } },
 	);
 }
@@ -773,7 +774,7 @@ async function startToolRound(
 		for (const call of calls) {
 			if (!offered.has(call.name)) {
 				const unavailable = harnessError("tool_unavailable", `Tool ${call.name} is not available`);
-				const result = await appendToolResult(tx, conversationId, call, unavailable, runtime.now());
+				const result = await appendToolResult(tx, conversationId, call, unavailable, { timestamp: runtime.now() });
 				slots.push({ callId: call.id, name: call.name, status: "done", entry: result.id });
 				continue;
 			}
@@ -826,7 +827,11 @@ async function finishToolRound(
 	const outcomes = await runtime.outcomes(tools, context);
 	tools.forEach((id, index) => {
 		const outcome = outcomes[index]!;
-		controls.set(id, outcome.status === "completed" ? outcome.result.control : undefined);
+		// A generation owns model-issued calls only.
+		controls.set(
+			id,
+			outcome.status === "completed" && outcome.result.kind === "model" ? outcome.result.control : undefined,
+		);
 	});
 	const slots = (await runtime.snapshot(LiveDoc, conversationId, context))?.tools ?? [];
 	const results = slots.flatMap((slot) => (slot.entry === undefined ? [] : [slot.entry]));
@@ -860,6 +865,7 @@ async function finishToolRound(
 				if (users.length > 0) await startRun(tx, conversationId, live, users);
 			} else {
 				delete live.tools;
+				delete live.nestedTools;
 				if (live.run?.taskId === runtime.taskId) live.run.inputs.push(...users);
 				handOver(live, runtime.taskId, await createGeneration(tx, conversationId));
 			}

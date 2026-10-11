@@ -11,8 +11,6 @@ import {
 	type HarnessOptions,
 	InboxDoc,
 	type Storage,
-	StorageRejected,
-	type StorageWrite,
 	type SubmissionId,
 	type TaskId,
 	UserEntry,
@@ -21,29 +19,18 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { allEntries, chatSetup } from "./chat-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
 import { ControlledStorage, context } from "./session-support.ts";
 
 const sessions: Harness[] = [];
+const persistentFixtures: Awaited<ReturnType<typeof createPersistentStorage>>[] = [];
 const directories: string[] = [];
 afterEach(async () => {
 	const results = await Promise.allSettled(sessions.splice(0).map((session) => session.close(context)));
+	await Promise.all(persistentFixtures.splice(0).map((fixture) => fixture.close()));
 	await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 	for (const result of results) if (result.status === "rejected") throw result.reason;
 });
-class RejectRevisionStorage extends ControlledStorage {
-	failure: StorageRejected | undefined;
-	override commit(writes: readonly StorageWrite[], context: Parameters<Storage["commit"]>[1]) {
-		if (
-			this.failure &&
-			writes.some((write) => write.type === "entry" && write.value.kind === "test.authorized-edit")
-		) {
-			const error = this.failure;
-			this.failure = undefined;
-			return Promise.reject(error);
-		}
-		return super.commit(writes, context);
-	}
-}
 const Original = defineDoc<{
 	source: { id: SubmissionId; author: string; content: string }[];
 	reads: { id: SubmissionId; entry: EntryId }[];
@@ -70,7 +57,7 @@ const ReadAck = defineTask<{ entry: EntryId }, { phase: "ack" }, null>({
 	},
 	abort: async () => {},
 });
-async function fixture(storage = new ControlledStorage(), prepareCommit?: HarnessOptions["prepareCommit"]) {
+async function fixture(storage: Storage = new ControlledStorage(), prepareCommit?: HarnessOptions["prepareCommit"]) {
 	const setup = chatSetup();
 	setup.faux.setResponses([fauxAssistantMessage("first answer"), fauxAssistantMessage("second answer")]);
 	setup.registry.install(defineExtension({ name: "read-ack", tasks: [ReadAck] }));
@@ -205,18 +192,25 @@ describe("native queued input correction", () => {
 		await expect(
 			f.root.commit((tx) => tx.reviseQueuedInput(write.id, { kind: "replace", content: "invalid" }), context),
 		).rejects.toThrow("is not an input");
-		expect(await write.abort(context)).toBe("aborted");
+		expect(await write.abort(context)).toBe("settled");
+		expect(await write.status(context)).toMatchObject({ status: "done" });
 		expect(
 			await f.root.commit((tx) => tx.reviseQueuedInput(999 as SubmissionId, { kind: "withdraw" }), context),
 		).toBe("not_found");
 	});
 	it("rolls back queued correction, audit and derived work with the original storage rejection", async () => {
-		const storage = new RejectRevisionStorage();
-		const f = await fixture(storage);
+		const persisted = await createPersistentStorage();
+		persistentFixtures.push(persisted);
+		const storage = persisted.storage;
+		let f = await fixture(storage);
 		await f.submit("first", "first");
 		const queued = await f.submit("second", "original");
-		const failure = new StorageRejected("revision rejected");
-		storage.failure = failure;
+		const failure = new Error("revision rejected");
+		storage.rejectCommit((writes) =>
+			writes.some((write) => write.type === "entry" && write.value.kind === "test.authorized-edit")
+				? failure
+				: undefined,
+		);
 		let taskId: TaskId | undefined;
 		await expect(
 			f.root.commit(async (tx) => {
@@ -232,12 +226,14 @@ describe("native queued input correction", () => {
 				);
 			}, context),
 		).rejects.toBe(failure);
+		expect(await f.harness.closed).toEqual({ reason: "failed", error: failure });
+		f = await fixture(await persisted.reopen());
 		expect((await f.harness.snapshot(InboxDoc, f.root.id, context))?.items).toMatchObject([
 			{ id: queued.id, content: "original" },
 		]);
 		expect((await allEntries(f.root)).some((entry) => entry.kind === "test.authorized-edit")).toBe(false);
 		expect(await f.harness.getTask(taskId!, context)).toBeUndefined();
-		expect((await queued.status(context)).status).toBe("queued");
+		expect((await (await f.harness.submission(queued.id, context))!.status(context)).status).toBe("queued");
 	});
 	it("makes staged native submission placement, UserEntry and read-ack task one atomic batch with a frozen final record", async () => {
 		const storage = new ControlledStorage();

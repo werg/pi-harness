@@ -10,7 +10,7 @@ export {
 	ToolResultEntry,
 	UserEntry,
 } from "./entries.ts";
-export { ConversationBusy, ReadAfterWrite, StorageRejected } from "./errors.ts";
+export { ConversationBusy, ReadAfterWrite, SessionFailed, StorageRequestError } from "./errors.ts";
 export {
 	AgentDoc,
 	configure,
@@ -30,6 +30,7 @@ export {
 	type AgentEventStream,
 	type MessageChange,
 	type SnapshotEvent,
+	type ToolEventCall,
 	watchEvents,
 } from "./harness/events.ts";
 export {
@@ -47,6 +48,8 @@ export {
 	type CompactionStatus,
 	LiveDoc,
 	type LiveState,
+	type NestedToolSlot,
+	type NestedToolSummary,
 	ReceiptDoc,
 	type ToolSlot,
 	WakeDoc,
@@ -58,6 +61,8 @@ export type { TaskGraph, TaskGraphNode, TaskGraphState, TaskGraphWatch } from ".
 export {
 	createDirectToolTask,
 	type DirectToolCall,
+	NestedCallDoc,
+	type NestedCallState,
 	ToolProgressDoc,
 	ToolTask,
 	type ToolTaskCheckpoint,
@@ -99,6 +104,7 @@ export type {
 	HookRegistration,
 	HookResult,
 	HooksOf,
+	InputEntry,
 	InputSubmissionDraft,
 	ModelRef,
 	ModelRequestApi,
@@ -109,6 +115,7 @@ export type {
 	ModelRequestResult,
 	ModelRequestTarget,
 	ModelRequestWait,
+	NestedToolExecutionResult,
 	ProgressPolicy,
 	PromptInput,
 	PromptSection,
@@ -129,6 +136,7 @@ export type {
 	ToolExecutionMode,
 	ToolExecutionResult,
 	ToolExecutionWait,
+	ToolHookCall,
 	ToolHooks,
 	ToolRegistration,
 	UserInput,
@@ -194,6 +202,7 @@ export type {
 	Session,
 	SessionDocFamilyToken,
 	SessionDocToken,
+	SessionEnd,
 	Storage,
 	StorageWrite,
 	StoredDocument,

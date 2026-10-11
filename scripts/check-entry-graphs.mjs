@@ -47,7 +47,8 @@ const BUDGETS = {
 			// Knowledge-only history transfer and protected model preparation add two single-path native modules.
 			// Provider-session creation adds its document and pi-ai's lean UUID utility.
 			// Upstream 1.1.0 adds the shared storage/scan module for ordered cursors (upstream budget 62 -> 63).
-			maxFiles: 65,
+			// The incremental scheduler adds one dependency-free wake heap, replacing full task-map scans.
+			maxFiles: 66,
 			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
 		},
 	},

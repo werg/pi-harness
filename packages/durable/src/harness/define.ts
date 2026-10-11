@@ -63,6 +63,11 @@ export function bindTool(tool: ToolRegistration, mode: ToolExecutionMode): ToolB
 			version,
 			// Bind the JSON schema sent to the provider, excluding TypeBox symbol metadata.
 			parameters: JSON.parse(JSON.stringify(tool.parameters)) as JsonValue,
+			structuredOutputSchema:
+				tool.structuredOutputSchema === undefined
+					? null
+					: (JSON.parse(JSON.stringify(tool.structuredOutputSchema)) as JsonValue),
+			callers: tool.callers ?? null,
 			replay: tool.replay ?? "unsafe",
 			cancel: tool.cancel !== undefined,
 			executionMode: tool.executionMode ?? null,

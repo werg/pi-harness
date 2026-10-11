@@ -15,7 +15,6 @@ import {
 	LiveDoc,
 	ReceiptDoc,
 	ResetEntry,
-	StorageRejected,
 	SystemEntry,
 	UsageDoc,
 } from "@earendil-works/pi-durable";
@@ -23,6 +22,7 @@ import { describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { allEntries, chatSetup, openChat, unanswered } from "./chat-support.ts";
 import { assistant, openHarness, system, toolResult, user } from "./harness-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
 import { ControlledStorage, context } from "./session-support.ts";
 
 const Work = defineTask<null, { phase: "parked" }, null>({
@@ -420,8 +420,9 @@ describe("knowledge-only conversation transfer", () => {
 
 	it("rolls back the entire imported candidate on original init failure or deterministic storage rejection", async () => {
 		const source = await openHarness(new ControlledStorage());
-		const storage = new ControlledStorage();
-		const receiver = await openHarness(storage);
+		const persisted = await createPersistentStorage();
+		const storage = persisted.storage;
+		let receiver = await openHarness(storage);
 		try {
 			const root = await source.harness.root(context);
 			const entry = await root.commit(
@@ -447,7 +448,7 @@ describe("knowledge-only conversation transfer", () => {
 			).rejects.toBe(failure);
 			expect(storage.commits).toHaveLength(before);
 			expect(await receiver.harness.conversation(failedId!, context)).toBeUndefined();
-			const rejected = new StorageRejected("import rejected");
+			const rejected = new Error("import rejected");
 			storage.failNextCommit(rejected);
 			await expect(
 				receiver.harness.importHistory(
@@ -461,12 +462,15 @@ describe("knowledge-only conversation transfer", () => {
 					context,
 				),
 			).rejects.toBe(rejected);
+			expect(await receiver.harness.closed).toEqual({ reason: "failed", error: rejected });
+			receiver = await openHarness(await persisted.reopen());
 			expect(await receiver.harness.conversation(failedId!, context)).toBeUndefined();
 			const imported = await receiver.harness.importHistory(history, { ownership: { kind: "ownerless" } }, context);
 			expect((await imported.context(context)).messages).toEqual([user("knowledge")]);
 		} finally {
 			await source.harness.close(context);
 			await receiver.harness.close(context);
+			await persisted.close();
 		}
 	});
 

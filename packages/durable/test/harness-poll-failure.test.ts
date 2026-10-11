@@ -7,22 +7,24 @@ import {
 	Harness,
 	LiveDoc,
 	type ModelRequestPort,
-	StorageRejected,
-	type StorageWrite,
 	type TaskId,
 	UsageDoc,
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { chatSetup } from "./chat-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
 import { ControlledStorage, context } from "./session-support.ts";
 
 const harnesses = new Set<Harness>();
 const directories = new Set<string>();
+const persistent = new Set<Awaited<ReturnType<typeof createPersistentStorage>>>();
 
 afterEach(async () => {
 	const closed = await Promise.allSettled([...harnesses].map((harness) => harness.close(context)));
 	harnesses.clear();
+	await Promise.all([...persistent].map((fixture) => fixture.close()));
+	persistent.clear();
 	await Promise.all([...directories].map((directory) => rm(directory, { recursive: true, force: true })));
 	directories.clear();
 	for (const result of closed) if (result.status === "rejected") throw result.reason;
@@ -80,13 +82,12 @@ describe("deferred polling retains operation ownership", () => {
 	});
 
 	it("seals dispatch and rolls back poll evidence when recording the retained failure is rejected", async () => {
-		const rejection = new StorageRejected("failure transaction refused");
-		const storage = new (class extends ControlledStorage {
-			override async commit(writes: readonly StorageWrite[], ctx: typeof context) {
-				if (writes.some((write) => write.type === "entry" && write.value.kind === "pi.failure")) throw rejection;
-				return super.commit(writes, ctx);
-			}
-		})();
+		const rejection = new Error("failure transaction refused");
+		const database = await createPersistentStorage();
+		persistent.add(database);
+		database.storage.rejectCommit((writes) =>
+			writes.some((write) => write.type === "entry" && write.value.kind === "pi.failure") ? rejection : undefined,
+		);
 		const setup = chatSetup({ deferred: { pollAfterMs: 60_000 } });
 		setup.settings.stream = { deferred: true };
 		setup.faux.setResponses([fauxAssistantMessage("unused remote answer")]);
@@ -97,8 +98,8 @@ describe("deferred polling retains operation ownership", () => {
 			polls++;
 			return { ...message, usage: { ...message.usage, input: 5, totalTokens: 5 } };
 		};
-		const harness = await Harness.open(
-			storage,
+		let harness = await Harness.open(
+			database.storage,
 			{
 				models: setup.models,
 				registry: setup.registry,
@@ -108,27 +109,40 @@ describe("deferred polling retains operation ownership", () => {
 			context,
 		);
 		harnesses.add(harness);
-		const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+		let root = await harness.root(context, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
 		const submission = await root.submit({ type: "input", content: "start remote work" }, context);
 		await harness.runPass(context);
 		const taskId = (await harness.snapshot(LiveDoc, root.id, context))!.run!.taskId;
 		now = 61_000;
 		await expect(harness.runPass(context)).rejects.toMatchObject({
-			errors: [expect.objectContaining({ message: "503 poll unavailable" }), rejection],
+			cause: rejection,
 		});
+		expect(await harness.closed).toEqual({ reason: "failed", error: rejection });
+		await expect(harness.runPass(context)).rejects.toMatchObject({ cause: rejection });
+		harness = await Harness.open(
+			await database.reopen(),
+			{
+				models: setup.models,
+				registry: setup.registry,
+				settings: setup.settings,
+				now: () => now,
+			},
+			context,
+		);
+		harnesses.add(harness);
+		root = (await harness.conversation(root.id, context))!;
 		expect(await harness.getTask(taskId, context)).toMatchObject({
-			state: { status: "running", checkpoint: { phase: "poll" } },
+			state: { status: "pending", checkpoint: { phase: "poll" } },
 		});
-		expect(await submission.status(context)).toMatchObject({ status: "placed" });
+		expect(await (await harness.submission(submission.id, context))!.status(context)).toMatchObject({
+			status: "placed",
+		});
 		expect(
 			(await root.entries({}, 100, undefined, context)).items.some(
 				(entry) => entry.kind === "pi.failure" || entry.kind === "pi.assistant",
 			),
 		).toBe(false);
 		expect((await harness.snapshot(UsageDoc, root.id, context))?.models["faux/faux-1"]?.input ?? 0).toBe(0);
-		await expect(harness.runPass(context)).rejects.toMatchObject({
-			errors: [expect.objectContaining({ message: "503 poll unavailable" }), rejection],
-		});
 		expect(polls).toBe(1);
 	});
 

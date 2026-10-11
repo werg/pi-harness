@@ -17,19 +17,21 @@ import {
 	MemoryStorage,
 	type ModelRequestTarget,
 	type Storage,
-	StorageRejected,
 	ToolProgressDoc,
 	ToolTask,
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { allEntries, chatSetup } from "./chat-support.ts";
-import { ControlledStorage, context } from "./session-support.ts";
+import { createPersistentStorage } from "./persistent-storage-support.ts";
+import { context } from "./session-support.ts";
 
 const sessions: Harness[] = [];
+const persistentFixtures: Awaited<ReturnType<typeof createPersistentStorage>>[] = [];
 const directories: string[] = [];
 afterEach(async () => {
 	await Promise.all(sessions.splice(0).map((session) => session.close(context)));
+	await Promise.all(persistentFixtures.splice(0).map((fixture) => fixture.close()));
 	await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -59,7 +61,7 @@ describe("genuine direct native tool invocation", () => {
 		const id = await root.invokeTool({ id: "utf8:one", name: tool.name, arguments: {} }, context);
 		await harness.waitForTask(id, context);
 		expect((await allEntries(root)).filter(DirectToolResultEntry.is)).toMatchObject([
-			{ data: { result: { content: [{ type: "text", text: "€" }], details: { phase: "complete" } } } },
+			{ data: { result: { output: [{ type: "text", text: "€" }], details: { phase: "complete" } } } },
 		]);
 	});
 	it("retains direct execution definitions while incapable model rounds pin no tool offerings", async () => {
@@ -73,7 +75,7 @@ describe("genuine direct native tool invocation", () => {
 			parameters: Type.Object({}),
 			execute: async () => {
 				dispatches++;
-				return { content: [] };
+				return { output: [] };
 			},
 		});
 		setup.registry.install(defineExtension({ name: "direct", tools: [tool] }));
@@ -125,7 +127,7 @@ describe("genuine direct native tool invocation", () => {
 			parameters: Type.Object({ value: Type.String() }),
 			execute: async (args, api) => {
 				observed.push({ args, callId: api.callId, taskId: api.taskId });
-				return { content: [{ type: "text" as const, text: args.value }], details: { value: args.value } };
+				return { output: [{ type: "text" as const, text: args.value }], details: { value: args.value } };
 			},
 		});
 		setup.registry.install(
@@ -169,7 +171,8 @@ describe("genuine direct native tool invocation", () => {
 
 	it("atomically binds product state, the original source and the actual task; rejection dispatches nothing", async () => {
 		const setup = chatSetup();
-		const storage = new ControlledStorage();
+		const persisted = await createPersistentStorage();
+		const storage = persisted.storage;
 		let dispatches = 0;
 		const tool = defineTool({
 			name: "eval",
@@ -177,13 +180,13 @@ describe("genuine direct native tool invocation", () => {
 			parameters: Type.Object({}),
 			execute: async () => {
 				dispatches++;
-				return { content: [] };
+				return { output: [] };
 			},
 		});
 		setup.registry.install(defineExtension({ name: "direct", tools: [tool] }));
-		const harness = await Harness.open(storage, setup, context);
+		let harness = await Harness.open(storage, setup, context);
 		sessions.push(harness);
-		const root = await harness.root(context, { agent: { tools: [tool] } });
+		let root = await harness.root(context, { agent: { tools: [tool] } });
 		const Product = defineDoc<{ taskId: number | null }>({
 			kind: "test.direct-product",
 			version: 1,
@@ -192,7 +195,8 @@ describe("genuine direct native tool invocation", () => {
 			fork: "initial",
 			initial: () => ({ taskId: null }),
 		});
-		const error = new StorageRejected("actual direct admission rejected");
+		persistentFixtures.push(persisted);
+		const error = new Error("actual direct admission rejected");
 		storage.failNextCommit(error);
 		const admit = () =>
 			root.commit(async (tx) => {
@@ -207,6 +211,10 @@ describe("genuine direct native tool invocation", () => {
 				return id;
 			}, context);
 		await expect(admit()).rejects.toBe(error);
+		expect(await harness.closed).toEqual({ reason: "failed", error });
+		harness = await Harness.open(await persisted.reopen(), setup, context);
+		sessions.push(harness);
+		root = (await harness.conversation(root.id, context))!;
 		expect(await allEntries(root)).toEqual([]);
 		expect(await harness.snapshot(Product, root.id, context)).toBeUndefined();
 		expect(dispatches).toBe(0);
@@ -225,7 +233,7 @@ describe("genuine direct native tool invocation", () => {
 			parameters: Type.Object({ value: Type.String() }),
 			execute: async () => {
 				dispatches++;
-				return { content: [] };
+				return { output: [] };
 			},
 		});
 		setup.registry.install(defineExtension({ name: "direct", tools: [tool] }));
@@ -275,7 +283,7 @@ describe("genuine direct native tool invocation", () => {
 				identities.push({ taskId: api.taskId, callId: api.callId, args, data: api.executionData });
 				cancels++;
 				if (!repaired) throw cleanup;
-				return { content: [] };
+				return { output: [] };
 			},
 		});
 		setup.registry.install(defineExtension({ name: "direct", tools: [tool] }));

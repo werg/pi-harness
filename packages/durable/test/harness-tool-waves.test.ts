@@ -49,13 +49,13 @@ async function fixture() {
 					if (api.continuation !== undefined) {
 						const result = await api.snapshot(ReceiptDoc, key, ctx);
 						expect(result?.result).toEqual({ done: name });
-						return { content: [{ type: "text", text: name }] };
+						return { output: [{ type: "text", text: name }] };
 					}
 					await api.commit((tx) => bindReceipt(tx, key, "test-owner"), ctx);
 					admitted.push(name);
 					return { wait: { kind: "receipt", key, binding: "test-owner" }, continuation: name };
 				},
-				cancel: async () => ({ content: [{ type: "text", text: "cancelled" }] }),
+				cancel: async () => ({ output: [{ type: "text", text: "cancelled" }] }),
 			}),
 		);
 	}

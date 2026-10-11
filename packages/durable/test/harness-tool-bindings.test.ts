@@ -52,7 +52,7 @@ async function fixture() {
 		},
 		cancel: async () => {
 			cancellations++;
-			return { content: [] };
+			return { output: [] };
 		},
 	});
 	const changed: ToolRegistration = {
@@ -60,11 +60,11 @@ async function fixture() {
 		version: 2,
 		execute: async () => {
 			changedCalls++;
-			return { content: [] };
+			return { output: [] };
 		},
 		cancel: async () => {
 			changedCalls++;
-			return { content: [] };
+			return { output: [] };
 		},
 	};
 	addTool(setup.registry, original);

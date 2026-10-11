@@ -110,6 +110,65 @@ async function open(
 }
 
 describe("durable dormant scheduling", () => {
+	it("projects an unrelated commit without visiting ordinary live task records", async () => {
+		const harness = await open(await database());
+		const root = await harness.root(context);
+		await root.commit(async (tx) => {
+			for (let n = 0; n < 1000; n++)
+				await tx.createTask(Timed, { until: n + 1000 }, { ownership: { kind: "conversation" } });
+		}, context);
+		await harness.snapshot(WakeDoc, context);
+		let visited = 0;
+		const values = Map.prototype.values;
+		const counted = function* (this: Map<unknown, unknown>) {
+			for (const value of values.call(this)) {
+				if (typeof value === "object" && value !== null && "kind" in value && value.kind === Timed.definition.name)
+					visited++;
+				yield value;
+			}
+		};
+		Map.prototype.values = counted as typeof values;
+		try {
+			await root.commit((tx) => tx.appendEntry(root.id, { kind: "unrelated" }), context);
+		} finally {
+			Map.prototype.values = values;
+		}
+		expect(visited).toBeLessThan(10);
+		expect((await harness.snapshot(WakeDoc, context))?.wakeAt).toBe(0);
+	});
+
+	it("leaves unrelated suspended receipt tasks parked during projection and reservation", async () => {
+		const harness = await open(await database());
+		const root = await harness.root(context);
+		await root.commit(async (tx) => {
+			for (let n = 0; n < 64; n++)
+				await tx.createTask(
+					External,
+					{ key: `parked-${n}`, binding: "owned" },
+					{ ownership: { kind: "conversation" } },
+				);
+		}, context);
+		await harness.runPass(context);
+		expect((await harness.snapshot(WakeDoc, context))?.wakeAt).toBeNull();
+		let visited = 0;
+		const iterator = Set.prototype[Symbol.iterator];
+		const counted = function* (this: Set<unknown>) {
+			for (const value of iterator.call(this)) {
+				if (typeof value === "number") visited++;
+				yield value;
+			}
+		};
+		Set.prototype[Symbol.iterator] = counted as typeof iterator;
+		try {
+			await root.commit((tx) => tx.appendEntry(root.id, { kind: "unrelated" }), context);
+			await harness.flushWake(context);
+		} finally {
+			Set.prototype[Symbol.iterator] = iterator;
+		}
+		expect(visited).toBeLessThan(10);
+		expect((await harness.snapshot(WakeDoc, context))?.wakeAt).toBeNull();
+	});
+
 	it.each([1000, 2_147_484_747])("keeps an early resident timer armed until its deadline %i", async (until) => {
 		const timers: { fire: () => void; handle: ReturnType<typeof setTimeout> }[] = [];
 		const expectedDelay = Math.min(2_147_483_647, until - 100);
@@ -440,7 +499,7 @@ describe("durable dormant scheduling", () => {
 				expect(api.continuation).toBe(key);
 				return { details: receipt?.result };
 			},
-			cancel: async () => ({ content: [] }),
+			cancel: async () => ({ output: [] }),
 		});
 		const registry = createRegistry();
 		registry.install(defineExtension({ name: "external", tools: [tool] }));
