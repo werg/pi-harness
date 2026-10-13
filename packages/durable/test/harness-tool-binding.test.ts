@@ -1,6 +1,6 @@
 import { Type } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { bindTool, toolMatches } from "../src/harness/define.ts";
+import { bindTool, toolMatches } from "../src/harness/binding.ts";
 import type { ToolRegistration } from "../src/harness/types.ts";
 
 const tool: ToolRegistration = {

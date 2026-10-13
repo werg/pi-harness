@@ -62,7 +62,7 @@ function section(key: string, render: PromptSection<ToolRegistration>["render"],
 
 const input: PromptInput<ToolRegistration> = {
 	conversationId: 1 as never,
-	agent: { thinkingLevel: "off", stream: {}, extensions: [], tools: [], callable: [], sections: [] },
+	agent: { thinkingLevel: "off", stream: {}, extensions: [], tools: [], callable: [], deferred: [], sections: [] },
 	env: undefined,
 	shown: {},
 	read: { snapshot: async () => undefined, snapshotAsOf: async () => undefined },

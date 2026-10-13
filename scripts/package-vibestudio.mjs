@@ -8,10 +8,11 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(process.argv[2] ?? join(root, ".artifacts/vibestudio"));
-const version = "1.1.0-vibestudio.2";
+const version = "1.2.0-vibestudio.1";
 const packages = [
 	["telemetry", "@earendil-works/pi-telemetry", "@panticonic/pi-telemetry"],
 	["chord", "@earendil-works/chord", "@panticonic/pi-chord"],
+	["codemode", "@earendil-works/pi-codemode", "@panticonic/pi-codemode"],
 	["ai", "@earendil-works/pi-ai", "@panticonic/pi-ai"],
 	["durable", "@earendil-works/pi-durable", "@panticonic/pi-durable"],
 ];
@@ -59,9 +60,11 @@ async function recordData(directory) {
 }
 await recordData(join(root, "packages/ai/src/providers/data"));
 inputs.sort((a, b) => a.path.localeCompare(b.path));
+const adoptedUpstream = JSON.parse(await readFile(join(root, "UPSTREAM-ADOPTIONS.json"), "utf8"));
 const source = {
-	upstreamCommit: run("git", ["rev-parse", "HEAD"]).trim(),
-	adoptedUpstream: JSON.parse(await readFile(join(root, "UPSTREAM-ADOPTIONS.json"), "utf8")),
+	forkCommit: run("git", ["rev-parse", "HEAD"]).trim(),
+	upstreamCommit: adoptedUpstream.reviewedMain,
+	adoptedUpstream,
 	inputDigest: sha256(JSON.stringify(inputs)),
 	inputs,
 	node: process.version,
@@ -90,6 +93,11 @@ for (const [directory, upstream, name] of packages) {
 		if ((await readdir(packageRoot)).includes("CHANGELOG.md")) {
 			await writeFile(join(stage, "CHANGELOG.md"), relocate(await readFile(join(packageRoot, "CHANGELOG.md"), "utf8")));
 			files.push("CHANGELOG.md");
+		}
+		for (const file of manifest.files ?? []) {
+			if (files.includes(file)) continue;
+			await cp(join(packageRoot, file), join(stage, file), { recursive: true });
+			files.push(file);
 		}
 		await cp(join(root, "LICENSE"), join(stage, "LICENSE"));
 		const dependencies = Object.fromEntries(Object.entries(manifest.dependencies ?? {}).map(([dependency, range]) => {

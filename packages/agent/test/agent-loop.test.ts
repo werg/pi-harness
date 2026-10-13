@@ -3,6 +3,7 @@ import {
 	createAssistantMessageEventStream,
 	type Message,
 	type Model,
+	type ToolResultMessage,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -395,6 +396,61 @@ describe("agentLoop with AgentMessage", () => {
 		const messages = await stream.result();
 		const toolResult = messages.find((message) => message.role === "toolResult");
 		expect(toolResult?.role === "toolResult" ? toolResult.usage : undefined).toEqual(patchedToolUsage);
+	});
+
+	// #10549
+	it("records how long execute() took on the tool result, excluding hooks", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				await sleep(30);
+				return { content: [{ type: "text", text: params.value }], details: { value: params.value } };
+			},
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			beforeToolCall: async ({ toolCall }) => {
+				await sleep(100);
+				return toolCall.id === "blocked" ? { block: true, reason: "no" } : undefined;
+			},
+		};
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex === 0
+						? createAssistantMessage(
+								[
+									{ type: "toolCall", id: "ran", name: "echo", arguments: { value: "a" } },
+									{ type: "toolCall", id: "blocked", name: "echo", arguments: { value: "b" } },
+								],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: callIndex === 0 ? "toolUse" : "stop", message });
+				callIndex++;
+			});
+			return stream;
+		};
+		const stream = agentLoop([createUserMessage("go")], { messages: [], tools: [tool] }, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// drain
+		}
+		const results = (await stream.result()).filter(
+			(message): message is ToolResultMessage => message.role === "toolResult",
+		);
+		const [ran, blocked] = results;
+		expect(ran?.durationMs).toBeGreaterThanOrEqual(25);
+		expect(ran?.durationMs).toBeLessThan(100);
+		expect(blocked?.isError).toBe(true);
+		expect(blocked).not.toHaveProperty("durationMs");
 	});
 
 	it("should not execute tool calls from a length-truncated assistant message", async () => {

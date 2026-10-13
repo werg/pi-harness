@@ -1,4 +1,5 @@
-import { copyJson, type JsonValue } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord";
+import { copyJson } from "@earendil-works/chord/json";
 import { defineDocFamily } from "../documents.ts";
 import type { JsonObject, Tx } from "../types.ts";
 import { jsonEqual, type PinnedModel, pinJson } from "./json.ts";

@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-12
+
+## [1.1.0] - 2026-10-07
+
+### Added
+
+- Added `durationMs` to tool result messages, `AgentToolCallOutcome`, and `tool_execution_end` events: how long `execute()` took, measured with a monotonic clock and excluding hooks. Calls that did not run have none ([#10549](https://github.com/earendil-works/pi/issues/10549))
+
+### Changed
+
+- `streamProxy()` returns an `AssistantMessageEventStream`, so proxied responses get `durationMs` like direct ones
+
+## [1.0.4] - 2026-10-05
+
+## [1.0.3] - 2026-10-05
+
+## [1.0.2] - 2026-10-04
+
+## [1.0.1] - 2026-10-03
+
+## [1.0.0] - 2026-10-01
+
+### Breaking Changes
+
+- Removed the experimental harness from `@earendil-works/pi-agent-core`: `AgentHarness`, sessions and session storage, the durable runtime, pico3, harness tools, compaction, skills, prompt templates, system prompt helpers, telemetry schemas, the search service types, and the `uuidv7` and pi-telemetry re-exports. The `./node`, `./harness/*`, and `./experimental/pico3` subpath exports are gone. The package now contains only `Agent`, the agent loop, the proxy stream, and their types. Use `@earendil-works/pi-durable` for durable sessions.
+
 ## [0.99.2] - 2026-09-30
 
 ## [0.99.1] - 2026-09-29

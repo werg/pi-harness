@@ -18,13 +18,14 @@ export {
 	DEFAULT_PROGRESS_POLICY,
 	DEFAULT_RETRY_POLICY,
 } from "./harness/agent.ts";
+export { bindTool } from "./harness/binding.ts";
 export {
 	type CompactionCheckpoint,
 	type CompactionInput,
 	CompactionTask,
 	type SummaryRequest,
 } from "./harness/compaction.ts";
-export { bindTool, defineExtension, defineTool, hook, section, wrapSection, wrapTool } from "./harness/define.ts";
+export { defineExtension, defineTool, hook, section, wrapSection, wrapTool } from "./harness/define.ts";
 export {
 	type AgentEvent,
 	type AgentEventStream,
@@ -45,6 +46,7 @@ export type { PinnedMessages, PinnedModel } from "./harness/json.ts";
 export {
 	acceptReceipt,
 	bindReceipt,
+	type CompactionFailure,
 	type CompactionStatus,
 	LiveDoc,
 	type LiveState,

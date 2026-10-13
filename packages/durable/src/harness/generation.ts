@@ -1,4 +1,5 @@
-import { type Context, copyJson, type Draft, type JsonValue } from "@earendil-works/chord";
+import type { Context, Draft, JsonValue } from "@earendil-works/chord";
+import { copyJson } from "@earendil-works/chord/json";
 import type {
 	Api,
 	AssistantMessage,
@@ -20,13 +21,14 @@ import type {
 	NextTaskState,
 	SubmissionId,
 	TaskId,
+	TaskOutcome,
 	TaskRuntime,
 	Tx,
 	TypedEntry,
 } from "../types.ts";
 import { addTools } from "./agent.ts";
+import { bindTool } from "./binding.ts";
 import { createCompaction, estimateContext, selectCut } from "./compaction.ts";
-import { bindTool } from "./define.ts";
 import { applyBoundary, prepareBoundary } from "./inbox.ts";
 import { assignJson, jsonEqual, type PinnedMessages, type PinnedModel, pinMessages, pinModel } from "./json.ts";
 import { endRun, LiveDoc, type LiveState, type ToolSlot } from "./live.ts";
@@ -72,6 +74,8 @@ export type GenerationCheckpoint =
 			compacted?: TaskId<CompactionResult>;
 			/** Error text of the overflow that started `compacted`; checked once when `prepare` resumes. */
 			overflow?: string;
+			/** Set when the blocking threshold started `compacted`; its outcome is checked once when `prepare` resumes. */
+			threshold?: true;
 	  }
 	| ({ phase: "bind" } & PreparedRequest)
 	| ({ phase: "request"; messages: PinnedMessages } & PreparedRequest)
@@ -135,11 +139,19 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 			const resolved = model === undefined ? undefined : runtime.models.getModel(model.provider, model.modelId);
 			if (model === undefined || resolved === undefined) return failNoModel(runtime, model, context);
 			const descriptor = pinModel(resolved);
-			const { attempt, compacted, overflow } = task.state.checkpoint;
+			const { attempt, compacted, overflow, threshold: blocked } = task.state.checkpoint;
 			if (compacted !== undefined && overflow !== undefined) {
 				const [outcome] = await runtime.outcomes([compacted], context);
 				if (outcome?.status !== "completed" || outcome.result.entryId === undefined) {
 					return failModelError(runtime, overflow, context);
+				}
+			}
+			// A threshold compaction that found nothing to compact or was declined leaves a request that may still fit. One
+			// that failed left a context it judged too large: sending it would at best leave no room for the answer.
+			if (compacted !== undefined && blocked === true) {
+				const [outcome] = await runtime.outcomes([compacted], context);
+				if (outcome !== undefined && outcome.status !== "completed") {
+					return failModelError(runtime, compactionFailure(outcome), context);
 				}
 			}
 			const view = await runtime.context(conversationId, context);
@@ -171,7 +183,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				// Compact first and prepare again; the transcript is unchanged until the compaction appends.
 				await runtime.commit(async (tx): Promise<Next> => {
 					const child = await createCompaction(tx, conversationId, { reason: "threshold" }, runtime.taskId);
-					const checkpoint = { phase: "prepare", attempt, compacted: child } as const;
+					const checkpoint = { phase: "prepare", attempt, compacted: child, threshold: true } as const;
 					return {
 						status: "waiting",
 						checkpoint,
@@ -463,6 +475,19 @@ function thresholdCompaction(
 		tokens > blocking ? "blocking" : policy.backgroundTokens > 0 && tokens > background ? "background" : undefined;
 	if (over === undefined || selectCut(view, policy.keepRecentTokens) === undefined) return undefined;
 	return over;
+}
+
+/** Error text for a generation whose blocking compaction ended without completing. */
+function compactionFailure(outcome: Exclude<TaskOutcome<CompactionResult>, { status: "completed" }>): string {
+	switch (outcome.status) {
+		case "failed":
+		case "faulted":
+			return `Compaction failed: ${outcome.error.message}`;
+		case "orphaned":
+			return `Compaction failed: ${outcome.reason}`;
+		case "aborted":
+			return "Compaction was aborted";
+	}
 }
 
 /** Settle the run's inputs `unanswered` with `model_error` and fail with `text`. */

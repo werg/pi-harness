@@ -1,4 +1,5 @@
-import { copyJson, isJsonValue, type JsonRepresentation, type JsonValue } from "@earendil-works/chord";
+import type { JsonRepresentation, JsonValue } from "@earendil-works/chord";
+import { copyJson, isJsonValue } from "@earendil-works/chord/json";
 import type { Api, Message, Model } from "@earendil-works/pi-ai";
 import { errorMessage } from "../errors.ts";
 import type { TaskOutcomeError } from "../types.ts";

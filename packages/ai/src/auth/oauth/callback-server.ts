@@ -43,7 +43,13 @@ export interface OAuthCallbackServer<T> {
 }
 
 function sendPage(response: ServerResponse, status: number, html: string): void {
-	response.writeHead(status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+	// This listener belongs to one sign-in and is closed as soon as its wait settles.
+	// A pooled connection must not survive into another sign-in on the same port.
+	response.writeHead(status, {
+		"content-type": "text/html; charset=utf-8",
+		"cache-control": "no-store",
+		connection: "close",
+	});
 	response.end(html);
 }
 

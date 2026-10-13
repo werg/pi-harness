@@ -148,23 +148,34 @@ describe("Radius OAuth", () => {
 
 		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
 		const login = async () => {
-			let callbackPage: Promise<Response> | undefined;
+			const controller = new AbortController();
+			let callbackPage: Promise<{ response: Response } | { error: unknown }> | undefined;
 			const result = oauth.login({
 				...interaction("browser"),
+				signal: controller.signal,
 				notify: (event) => {
 					if (event.type !== "auth_url") return;
 					const authorize = new URL(event.url);
 					const callback = new URL(authorize.searchParams.get("redirect_uri") ?? "");
 					callback.searchParams.set("code", "browser-code");
 					callback.searchParams.set("state", authorize.searchParams.get("state") ?? "");
-					callbackPage = nativeFetch(callback);
+					callbackPage = nativeFetch(callback, { signal: controller.signal }).then(
+						(response) => ({ response }),
+						(error: unknown) => {
+							controller.abort(error);
+							return { error };
+						},
+					);
 				},
 			});
 			const outcome = await result.then(
 				(credential) => ({ credential }),
 				(error: Error) => ({ error }),
 			);
-			const response = await callbackPage;
+			const pageResult = await callbackPage;
+			if (!pageResult) throw new Error("Browser authorization did not publish a callback URL");
+			if ("error" in pageResult) throw pageResult.error;
+			const response = pageResult.response;
 			return { ...outcome, status: response?.status, page: await response?.text() };
 		};
 

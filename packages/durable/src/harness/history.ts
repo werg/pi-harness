@@ -1,4 +1,5 @@
-import { type Context, copyJson, type JsonValue } from "@earendil-works/chord";
+import type { Context, JsonValue } from "@earendil-works/chord";
+import { copyJson } from "@earendil-works/chord/json";
 import { materializeDocumentValue } from "../documents.ts";
 import { SystemEntry } from "../entries.ts";
 import type { SessionImpl } from "../session/session.ts";

@@ -1,5 +1,6 @@
-import { type AttachedReplicatedState, type Context, copyJson, type JsonValue } from "@earendil-works/chord";
+import type { AttachedReplicatedState, Context, JsonValue } from "@earendil-works/chord";
 import { withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
+import { copyJson } from "@earendil-works/chord/json";
 import { ResetEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
 import { contained, SessionImpl } from "../session/session.ts";
@@ -21,9 +22,9 @@ import type {
 } from "../types.ts";
 import { ROOT_CONVERSATION_ID } from "../types.ts";
 import { AgentDoc, configure, createAgent, resolveAgent, resolveSettings } from "./agent.ts";
+import { bindTool } from "./binding.ts";
 import { createCompaction } from "./compaction.ts";
 import { readContext } from "./context.ts";
-import { bindTool } from "./define.ts";
 import { startRun } from "./generation.ts";
 import { exportConversationHistory, importConversationHistory, prepareConversationHistory } from "./history.ts";
 import { applyBoundary, InboxDoc, prepareBoundary, withdrawQueuedInputs } from "./inbox.ts";

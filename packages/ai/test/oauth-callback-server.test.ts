@@ -71,6 +71,9 @@ describe.sequential("OAuth callback server", () => {
 		expect(success).toMatchObject({ status: 200, contentType: "text/html; charset=utf-8" });
 		expect(success.body).toContain("Authentication successful");
 		expect(success.body).toContain("Signed in to Example.");
+		expect(success.body).toContain('fill="#F09082"');
+		expect(success.body).toContain('fill="#4D9ABF"');
+		expect(success.body).toContain('fill="#F1BE58"');
 		await expect(server.wait()).resolves.toBe("completed:the-code");
 	});
 
@@ -80,6 +83,22 @@ describe.sequential("OAuth callback server", () => {
 		const response = await nativeFetch(callbackUrl(server.redirectUri, { code: "no-state" }));
 		expect(response.status).toBe(200);
 		await expect(server.wait()).resolves.toBe("completed:no-state");
+	});
+
+	it("retires callback connections before another sign-in uses the same port", async () => {
+		let server = await start<string>();
+		const port = Number(new URL(server.redirectUri).port);
+		for (const code of ["first", "second"]) {
+			if (code === "second") server = await start<string>({ port });
+			const callbackPage = nativeFetch(callbackUrl(server.redirectUri, { code, state: "expected-state" }));
+			// Match provider ownership: retire the listener immediately when completion settles.
+			const completion = server.wait().finally(() => server.close());
+			const [value, response] = await Promise.all([completion, callbackPage]);
+			expect(value).toBe(`completed:${code}`);
+			expect(response.headers.get("connection")).toBe("close");
+			expect(response.status).toBe(200);
+			await response.text();
+		}
 	});
 
 	it("shows completion failures on the page and rejects the wait", async () => {

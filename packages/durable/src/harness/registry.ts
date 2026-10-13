@@ -1,6 +1,6 @@
 import { INSTRUCTIONS_KEY } from "./agent.ts";
+import { bindTool } from "./binding.ts";
 import { CompactionTask } from "./compaction.ts";
-import { bindTool } from "./define.ts";
 import { GenerationTask } from "./generation.ts";
 import { ToolTask } from "./tool.ts";
 import type { AnyTask, Extension, PromptSection, Registry, RegistrySnapshot, ToolRegistration } from "./types.ts";

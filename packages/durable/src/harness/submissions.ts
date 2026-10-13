@@ -1,4 +1,5 @@
-import { type Context, copyJson, type JsonRepresentation } from "@earendil-works/chord";
+import type { Context, JsonRepresentation } from "@earendil-works/chord";
+import { copyJson } from "@earendil-works/chord/json";
 import { ConversationBusy } from "../errors.ts";
 import type { SessionImpl } from "../session/session.ts";
 import type {

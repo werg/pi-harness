@@ -1,4 +1,5 @@
-import { copyJson, type Draft, type JsonRepresentation } from "@earendil-works/chord";
+import type { Draft, JsonRepresentation } from "@earendil-works/chord";
+import { copyJson } from "@earendil-works/chord/json";
 import type { Usage } from "@earendil-works/pi-ai";
 import { defineDoc } from "../documents.ts";
 import type { ConversationId, Tx } from "../types.ts";
