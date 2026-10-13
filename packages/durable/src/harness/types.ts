@@ -885,6 +885,12 @@ export interface Conversation {
 	 */
 	flush(context: Context): Promise<void>;
 	/**
+	 * Supersede exactly this generation and join its owned work, then prepare a new generation from current settings
+	 * for the same admitted inputs. No input or transcript message is manufactured. A queued reset or explicit abort
+	 * takes precedence. Returns false when the named generation no longer owns the run or is already cancelling.
+	 */
+	reprepare(taskId: TaskId, context: Context): Promise<boolean>;
+	/**
 	 * Resolve when the ordinary ownership scope has no live non-background task: this conversation and the conversations
 	 * owned, transitively, by its non-background tasks.
 	 */

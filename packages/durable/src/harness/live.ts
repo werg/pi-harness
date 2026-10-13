@@ -88,7 +88,7 @@ export type LiveState = {
 		inputs: SubmissionId[];
 		requestSelection?: GenerationRetrySelection;
 		/** Admitted intervention, consumed only after the old invocation and its tools have joined. */
-		interruption?: { kind: "flush" };
+		interruption?: { kind: "flush" | "reprepare" };
 	};
 	/** Presentation of the current generation attempt. */
 	generation?: {

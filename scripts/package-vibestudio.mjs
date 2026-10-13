@@ -31,7 +31,7 @@ async function relocateTree(directory) {
 	for (const entry of await readdir(directory, { withFileTypes: true })) {
 		const path = join(directory, entry.name);
 		if (entry.isDirectory()) await relocateTree(path);
-		else if (entry.isFile() && /\.(?:js|ts|map|json)$/.test(entry.name)) {
+		else if (entry.isFile() && /\.(?:js|ts|map|json|md)$/.test(entry.name)) {
 			const text = await readFile(path, "utf8");
 			await writeFile(path, relocate(text));
 		}
@@ -88,10 +88,9 @@ for (const [directory, upstream, name] of packages) {
 	try {
 		const files = ["dist", "README.md", "LICENSE", "SOURCE.json"];
 		await cp(join(packageRoot, "dist"), join(stage, "dist"), { recursive: true });
-		await relocateTree(join(stage, "dist"));
-		await writeFile(join(stage, "README.md"), relocate(await readFile(join(packageRoot, "README.md"), "utf8")));
+		await cp(join(packageRoot, "README.md"), join(stage, "README.md"));
 		if ((await readdir(packageRoot)).includes("CHANGELOG.md")) {
-			await writeFile(join(stage, "CHANGELOG.md"), relocate(await readFile(join(packageRoot, "CHANGELOG.md"), "utf8")));
+			await cp(join(packageRoot, "CHANGELOG.md"), join(stage, "CHANGELOG.md"));
 			files.push("CHANGELOG.md");
 		}
 		for (const file of manifest.files ?? []) {
@@ -100,6 +99,7 @@ for (const [directory, upstream, name] of packages) {
 			files.push(file);
 		}
 		await cp(join(root, "LICENSE"), join(stage, "LICENSE"));
+		await relocateTree(stage);
 		const dependencies = Object.fromEntries(Object.entries(manifest.dependencies ?? {}).map(([dependency, range]) => {
 			const fork = packages.find(([, original]) => original === dependency);
 			return fork ? [fork[2], version] : [dependency, range];

@@ -422,6 +422,8 @@ await root.submit({ type: "write", entry: { kind: "app.note", data: "user opened
 
 If a run fails, queued items stay in the inbox until the next input or queued write places them, oldest first.
 
+`await root.reprepare(expectedGenerationTaskId, context)` explicitly supersedes the current generation after changing its configuration, for example when a user selects another provider while credential setup is pending. It returns `false` if that exact generation is no longer current, has cancellation intent, or the run is executing tools. An admitted transition cancels and joins the old request before preparing a new generation from the same original inputs and current configuration. It appends no user message, leaves follow-ups queued, and does not alter the old request's immutable selection. An explicit Stop during cleanup wins and prevents the successor.
+
 An input is placed as a `pi.user` entry. To show it as something else, give it an `entry` with your kind and data; the model still sees `content` as the user message:
 
 ```typescript
@@ -588,7 +590,7 @@ pay: async (task, runtime, context) => {
 			payments.push(await tx.createTask(Payment, { card }, { ownership: { kind: "task", taskId: task.id } }));
 		}
 		// Resume in `decide` once every payment is done; the first failure aborts the rest.
-		return { status: "waiting", checkpoint: { phase: "decide", payments }, on: payments, policy: "failFast" };
+		return { status: "waiting", checkpoint: { phase: "decide", payments }, condition: { kind: "tasks", on: payments, policy: "failFast" } };
 	}, context);
 },
 decide: async (task, runtime, context) => {
@@ -617,7 +619,7 @@ graph.subscribe((value) => {
 });
 ```
 
-A task appears with the commit that creates it and leaves with the commit that makes it terminal. Statuses are the committed ones: `pending`, `running`, `waiting` (with `on` and `policy`), and `completing` (with the held outcome's status). After a restart, tasks that were `running` show as `pending` until they run again. Whether a pending task is blocked by a missing definition is not part of the graph; `harness.inspect()` reports that. The graph lists live tasks only: once a subagent's owner task is terminal, a later task in its conversation is a top-level node, and the conversation's `ConversationRecord.owner` (also in its view's `conversation`) links it to its parent. [`24-child-tasks.ts`](test/examples/24-child-tasks.ts) prints the checkout's tree while its payments run.
+A task appears with the commit that creates it and leaves with the commit that makes it terminal. Statuses are the committed ones: `pending`, `running`, `waiting` (with its durable `condition`), and `completing` (with the held outcome's status). After a restart, tasks that were `running` show as `pending` until they run again. Whether a pending task is blocked by a missing definition is not part of the graph; `harness.inspect()` reports that. The graph lists live tasks only: once a subagent's owner task is terminal, a later task in its conversation is a top-level node, and the conversation's `ConversationRecord.owner` (also in its view's `conversation`) links it to its parent. [`24-child-tasks.ts`](test/examples/24-child-tasks.ts) prints the checkout's tree while its payments run.
 
 ## Your Own State
 

@@ -25,7 +25,7 @@ import { AgentDoc, configure, createAgent, resolveAgent, resolveSettings } from 
 import { bindTool } from "./binding.ts";
 import { createCompaction } from "./compaction.ts";
 import { readContext } from "./context.ts";
-import { startRun } from "./generation.ts";
+import { GenerationTask, startRun } from "./generation.ts";
 import { exportConversationHistory, importConversationHistory, prepareConversationHistory } from "./history.ts";
 import { applyBoundary, InboxDoc, prepareBoundary, withdrawQueuedInputs } from "./inbox.ts";
 import { LiveDoc, settleSchedulerOutcome } from "./live.ts";
@@ -180,6 +180,10 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 
 	flush(context: Context): Promise<void> {
 		return this.#host.harness.flushConversation(this.id, context);
+	}
+
+	reprepare(taskId: TaskId, context: Context): Promise<boolean> {
+		return this.#host.harness.reprepareConversation(this.id, taskId, context);
 	}
 
 	waitForIdle(context: Context): Promise<void> {
@@ -396,6 +400,33 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 			{ conversationId },
 		);
 		if (taskId !== undefined) await this.#tasks.waitForTask(taskId, context);
+	}
+
+	async reprepareConversation(conversationId: ConversationId, taskId: TaskId, context: Context): Promise<boolean> {
+		this.#tasks.resume();
+		const admitted = await this.commitWith(
+			async (tx) => {
+				const live = await tx.doc(LiveDoc, conversationId);
+				if (live.run?.taskId !== taskId) return false;
+				const task = await tx.task(taskId);
+				if (
+					!task ||
+					task.kind !== GenerationTask.definition.name ||
+					task.state.status === "terminal" ||
+					task.state.status === "completing" ||
+					(task.state.checkpoint as { phase: string }).phase === "tools" ||
+					task.abortRequested
+				)
+					return false;
+				live.run.interruption = { kind: "reprepare" };
+				tx.setTask({ ...task, abortRequested: true });
+				return true;
+			},
+			context,
+			{ conversationId },
+		);
+		if (admitted) await this.#tasks.waitForTask(taskId, context);
+		return admitted;
 	}
 
 	retryTask(id: TaskId, incident: EntryId, context: Context): Promise<"queued" | "stale" | "terminal"> {

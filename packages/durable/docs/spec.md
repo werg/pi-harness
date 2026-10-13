@@ -584,6 +584,8 @@ interface Conversation {
   reset(handoff: string | undefined, context: Context): Promise<void>;
   /** `{ background: true }` also aborts background work under the conversation (section 5.4). */
   abort(context: Context, options?: { readonly background?: boolean }): Promise<void>;
+  /** Supersede only the expected current generation, joining cancellation before reusing its inputs. */
+  reprepare(expectedTaskId: TaskId, context: Context): Promise<boolean>;
   waitForIdle(context: Context): Promise<void>;
   viewState(context: Context): Promise<AttachedReplicatedState<ConversationView>>;
   watch(context: Context): Promise<ConversationWatch>;
@@ -1656,15 +1658,23 @@ type TaskOutcome<R> =
 
 type JoinPolicy = "failFast" | "allSettled";
 
+type TaskWaitCondition =
+  | { readonly kind: "tasks"; readonly on: readonly TaskId[]; readonly policy: JoinPolicy }
+  | { readonly kind: "time"; readonly until: number }
+  | { readonly kind: "receipt"; readonly key: string; readonly binding: string }
+  | { readonly kind: "failure"; readonly incident: EntryId; readonly error: TaskOutcomeError }
+  | { readonly kind: "registry"; readonly after: string; readonly reason: JsonObject }
+  | { readonly kind: "input"; readonly conversationId: ConversationId; readonly after: EntryId; readonly kinds: readonly string[] };
+
 type TaskState<S, R> =
   | { readonly status: "pending"; readonly checkpoint: S }
   | { readonly status: "running"; readonly checkpoint: S }
-  /** Parked without an invocation until every task in `on` is terminal; then resumes at `checkpoint` (section 5.5). */
+  /** Parked without an invocation until its durable condition is satisfied (section 5.5). */
   | {
       readonly status: "waiting";
       readonly checkpoint: S;
-      readonly on: readonly TaskId[];
-      readonly policy: JoinPolicy;
+      readonly mode: "run" | "abort";
+      readonly condition: TaskWaitCondition;
     }
   /** Outcome decided; terminal once no ordinary owned work below is live (section 5.5). Runs no more code. */
   | { readonly status: "completing"; readonly outcome: TaskOutcome<R> }
@@ -2216,9 +2226,29 @@ started there, for example to interrogate a finished subagent, are ordinary work
 of that conversation, reached by traversal from above, and not part of any
 finish.
 
-**Waiting.** A phase may commit `{ status: "waiting", checkpoint, on, policy }`.
-The task stops without an invocation and resumes at `checkpoint` once every task
-in `on` is terminal. `on` may name any tasks, including already terminal ones;
+**Repreparing a generation.** `Conversation.reprepare(expectedTaskId, context)`
+admits an interruption only when the run is owned by that exact live
+`pi.generation` task and it has no cancellation intent. An active tools phase or non-generation task, a stale
+task, and a terminal or completing task return `false` without effects.
+Admission records the `reprepare` interruption and cancellation in one commit.
+The old generation joins its transport and owned cleanup before handing the
+same original input entries to a new generation with current configuration.
+Its prepared checkpoint and request selection remain immutable; the successor
+starts without the old selection. No synthetic input or duplicate user entry
+is appended, and follow-ups stay queued. An explicit task or conversation abort
+clears the interruption, so Stop during cleanup prevents a successor.
+The call returns `true` only after the old task is terminal; it does not claim
+the successor has answered or that external setup has completed.
+
+**Waiting.** A phase may commit `{ status: "waiting", checkpoint, condition }`.
+The scheduler retains the invocation mode (`run` or `abort`) in the resulting state.
+The task stops without an invocation and resumes at `checkpoint` when its condition is satisfied.
+An input condition observes matching entry kinds strictly after its frontier;
+a receipt condition requires its exact binding; a time condition waits for its
+specified instant. Failure conditions require explicit incident repair, and registry
+conditions require an executable registry change. These waits retain no transport.
+For `condition: { kind: "tasks", on, policy }`, every task in `on` must be terminal.
+`on` may name any tasks, including already terminal ones;
 tasks the waiting task does not own, whose `owner` is not the waiting task,
 require `policy: "allSettled"`. `on` may not name a missing task or close a
 cycle in the wait-for graph (section 5.1), whose edges run from each task to the
@@ -4759,8 +4789,7 @@ type TaskGraphState =
   | {
       readonly status: "waiting";
       readonly phase: string;
-      readonly on: readonly TaskId[];
-      readonly policy: JoinPolicy;
+      readonly condition: TaskWaitCondition;
     }
   /** Outcome held until its ordinary owned work drains (section 5.5). */
   | { readonly status: "completing"; readonly outcome: TaskOutcome<JsonValue>["status"] };

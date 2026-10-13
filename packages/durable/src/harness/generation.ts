@@ -407,14 +407,22 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				const result = harnessError("aborted", `Tool ${call.name} was aborted`);
 				await appendToolResult(tx, conversationId, call, result, { timestamp: runtime.now() });
 			}
-			if (live.run?.taskId === runtime.taskId && live.run.interruption?.kind === "flush") {
+			if (live.run?.taskId === runtime.taskId && live.run.interruption !== undefined) {
+				const reprepare = live.run.interruption.kind === "reprepare";
 				const steering = boundary.inbox.items.some((item) => item.mode === "steer");
-				const { users, reset } = await applyBoundary(tx, boundary, steering ? "postTools" : "final", runtime.now());
-				if (steering && users.length > 0 && !reset) {
+				const { users, reset } = await applyBoundary(
+					tx,
+					boundary,
+					reprepare || steering ? "postTools" : "final",
+					runtime.now(),
+				);
+				if ((reprepare || (steering && users.length > 0)) && !reset) {
 					live.run.inputs.push(...users);
 					delete live.run.interruption;
+					if (reprepare) delete live.run.requestSelection;
 					delete live.generation;
 					delete live.tools;
+					delete live.nestedTools;
 					handOver(live, runtime.taskId, await createGeneration(tx, conversationId));
 				} else {
 					endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "aborted" });

@@ -29,7 +29,7 @@ import type {
 import { agentHooks } from "./agent.ts";
 import { type ContextRange, readContextFrom } from "./context.ts";
 import { jsonEqual, pinJson, snapshotError } from "./json.ts";
-import { ReceiptDoc, WakeDoc, type WakeSchedule } from "./live.ts";
+import { LiveDoc, ReceiptDoc, WakeDoc, type WakeSchedule } from "./live.ts";
 import { admitModelRequest, prepareModelRequest } from "./model-request.ts";
 import type {
 	Agent,
@@ -555,6 +555,8 @@ export class TaskScheduler {
 			if (current.state.status === "terminal") return { result: "terminal" as const };
 			const invocation = this.#invocations.get(id);
 			if (keepRestart && current.abortReason === "restart") return { result: "marked" as const };
+			const run = (await tx.doc(LiveDoc, current.conversationId)).run;
+			if (run?.taskId === id) delete run.interruption;
 			if (!current.abortRequested || current.abortReason !== undefined) tx.setTask(withAbortMark(current));
 			return { result: "marked" as const, run: invocation?.mode === "run" ? invocation : undefined };
 		}, context);
@@ -636,6 +638,8 @@ export class TaskScheduler {
 			for (const { node, live } of walk) {
 				if (live === undefined || (node.background && !background)) continue;
 				reached.push(live.id);
+				const run = (await tx.doc(LiveDoc, live.conversationId)).run;
+				if (run?.taskId === live.id) delete run.interruption;
 				if (!live.abortRequested || live.abortReason !== undefined) tx.setTask(withAbortMark(live));
 			}
 			for (const id of queued) {
