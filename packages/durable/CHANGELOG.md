@@ -6,6 +6,7 @@
 
 - Upstream restart-count parking and `restartLimit` are omitted: an interrupted task recovers from its committed checkpoint rather than being faulted or parked after an arbitrary number of restarts.
 
+- `SqliteStorage.open(database, options)` opens an initialized store: it no longer takes an initializer or migrates, so a database whose version-2 tables use upstream's inline payload layout is rejected unchanged. Call `applySqliteMigrations(database)` (or `applySqliteMigrationsForSchema()` with a prefix) first; `openNodeSqliteStorage()` and `openDurableObjectSqliteStorage()` still migrate before opening.
 - `Storage.commit(writes, adopt, context)` requires the storage to call `adopt(seq)` synchronously after the batch is durable and before the next commit. A rejection after adoption fails the Session without retracting the published commit.
 - Watch listeners receive a change object and context: use `({ value, ops, retired }, context)` for document and view watches and `({ value: events }, context)` for event streams.
 - `FileSystem.watch()` uses the exported `FileChange` type instead of `WatchChange`.
