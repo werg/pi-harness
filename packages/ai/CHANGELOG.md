@@ -2,20 +2,41 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `appendGrammarToolInputJsonDelta()` now accepts only the next input delta and no longer closes the input. Call `closeGrammarToolInputJson()` to finish the JSON arguments ([#9265](https://github.com/earendil-works/pi/issues/9265)).
+- `resolveTranscriptTools()` takes a `TranscriptToolSupport` value instead of a boolean, and returns `foldedSystemMessages` in place of `anchorsAdditions` ([#10940](https://github.com/earendil-works/pi/issues/10940)).
+
 ### Added
 
 - Emit request-owned prompt processing progress for local completion models without treating it as assistant content.
+- Added GPT-6.1 Terra to the OpenAI, Azure, and OpenAI Codex catalogs with image input, tool search, reasoning levels, and official token prices. Codex supplies a 500K context window.
+- Added image input for supported TypeSafe and Cloudflare System One classifier models and OpenRouter decision models.
+- `Usage.cost.totalFromProvider` identifies billed totals reported by providers; OpenRouter responses use the reported total when available ([#11178](https://github.com/earendil-works/pi/issues/11178), [#10286](https://github.com/earendil-works/pi/issues/10286)).
+- Added `StreamingJsonParser` and `ToolCallArgumentsStream` to parse streamed tool arguments incrementally; provider streams no longer reparse the complete input on every delta ([#9265](https://github.com/earendil-works/pi/issues/9265)).
+- Added MiniMax-M3.1-Flash and current MiMo and Kimi model metadata. OpenAI GPT-6 models can change reasoning effort mid-conversation without invalidating the prompt cache ([#10853](https://github.com/earendil-works/pi/issues/10853)).
 
 ### Changed
 
 - Keep Codex transport request identity distinct from session affinity, expose owned transport diagnostics, and bound provider retry attempts with cancellation-aware cleanup.
+- Kimi Coding uses its OpenAI Chat Completions endpoint at `https://api.kimi.com/coding/v1`; OpenCode and OpenCode Go use their protocol-specific inference endpoints.
+- Thinking blocks from another model are dropped during model changes instead of being sent as visible text ([#10995](https://github.com/earendil-works/pi/issues/10995)).
+- The Codex catalog removes GPT-5.5 and GPT-5.3 Codex Spark, which the ChatGPT subscription endpoint rejects, and uses the 500K Codex window for GPT-6.1 Sol ([#11173](https://github.com/earendil-works/pi/pull/11173) by [@lucasmeijer](https://github.com/lucasmeijer), [#10840](https://github.com/earendil-works/pi/issues/10840)).
 
 ### Fixed
 
 - Close OAuth callback HTTP connections with each response so a later sign-in on the same loopback port cannot reuse a retired listener's pooled socket.
 - Preserve explicitly resolved Anthropic OAuth authentication when the host injects a credential sentinel rather than the original token.
 - Fixed tool-call argument parsing dropping fields when a string contains an invalid `\u` escape such as `\usepackage` ([#10868](https://github.com/earendil-works/pi/issues/10868))
-- Fixed Anthropic requests failing with a 400 when an error tool result contains images; the images are now replaced with a text note ([#10794](https://github.com/earendil-works/pi/issues/10794))
+- Fixed Anthropic and Bedrock Claude requests failing when an error tool result contains images; the images are preserved after the tool results ([#10794](https://github.com/earendil-works/pi/issues/10794)).
+- Fixed malformed final tool-call JSON silently executing with a partial argument object. Invalid calls now retain an argument error and fail validation ([#10897](https://github.com/earendil-works/pi/issues/10897)).
+- Fixed OpenAI Responses prompt-cache invalidation when tools are added or removed, and fixed Gemini tool schemas containing `const` or literal data ([#10940](https://github.com/earendil-works/pi/issues/10940)).
+- Fixed GitHub Copilot HTTP 413 request-size errors being missed as context overflows ([#11016](https://github.com/earendil-works/pi/pull/11016) by [@petrroll](https://github.com/petrroll)).
+- Fixed retry classification for gateway failures, Codex proxy disconnects, network failures, and HTTP status digits embedded in unrelated numbers. ChatGPT Business usage-limit errors now report the workspace limit instead of retrying.
+- Fixed provider reasoning settings for Gemini 4, Xiaomi MiMo, Kimi K3.1, Claude Haiku 5.5, and Claude Opus 5, including Anthropic's top-level effort limit.
+- Fixed dropped Anthropic assistant messages losing a preceding system update; corrected empty tool results, mixed text/reasoning stream order, and faux cache-write accounting.
+- Fixed OAuth URLs that use local-file or custom protocols, pi-messages content indices outside the stream, and overly broad permissions on the pi-ai auth file.
+- pi-messages terminal events now retain the provider's `responseModel`; OpenRouter costs and streamed tool-call memory use reflect the provider response.
 
 ## [1.2.0] - 2026-10-12
 

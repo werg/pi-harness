@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject non-HTTP OAuth discovery and authorization URLs supplied by MCP servers instead of passing local-file or custom protocols to the platform URL handler.
+
 ## [1.2.0] - 2026-10-12
 
 ### Breaking Changes

@@ -2,11 +2,6 @@
 
 ## [Unreleased]
 
-### Changed
-
-- Integrated the complete upstream Durable changes through `96abe9a5a`, retaining workerd payloads, pinned request inputs, direct tools and owned continuation cancellation.
-- Wake publication still repairs the host schedule but skips acknowledgement transactions for already acknowledged revisions.
-
 ### Breaking Changes
 
 - `ToolTaskInput` and `ToolTaskResult` are tagged unions: a model-issued call is `{ kind: "model", ... }` with its previous fields, a nested call `{ kind: "nested", ... }`, and a direct call `{ kind: "direct", ... }`. Admission pins its execution contract. Older persisted task contracts are rejected; recreate session state.
@@ -30,8 +25,17 @@
 - `TaskRuntime.ownedTasks(context)`: the live tasks a task owns directly, whichever invocation created them, as copies. A tool call settling finds the nested calls it left running with it.
 - `read` returns images as one image block instead of an `unsupported_image` error: PNG, JPEG, GIF, and WebP within the model's image limits (by default 2000x2000 pixels and 4.5 MB of base64) as they are, or, with `createCodingTools({ images })`, oriented, converted, and shrunk to fit. `@earendil-works/pi-durable/images` provides a Photon (WebAssembly) image processor, with `/images/node` and `/images/cloudflare` loaders; `/images/node` prepares images in a worker thread, so a large photo never blocks the event loop, and the thread exits after 30 s without images; nothing loads it unless imported. A model without image input gets a diagnostic saying it sees a placeholder.
 
+### Changed
+
+- Integrated the complete upstream Durable changes through `96abe9a5a`, retaining workerd payloads, pinned request inputs, direct tools and owned continuation cancellation.
+- Wake publication still repairs the host schedule but skips acknowledgement transactions for already acknowledged revisions.
+- `ToolControl.terminate` accepts `false` as well as `true`; only `true` ends the run.
+
 ### Fixed
 
+- Fixed a tool handoff ending the run before its replacement context is processed; the same run now continues after the handoff.
+- Fixed system baselines appearing after assistant messages retained by compaction, and record the requested thinking level on generation responses, including deferred responses ([#10904](https://github.com/earendil-works/pi/issues/10904)).
+- Fixed image base64 encoding retaining large concatenation trees, and prevented streamed JSON assignments from modifying inherited properties ([#10923](https://github.com/earendil-works/pi/issues/10923)).
 - A throwing `onReport` no longer replaces the error being reported or becomes an unhandled rejection, a throwing `now()` is reported once and `Date.now` used, and a watch listener's error is reported as well as ending the watch with `listener_error`.
 - A task whose fault write failed no longer runs again in the same process.
 - The scheduler no longer visits every live task on each pass: abort cascades start only from tasks with cancellation intent, owned live work and idle scopes are walks down an in-memory ownership index, and reservation, finalization, and failFast checks keep their own candidate sets. Nested calls use one document per call instead of one growing index. The fork benchmarks must be measured independently (`npm run bench:scheduler-fanout`).
@@ -67,6 +71,7 @@
 
 ### Fixed
 
+- Bounded the Node SQLite driver's prepared-statement cache to 256 entries per connection, preventing unbounded growth when applications generate many SQL shapes.
 - A wait that closes a cycle through waits and held owners is rejected by `runtime.commit()`, naming the cycle, instead of leaving every task on it waiting forever; waiting on itself or on an owner chain were the only cycles caught. A background task may now wait on the owner of its conversation, which is no cycle ([#10411](https://github.com/earendil-works/pi/issues/10411); tests and approach from [#10533](https://github.com/earendil-works/pi/pull/10533) by [@odysseus0](https://github.com/odysseus0))
 - Appending to an array in a document no longer costs a walk over the whole array per commit: Chord's delta tracker plans inserts and removals that keep the remaining elements in order from the changed ranges alone, and builds an appended array in one copy instead of two. 32,000 one-item appends, one commit each, take 1.4 s instead of 11.3 s; what remains is the copy each immutable value needs (`npm run bench:document-append`).
 - A generation whose blocking threshold compaction failed, faulted, was orphaned, or was aborted directly now fails with `model_error` (`Compaction failed: <error>`) instead of sending its request anyway. The context was still above the blocking threshold, so the request at best left no room for the answer: a session at 996K of a 1M window got an empty `length` answer on every turn, with no visible error.

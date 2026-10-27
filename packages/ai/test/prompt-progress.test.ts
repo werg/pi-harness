@@ -82,4 +82,33 @@ describe("native completion prompt progress", () => {
 		expect(payload).not.toHaveProperty("return_progress");
 		expect(result.stopReason).toBe("stop");
 	});
+
+	it("preserves malformed tool arguments when progress frames are replayed", async () => {
+		const { events, result } = await collect([
+			{
+				id: "request-owned",
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{
+									index: 0,
+									id: "call-1",
+									type: "function",
+									function: { name: "write", arguments: '{"path":' },
+								},
+							],
+						},
+					},
+				],
+			},
+			{ id: "request-owned", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+		]);
+		const call = result.content[0];
+		expect(call).toMatchObject({ type: "toolCall", arguments: {}, argumentsError: expect.any(String) });
+		const encoder = new AssistantMessageFrameEncoder();
+		const frames = events.map((event) => encoder.encode(event)).filter((frame) => frame !== undefined);
+		expect(reduceAssistantMessageFrames(frames)?.content).toEqual(result.content);
+	});
 });

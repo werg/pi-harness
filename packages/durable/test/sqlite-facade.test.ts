@@ -76,9 +76,31 @@ class PrepareCountingDatabaseSync extends DatabaseSync {
 	repeatedPrepares(): string[] {
 		return [...this.prepareCounts].filter(([, count]) => count > 1).map(([sql]) => sql);
 	}
+
+	prepareCount(sql: string): number {
+		return this.prepareCounts.get(sql) ?? 0;
+	}
 }
 
 describe("portable SQLite facade settlement", () => {
+	it("evicts old prepared statements while retaining recently reused statements", async () => {
+		const connection = new PrepareCountingDatabaseSync(":memory:");
+		const database = new NodeSqliteDatabase(connection);
+		try {
+			for (let i = 0; i < 256; i++) await database.get(`SELECT ${i} AS n`);
+			await database.transaction(async (transaction) => {
+				expect(await transaction.get("SELECT 0 AS n")).toEqual({ n: 0 });
+			});
+			for (let i = 256; i < 300; i++) await database.get(`SELECT ${i} AS n`);
+			expect(await database.get("SELECT 0 AS n")).toEqual({ n: 0 });
+			expect(connection.prepareCount("SELECT 0 AS n")).toBe(1);
+			expect(await database.get("SELECT 1 AS n")).toEqual({ n: 1 });
+			expect(connection.prepareCount("SELECT 1 AS n")).toBe(2);
+		} finally {
+			await database.close();
+		}
+	});
+
 	it("prepares each storage statement once per connection and reuses it across transactions", async () => {
 		const connection = new PrepareCountingDatabaseSync(":memory:");
 		const storage = await SqliteStorage.open(new NodeSqliteDatabase(connection));

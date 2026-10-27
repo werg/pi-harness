@@ -1,7 +1,7 @@
 import { Value } from "typebox/value";
 import type { AnyContract } from "./contract.ts";
 import { applyImmutable, type Decoder, decoder } from "./delta/index.ts";
-import { ChordError } from "./errors.ts";
+import { ChordError, invalid } from "./errors.ts";
 import {
 	CtxImpl,
 	HANDLE_BASE,
@@ -308,14 +308,15 @@ export class RemoteHandle implements Hold {
 			caller = (args, ctx) => {
 				if (this.host.inFactory > 0)
 					throw new ChordError("not_ready", `${this.address}.${name} called inside a factory`);
-				if (ctx instanceof CtxImpl) {
-					try {
-						ctx.check(ctx.host);
-					} catch (error) {
-						return Promise.reject(error);
-					}
+				if (ctx !== undefined && !(ctx instanceof CtxImpl)) {
+					return Promise.reject(invalid("foreign_ctx", "ctx must come from a Chord host"));
 				}
-				if (ctx === undefined || (ctx instanceof CtxImpl && ctx.holder)) {
+				try {
+					ctx?.check(this.host);
+				} catch (error) {
+					return Promise.reject(error);
+				}
+				if (ctx === undefined || ctx.holder) {
 					return this.host.root((root) => this.#call(name, args, root), { signal: ctx?.signal });
 				}
 				return this.#call(name, args, ctx);

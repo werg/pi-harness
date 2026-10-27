@@ -232,7 +232,11 @@ for (const block of response.content) {
 }
 ```
 
+`usage.cost.totalFromProvider` is `true` when `usage.cost.total` is the billed cost reported by the provider and `false` when it is estimated from the model's catalog rates. A missing value, as in sessions recorded before this field existed, also means `false`.
+
 Snippets in the rest of this README assume a `models` collection set up like this (with the relevant providers registered).
+
+`usage.cost.total` is the best available total cost. For OpenRouter chat responses, it uses the cost reported by OpenRouter, including both the OpenRouter charge and upstream inference cost for BYOK requests. When provider accounting is unavailable or invalid, it falls back to the model's catalog rates. The `input`, `output`, `cacheRead`, and `cacheWrite` cost components remain catalog estimates and may not sum to a provider-reported total.
 
 ## Providers and Models
 
@@ -895,8 +899,8 @@ Classifier models consume structured JSON state, and optionally images, and answ
 | Provider | Model IDs | Auth |
 | --- | --- | --- |
 | `typesafe` | `jev-latest` | `TYPESAFE_API_KEY` |
-| `openrouter` | `typesafe/jev-1.13`, `~typesafe/jev-latest` | `OPENROUTER_API_KEY` or OpenRouter OAuth |
-| `cloudflare-workers-ai` | `typesafe/jev`, `@cf/cloudflare/clef`, `@cf/cloudflare/clef-flash` | `CLOUDFLARE_API_KEY` and `CLOUDFLARE_ACCOUNT_ID` |
+| `openrouter` | `typesafe/jev-1.13`, `typesafe/jev-1.14`, `~typesafe/jev-latest`, `cloudflare/clef`, `cloudflare/clef-flash`, `cloudflare/clef-omni` | `OPENROUTER_API_KEY` or OpenRouter OAuth |
+| `cloudflare-workers-ai` | `typesafe/jev`, `typesafe/jev-1.14.0`, `@cf/cloudflare/clef`, `@cf/cloudflare/clef-flash`, `@cf/cloudflare/clef-omni` | `CLOUDFLARE_API_KEY` and `CLOUDFLARE_ACCOUNT_ID` |
 | `vercel-ai-gateway` | `typesafe-ai/jev` | `AI_GATEWAY_API_KEY` |
 | `opencode` | `jev-1.13`, `jev-1.13-free` | `OPENCODE_API_KEY` |
 | `openai` | `gpt-6-luna` | `OPENAI_API_KEY` |
@@ -940,6 +944,18 @@ When the service reports token counts, `result.usage` carries them with their co
 `ClassifierOptions.temperature` divides the answer logits by the given value before they are normalized; values above 1 soften the distribution. APIs that cannot apply it, such as System One and OpenAI Decisions, ignore it.
 
 `ClassifierContext.images` holds image blocks (`{ type: "image", data, mimeType }`) judged together with the state. Only models whose `input` includes `"image"` accept them; `classify()` returns an error result for other models.
+
+### System One images
+
+System One services take images in three forms. The model's `compat.imageInput` chooses the form (`"assets"`, `"images"`, or `"state-image-urls"`), and `compat.sendImageOptInHeader` controls TypeSafe's opt-in header:
+
+- **TypeSafe** (`typesafe`, and Jev on Workers AI) takes PNG and JPEG images as `assets`, `{ "<image-1>": { type: "image", format: "png", data_base64 } }`. Every asset must be referenced from the request, so the state is sent as `["<image-1>", ..., state]`. Images are experimental on TypeSafe's own API and need the `TypeSafe-Danger-Zone-Images: true` header, which the API sends with requests that carry images.
+- **Clef on Workers AI** takes up to four PNG, JPEG, or WebP images as an `images` list of data URLs, next to the unchanged state.
+- **OpenRouter** takes images as `{ type: "image_url", image_url: { url } }` parts before the state: `[part, ..., state]`. It answers requests with `assets` but drops the images, without an error.
+
+Built-in catalog entries set `compat` explicitly, so they keep their form when `baseUrl` points at a proxy. For models without it, the APIs detect the form: OpenRouter by provider `openrouter` or a `baseUrl` containing `openrouter.ai`, Clef by a model ID starting with `@cf/cloudflare/clef`, and TypeSafe's form with the opt-in header otherwise. A custom provider that reaches OpenRouter through a proxy matches neither check and must set `compat.imageInput: "state-image-urls"` and `compat.sendImageOptInHeader: false`; otherwise OpenRouter drops its images.
+
+Vercel AI Gateway and OpenCode list their Jev models with text input only.
 
 ### OpenAI Decisions
 
@@ -1527,13 +1543,13 @@ Notes:
 
 ## Cross-Provider Handoffs
 
-The library supports seamless handoffs between different LLM providers within the same conversation. This allows you to switch models mid-conversation while preserving context, including thinking blocks, tool calls, and tool results.
+The library supports seamless handoffs between different LLM providers within the same conversation. This allows you to switch models mid-conversation while preserving context, including text, tool calls, and tool results.
 
 When messages from one provider are sent to a different provider, the library automatically transforms them for compatibility:
 
 - **User and tool result messages** are passed through unchanged
-- **Assistant messages from the same provider/API** are preserved as-is
-- **Assistant messages from different providers** have their thinking blocks converted to text with `<thinking>` tags
+- **Assistant messages from the same provider, API, and model** are preserved as-is, including thinking blocks
+- **Assistant messages from a different model** have their thinking blocks dropped. Signatures and encrypted reasoning only work with the model that produced them, and readable thinking sent as plain text makes the new model treat it as part of the reply
 - **Tool calls and regular text** are preserved unchanged
 
 ```typescript
@@ -1554,7 +1570,7 @@ const claude = models.getModel('anthropic', 'claude-sonnet-4-5')!;
 context.messages.push({ role: 'user', content: 'What is 25 * 18?', timestamp: Date.now() });
 context.messages.push(await models.completeSimple(claude, context, { reasoning: 'medium' }));
 
-// Switch to GPT-5 - it will see Claude's thinking as <thinking> tagged text
+// Switch to GPT-5 - it sees Claude's answer, but not Claude's thinking
 const gpt5 = models.getModel('openai', 'gpt-5-mini')!;
 context.messages.push({ role: 'user', content: 'Is that calculation correct?', timestamp: Date.now() });
 context.messages.push(await models.complete(gpt5, context));
@@ -1565,7 +1581,7 @@ context.messages.push({ role: 'user', content: 'What was the original question?'
 const geminiResponse = await models.complete(gemini, context);
 ```
 
-All providers can handle messages from other providers — text, tool calls and results (including images), thinking blocks (transformed to tagged text), and aborted messages with partial content. This enables flexible workflows: start with a fast model, switch to a more capable one for complex reasoning, or maintain continuity across provider outages.
+All providers can handle messages from other providers — text, tool calls and results (including images), thinking blocks (dropped when the model changes), and aborted messages with partial content. This enables flexible workflows: start with a fast model, switch to a more capable one for complex reasoning, or maintain continuity across provider outages.
 
 ## System Messages
 
@@ -1598,7 +1614,7 @@ getCurrentTools(messages);        // []
 
 A custom `Provider` or `ProviderStreams` implementation reads the prompt and tools the same way from `context.messages`; `context.systemPrompt` and `context.tools` do not exist at that layer.
 
-Models that accept system messages mid-conversation (`supportsMidConvoSystemMessages` in the model's compat settings, set by the generated catalog for verified models) receive each later system message in place, so the cached prefix stays intact; section changes are framed by name for the model. Every other model receives `collapseSystemMessages(transcript)`: the replayed prompt and current tools as the leading system message, with later system messages dropped. Anthropic models that also set `supportsMidConvoToolChanges` send tool changes as native blocks (`inline-tools-2026-09-15` beta): the top-level tool list holds the initial tools plus a stable deferred placeholder and never changes, later tools are defined by value in `tool_addition` blocks (a new definition under an existing name replaces the old one), and removals are `tool_removal` references, so tool changes do not invalidate the prompt cache. That needs at least one initial tool; otherwise the current tool list is sent at the top level with the system text only. OpenAI Responses models with `supportsAdditionalTools` or `supportsToolSearch` anchor additive tool changes at their message; everything else sends the current tool list at the top level.
+Models that accept system messages mid-conversation (`supportsMidConvoSystemMessages` in the model's compat settings, set by the generated catalog for verified models) receive each later system message in place, so the cached prefix stays intact; section changes are framed by name for the model. Every other model receives `collapseSystemMessages(transcript)`: the replayed prompt and current tools as the leading system message, with later system messages dropped. Anthropic models that also set `supportsMidConvoToolChanges` send tool changes as native blocks (`inline-tools-2026-09-15` beta): the top-level tool list holds the initial tools plus a stable deferred placeholder and never changes, later tools are defined by value in `tool_addition` blocks (a new definition under an existing name replaces the old one), and removals are `tool_removal` references, so tool changes do not invalidate the prompt cache. That needs at least one initial tool; otherwise the current tool list is sent at the top level with the system text only. OpenAI Responses models with `supportsAdditionalTools` declare every tool in `additional_tools` items, like Codex: the initial tools in one at the head of the input and later additions and redefinitions at their message, with no top-level tool list. A later item replaces same-name definitions from earlier items but cannot replace a top-level tool or remove any tool, so removals are announced as text, later updates restate the tools that are still unavailable, and calls to removed tools fail at execution. OpenAI Responses models with only `supportsToolSearch`, and Kimi models with `supportsMidConvoToolAdditions`, anchor new tools at their message; a removal or a redeclared name moves the tool state up to that point into the top-level list once. Everything else sends the current tool list at the top level.
 
 ## Context Serialization
 

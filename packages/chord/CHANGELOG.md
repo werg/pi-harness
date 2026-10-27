@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- Remote references reject a context from a different host, and failed IPC writes end their link with the original transport error.
+- Delta append operations own their text slices, avoiding retention of whole growing strings; immutable application copies changed containers more efficiently ([#9265](https://github.com/earendil-works/pi/issues/9265)).
 - `nodeLoader` registers every facet's directory before importing any, so a facet that imports a file of a facet listed after it gets the same module copy as that facet; before, the load order could produce duplicates.
 - A link that is already closed when a host accepts or routes to it is no longer kept as a connection: before, a route that returned a dead link (a child process that exited before its link was wrapped) made every later call to that host name fail with `unavailable` until restart, and leaked the connection's ping timer.
 - Fixed `processLock()` failing with `listen EINVAL` on macOS and the BSDs when the temporary directory is too deep for a socket path (sun_path holds 104 bytes); the lock socket then lives in a private per-user directory, `/tmp/chord2-<uid>`

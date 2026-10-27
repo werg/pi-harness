@@ -69,9 +69,12 @@ class SerialOperationQueue {
 	}
 }
 
+const STATEMENT_CACHE_LIMIT = 256;
+
 /**
  * Executes SQL on one connection. Prepared statements are cached per connection by SQL text, so the
- * database and its transaction handles share them across transactions.
+ * database and its transaction handles share them across transactions. The bounded cache retains
+ * recently used statements as callers generate new SQL shapes.
  */
 abstract class NodeSqliteExecutor implements SqliteExecutor {
 	protected readonly database: DatabaseSync;
@@ -105,11 +108,18 @@ abstract class NodeSqliteExecutor implements SqliteExecutor {
 	protected abstract runOperation<T>(operation: () => T): Promise<T>;
 
 	private statement(sql: string): StatementSync {
-		let statement = this.statements.get(sql);
-		if (statement === undefined) {
-			statement = this.database.prepare(sql);
-			this.statements.set(sql, statement);
+		const statements = this.statements;
+		let statement = statements.get(sql);
+		if (statement !== undefined) {
+			if (statements.size > STATEMENT_CACHE_LIMIT / 2) {
+				statements.delete(sql);
+				statements.set(sql, statement);
+			}
+			return statement;
 		}
+		statement = this.database.prepare(sql);
+		statements.set(sql, statement);
+		if (statements.size > STATEMENT_CACHE_LIMIT) statements.delete(statements.keys().next().value!);
 		return statement;
 	}
 }

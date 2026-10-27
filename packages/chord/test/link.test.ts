@@ -15,7 +15,7 @@ import {
 	resource,
 	type StateEvent,
 } from "../src/index.ts";
-import { Packed, unpack } from "../src/link.ts";
+import { type IpcChannel, ipcLink, Packed, unpack } from "../src/link.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -64,6 +64,24 @@ function serverWithWorker(workerName = "session:S1") {
 }
 
 describe("links: calls and state across hosts", () => {
+	// #10959: reject foreign or forged contexts before putting a call on the link.
+	it("remote calls only accept contexts owned by the calling host", async () => {
+		const { server, worker } = serverWithWorker();
+		const other = createHost({ name: "other", onError: () => {} });
+		serveCounter(server);
+		const counter = worker.get(Counter, { name: "owned" }, { at: "server" });
+		await counter.ready;
+		const foreign = await other.root((ctx) => counter.add(1, ctx).catch((error: unknown) => error));
+		assert.ok(isChordError(foreign, "invalid") && foreign.reason === "foreign_ctx");
+		const forged = { rootId: "forged", epoch: 1, signal: new AbortController().signal } as unknown as Ctx;
+		await assert.rejects(
+			counter.add(1, forged),
+			(error) => isChordError(error, "invalid") && error.reason === "foreign_ctx",
+		);
+		assert.equal(await counter.add(1), 1);
+		counter.release();
+		await Promise.all([server.close(), worker.close(), other.close()]);
+	});
 	it("a child calls the server; the server stamps the child's principal", async () => {
 		const { server, worker } = serverWithWorker();
 		const principals: unknown[] = [];
@@ -113,6 +131,31 @@ describe("links: calls and state across hosts", () => {
 		const { worker } = serverWithWorker();
 		const missing = worker.get(Counter, { name: "m" }, { at: "server" });
 		await assert.rejects(missing.ready, (error) => isChordError(error, "unavailable"));
+	});
+});
+
+describe("links: IPC write failures", () => {
+	it("ends the link with the original write error and sends no later frames", async () => {
+		const sent: unknown[] = [];
+		const channel: IpcChannel = {
+			connected: true,
+			send: (message, callback) => {
+				sent.push(message);
+				assert.ok(callback, "the write callback must own asynchronous errors");
+				process.nextTick(() => callback(new Error("write EPIPE")));
+				return false;
+			},
+			on: () => undefined,
+			off: () => undefined,
+		};
+		const link = ipcLink(channel);
+		const reasons: string[] = [];
+		link.onClose((reason) => reasons.push(reason));
+		link.send({ t: "ping", n: 1 });
+		await tick();
+		assert.deepEqual(reasons, ["ipc send failed: write EPIPE"]);
+		link.send({ t: "ping", n: 2 });
+		assert.equal(sent.length, 1);
 	});
 });
 

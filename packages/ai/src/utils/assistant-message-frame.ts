@@ -29,6 +29,7 @@ export type AssistantMessageFrame =
 			id: string;
 			name: string;
 			arguments: ToolCall["arguments"];
+			argumentsError?: string;
 			thoughtSignature?: string;
 			namespace?: string;
 	  };
@@ -70,6 +71,7 @@ function cloneToolCall(toolCall: ToolCall): ToolCall {
 		id: toolCall.id,
 		name: toolCall.name,
 		arguments: structuredClone(toolCall.arguments),
+		...(toolCall.argumentsError === undefined ? {} : { argumentsError: toolCall.argumentsError }),
 		...(toolCall.thoughtSignature === undefined ? {} : { thoughtSignature: toolCall.thoughtSignature }),
 		...(toolCall.namespace === undefined ? {} : { namespace: toolCall.namespace }),
 	};
@@ -278,6 +280,9 @@ export class AssistantMessageFrameEncoder {
 					id: event.toolCall.id,
 					name: event.toolCall.name,
 					arguments: structuredClone(event.toolCall.arguments),
+					...(event.toolCall.argumentsError === undefined
+						? {}
+						: { argumentsError: event.toolCall.argumentsError }),
 					...(event.toolCall.thoughtSignature === undefined
 						? {}
 						: { thoughtSignature: event.toolCall.thoughtSignature }),
@@ -474,8 +479,10 @@ export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFr
 				block.id = frame.id;
 				block.name = frame.name;
 				block.arguments = structuredClone(frame.arguments);
+				delete block.argumentsError;
 				delete block.thoughtSignature;
 				delete block.namespace;
+				if (frame.argumentsError !== undefined) block.argumentsError = frame.argumentsError;
 				if (frame.thoughtSignature !== undefined) block.thoughtSignature = frame.thoughtSignature;
 				if (frame.namespace !== undefined) block.namespace = frame.namespace;
 				state.ended = true;

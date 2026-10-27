@@ -153,7 +153,9 @@ export interface ConversationHandle {
 /** Post-tools controls requested by a tool result. */
 export type ToolControl = {
 	readonly addTools?: readonly string[];
-	readonly terminate?: true;
+	/** End the run only when every result in the round sets this to true. */
+	readonly terminate?: boolean;
+	/** Reset the context with this user message and continue the run; the last handoff in call order wins. */
 	readonly handoff?: string;
 };
 

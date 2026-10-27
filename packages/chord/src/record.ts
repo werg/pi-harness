@@ -28,6 +28,7 @@ import {
 import { asChordError, ChordError, invalid, runAll } from "./errors.ts";
 import { enqueue } from "./publish.ts";
 import type { Registration, Registry } from "./registry.ts";
+import type { RemoteHost } from "./remote.ts";
 import { assertValid } from "./schema.ts";
 import type { Ctx, Exposed, GetOptions, HandleStatus, Principal, Readable, Shape, StateEvent } from "./types.ts";
 
@@ -281,7 +282,7 @@ export class CtxImpl implements Ctx {
 	}
 
 	/** Throws unless this ctx may start work on `host` now (not expired, not aborted, not from another host). */
-	check(host: HostCore): void {
+	check(host: HostCore | RemoteHost): void {
 		if (this.host !== host) throw invalid("foreign_ctx", "ctx belongs to another host");
 		if (this.#closed) throw new ChordError("aborted", "ctx expired: its call already settled", { reason: "expired" });
 		if (this.signal.aborted) throw new ChordError("aborted", "ctx aborted", { cause: this.signal.reason });

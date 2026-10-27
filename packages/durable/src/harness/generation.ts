@@ -602,6 +602,7 @@ async function classify(
 	runtime.signal.throwIfAborted();
 	const conversationId = runtime.conversationId;
 	const { attempt, compacted, cutoff } = request;
+	message.thinkingLevel = request.thinkingLevel;
 	if (message.stopReason === "deferred" && message.deferred !== undefined) {
 		const handle = message.deferred;
 		const pollAt = Math.max(
@@ -846,8 +847,9 @@ async function admitToolWave(
 }
 
 /**
- * The round's tools are terminal: apply their controls and either end the run at the final boundary (`terminate`,
- * `handoff`, or a queued reset) or hand it to the next generation at the `postTools` boundary (spec §8.5).
+ * The round's tools are terminal: apply their controls, append a `handoff`'s reset, and then end the run at the final
+ * boundary (`terminate`), end it at a queued reset, or hand it to the next generation at the `postTools` boundary, in
+ * the handoff's new context when there is one (spec §8.5).
  */
 async function finishToolRound(
 	runtime: Runtime,
@@ -881,12 +883,13 @@ async function finishToolRound(
 		if (added.length > 0) await addTools(tx, conversationId, added);
 		const live = await tx.doc(LiveDoc, conversationId);
 		const now = runtime.now();
-		if (terminate || handoff !== undefined) {
-			if (handoff !== undefined) {
-				const message = { role: "user", content: handoff, timestamp: now } as const;
-				const entry = await tx.appendEntry(ResetEntry, conversationId, { head: "self", model: [message] });
-				boundary.head = entry.id;
-			}
+		if (handoff !== undefined) {
+			// The handoff's reset precedes every queued item, so queued writes and selected steers land in its context.
+			const message = { role: "user", content: handoff, timestamp: now } as const;
+			const entry = await tx.appendEntry(ResetEntry, conversationId, { head: "self", model: [message] });
+			boundary.head = entry.id;
+		}
+		if (terminate) {
 			const { users } = await applyBoundary(tx, boundary, "final", now);
 			endRun(tx, live, runtime.taskId, { status: "done", answer: assistant });
 			if (users.length > 0) await startRun(tx, conversationId, live, users);

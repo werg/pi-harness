@@ -14,9 +14,20 @@ type ProviderCompat = Static<typeof ProviderCompatSchema>;
 describe("compatibility schemas", () => {
 	it("preserves property types in the provider superset", () => {
 		expectTypeOf<ProviderCompat["supportsStore"]>().toEqualTypeOf<boolean | undefined>();
+		expectTypeOf<ProviderCompat["imageInput"]>().toEqualTypeOf<
+			"assets" | "images" | "state-image-urls" | undefined
+		>();
 		expectTypeOf<ProviderCompat["sessionAffinityFormat"]>().toEqualTypeOf<
 			"openai" | "openai-nosession" | "openrouter" | undefined
 		>();
+	});
+
+	it("includes the shared classifier schema once in the provider superset", () => {
+		const provider = Compile(ProviderCompatSchema);
+		for (const imageInput of ["assets", "images", "state-image-urls"]) {
+			expect(provider.Check({ imageInput, sendImageOptInHeader: true })).toBe(true);
+		}
+		expect(provider.Check({ imageInput: "unknown" })).toBe(false);
 	});
 
 	it("preserves API-specific defaults", () => {

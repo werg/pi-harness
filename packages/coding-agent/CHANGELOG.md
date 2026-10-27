@@ -2,8 +2,31 @@
 
 ## [Unreleased]
 
+### New Features
+
+- **GPT-6.1 Terra:** OpenAI, Azure, and ChatGPT Codex users can select the new vision-capable model, with a 500K Codex context window. See [providers](docs/providers.md).
+- **Incremental tool arguments:** provider streams parse tool-call arguments as they arrive, reducing repeated work on large calls. Invalid final arguments are reported to the model rather than executed partially.
+- **Classifier images and provider updates:** the pi-ai classifier API accepts images for supported System One classifiers, and the Kimi Coding and OpenCode catalogs use their current endpoints. See [providers](docs/providers.md).
+
+### Added
+
+- GPT-6.1 Terra is available in the OpenAI, Azure, and Codex model catalogs; the pi-ai classifier API accepts images for supported System One classifiers.
+
+### Changed
+
+- Updated OpenAI and GitHub Copilot defaults to GPT-6.1 Sol, NVIDIA to Nemotron 3.5 Super VL, and Xiaomi defaults to MiMo V2.6 Pro ([#11442](https://github.com/earendil-works/pi/issues/11442), [#10910](https://github.com/earendil-works/pi/pull/10910) by [@cv](https://github.com/cv)).
+- Kimi Coding and OpenCode use their current provider endpoints; the Codex catalog omits models rejected by the ChatGPT subscription endpoint.
+- GPT-6 reasoning-effort changes and supported OpenAI Responses tool changes preserve the provider prompt cache.
+
 ### Fixed
 
+- Fixed large streamed tool-call arguments being reparsed on each delta, and reject malformed final JSON rather than executing a partial call ([#9265](https://github.com/earendil-works/pi/issues/9265), [#10897](https://github.com/earendil-works/pi/issues/10897)).
+- Preserve images from error tool results for Anthropic and Bedrock Claude; drop another model's thinking blocks when switching models ([#10794](https://github.com/earendil-works/pi/issues/10794), [#10995](https://github.com/earendil-works/pi/issues/10995)).
+- Handle GitHub Copilot request-size overflows, transient gateway errors, Codex proxy disconnects, and ChatGPT Business usage limits with their correct error or retry behavior.
+- Fixed `pi.exec()` corrupting UTF-8 split across output chunks or hiding process spawn errors ([#11312](https://github.com/earendil-works/pi/issues/11312), [#11085](https://github.com/earendil-works/pi/issues/11085)).
+- Fixed forked sessions repeatedly reopening their output file, package installs resolving a symlinked agent directory incorrectly, and unsupported CPU architectures downloading x64 tool binaries ([#11253](https://github.com/earendil-works/pi/issues/11253), [#11358](https://github.com/earendil-works/pi/issues/11358), [#11209](https://github.com/earendil-works/pi/issues/11209)).
+- Fixed grep context line numbers after lone carriage returns ([#11398](https://github.com/earendil-works/pi/issues/11398)).
+- Reject MCP OAuth endpoints with non-HTTP schemes instead of opening local-file or custom URLs.
 - Pinned internal Pi dependencies to exact release versions to prevent fresh installs from mixing incompatible packages ([#10865](https://github.com/earendil-works/pi/issues/10865))
 - Fixed resumed sessions dropping tools activated during the session. Resume now restores the session's active tools, with `--tools +name`/`-name` entries applied to them, unless `--tools` with tool names, `--no-tools`, or `--no-builtin-tools` selects tools explicitly ([#10785](https://github.com/earendil-works/pi/issues/10785))
 - Fixed stopping a codemode script or reaching its deadline waiting for a non-interruptible built-in to return on Bun ([#10748](https://github.com/earendil-works/pi/issues/10748))
