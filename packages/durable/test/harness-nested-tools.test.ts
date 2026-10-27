@@ -116,11 +116,11 @@ describe("nested tool calls", () => {
 		// Per document written, the keys of the nested calls it holds.
 		const written: { kind: string; key: string | undefined }[] = [];
 		const commit = storage.commit.bind(storage);
-		storage.commit = (writes, commitContext) => {
+		storage.commit = (writes, adopt, commitContext) => {
 			for (const write of writes) {
 				if (write.type === "document.create") written.push({ kind: write.record.kind, key: write.record.key });
 			}
-			return commit(writes, commitContext);
+			return commit(writes, adopt, commitContext);
 		};
 		const { harness, root } = await openChat(storage, setup);
 		await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
@@ -376,7 +376,7 @@ describe("nested tool calls", () => {
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const stream = await watchEvents(harness, root.id, context);
 		const ends: AgentEvent[] = [];
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			ends.push(...batch.filter((event) => event.type === "tool_execution_end"));
 		});
 		const settled = await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
@@ -457,7 +457,7 @@ describe("nested tool calls", () => {
 		const stream = await watchEvents(harness, root.id, context);
 		expect(stream.snapshot.nestedTools).toEqual([]);
 		const events: AgentEvent[] = [];
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			events.push(...batch);
 		});
 		const submission = await root.submit({ type: "input", content: "go" }, context);
@@ -835,7 +835,7 @@ describe("nested tool calls", () => {
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const stream = await watchEvents(harness, root.id, context);
 		const tools: (string | undefined)[][] = [];
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			for (const event of batch) {
 				if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
 					tools.push([event.type, event.toolCallId, event.parentToolCallId]);
@@ -897,7 +897,7 @@ describe("nested tool calls", () => {
 			["c1/2", "running"],
 		]);
 		const updates: [string, unknown][] = [];
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			for (const event of batch) {
 				if (event.type === "tool_execution_update" && event.output !== undefined) {
 					updates.push([event.toolCallId, event.output]);
@@ -992,7 +992,7 @@ describe("nested tool calls", () => {
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const stream = await watchEvents(harness, root.id, context);
 		const ends: AgentEvent[] = [];
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			ends.push(...batch.filter((event) => event.type === "tool_execution_end"));
 		});
 		await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
@@ -1042,7 +1042,7 @@ describe("nested tool calls", () => {
 		const { harness, root } = await openChat(new MemoryStorage(), setup);
 		const stream = await watchEvents(harness, root.id, context);
 		const starts: AgentEvent[] = [];
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			starts.push(...batch.filter((event) => event.type === "tool_execution_start"));
 		});
 		const submission = await root.submit({ type: "input", content: "go" }, context);
@@ -1289,7 +1289,7 @@ describe("nested tool calls", () => {
 			);
 		}, context);
 		const record = (await storage.task(id, context))!;
-		await storage.commit([{ type: "task", value: { ...record, version: 1 } }], context);
+		await storage.commit([{ type: "task", value: { ...record, version: 1 } }], () => {}, context);
 		await harness.close(context);
 		const reopened = await openChat(await openNodeSqliteStorage(path), setup);
 		reopened.harness.resume();

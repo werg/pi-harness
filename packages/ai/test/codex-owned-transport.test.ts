@@ -172,6 +172,7 @@ describe("Codex invocation-owned transport", () => {
 		const response = streamSimple(model, context, {
 			apiKey: token,
 			sessionId: "fallback-session",
+			identity: { userAgent: { custom: "host-client" } },
 			connectWebSocket: async (_url, options) => {
 				socketHeaders = options.headers;
 				throw new Error("transport disconnected");
@@ -185,6 +186,10 @@ describe("Codex invocation-owned transport", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(httpHeaders.get("x-client-request-id")).toBe(socketHeaders.get("x-client-request-id"));
 		expect(httpHeaders.get("session-id")).toBe("fallback-session");
+		expect(httpHeaders.get("user-agent")).toBe("host-client");
+		expect(socketHeaders.get("user-agent")).toBe("host-client");
+		expect(httpHeaders.get("originator")).toBe("pi");
+		expect(socketHeaders.get("originator")).toBe("pi");
 		expect(result.diagnostics).toContainEqual(
 			expect.objectContaining({
 				type: "provider_transport_failure",

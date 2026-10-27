@@ -1,10 +1,10 @@
-import { arch, platform, release } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAnthropic, streamSimple } from "../src/api/anthropic-messages.ts";
 import { ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV } from "../src/env-api-keys.ts";
 import { createModels } from "../src/models.ts";
 import { anthropicProvider } from "../src/providers/anthropic.ts";
 import type { Model } from "../src/types.ts";
+import { formatUserAgent } from "../src/utils/identity.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const mockState = vi.hoisted(() => ({
@@ -55,7 +55,7 @@ vi.mock("@anthropic-ai/sdk", () => {
 	return { default: FakeAnthropic };
 });
 
-const PI_USER_AGENT = `pi (${platform()} ${release()}; ${arch()})`;
+const PI_USER_AGENT = formatUserAgent();
 const neverAbortedSignal = new AbortController().signal;
 
 const context = normalizeContext({
@@ -94,10 +94,14 @@ describe("Anthropic auth token env", () => {
 		const result = await streamSimple(anthropicModel, context, {
 			apiKey: "transport-placeholder",
 			authType: "oauth",
+			identity: { userAgent: { custom: "host-client" } },
 		}).result();
 		expect(result.stopReason).toBe("stop");
 		expect(mockState.constructorOpts?.apiKey).toBeNull();
 		expect(mockState.constructorOpts?.authToken).toBe("transport-placeholder");
+		expect(mockState.constructorOpts?.defaultHeaders).toMatchObject({
+			"user-agent": expect.stringMatching(/^claude-cli\//),
+		});
 		expect(mockState.createParams?.betas).toContain("oauth-2025-04-20");
 		expect(mockState.createParams?.system).toEqual([
 			expect.objectContaining({ text: "You are Claude Code, Anthropic's official CLI for Claude." }),
@@ -106,9 +110,14 @@ describe("Anthropic auth token env", () => {
 	});
 
 	it("uses an explicit API-key mode instead of inferring OAuth from an opaque key", async () => {
-		await streamSimple(anthropicModel, context, { apiKey: "sk-ant-oat-looking-key", authType: "api_key" }).result();
+		await streamSimple(anthropicModel, context, {
+			apiKey: "sk-ant-oat-looking-key",
+			authType: "api_key",
+			identity: { userAgent: { custom: "host-client" } },
+		}).result();
 		expect(mockState.constructorOpts?.apiKey).toBe("sk-ant-oat-looking-key");
 		expect(mockState.constructorOpts?.authToken).toBeNull();
+		expect(mockState.constructorOpts?.defaultHeaders).toMatchObject({ "User-Agent": "host-client" });
 		expect(mockState.createParams?.betas ?? []).not.toContain("oauth-2025-04-20");
 	});
 	it("resolves ANTHROPIC_AUTH_TOKEN as a bearer Authorization header", async () => {

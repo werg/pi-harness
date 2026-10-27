@@ -248,6 +248,8 @@ export class JsonlStorage implements Storage {
 	private readonly currentOnlyDocuments = new Set<DocumentId>();
 	private readonly liveTaskSidecars = new Set<TaskId>();
 	private closed = false;
+	private admission: Promise<void> = Promise.resolve();
+	private closing: Promise<void> | undefined;
 	private poisonError: JsonlStoragePoisonedError | undefined;
 
 	private constructor(fs: FileSystem, directory: string, mainPath: string, options: JsonlStorageOptions) {
@@ -275,8 +277,22 @@ export class JsonlStorage implements Storage {
 		return storage;
 	}
 
-	async commit(writes: readonly StorageWrite[], context: Context): Promise<Seq> {
+	async commit(writes: readonly StorageWrite[], adopt: (seq: Seq) => void, context: Context): Promise<Seq> {
 		this.assertUsable();
+		const operation = this.admission.then(() => this.commitAdmitted(writes, adopt, context));
+		this.admission = operation.then(
+			() => {},
+			() => {},
+		);
+		return operation;
+	}
+
+	private async commitAdmitted(
+		writes: readonly StorageWrite[],
+		adopt: (seq: Seq) => void,
+		context: Context,
+	): Promise<Seq> {
+		if (this.poisonError !== undefined) throw this.poisonError;
 		const prepared = this.memory.prepareCommit(writes);
 		const encoded = this.encodeCommit(prepared.seq, prepared.writes);
 		const reclamations = this.planReclamations(prepared.writes, encoded);
@@ -302,6 +318,8 @@ export class JsonlStorage implements Storage {
 		if (!marker.ok) throw this.poison(errorFromFile(`append to ${MAIN_FILE}`, marker.error));
 		const seq = prepared.apply();
 		this.adoptSidecarState(prepared.writes);
+		// The marker is appended: the batch is durable. Reclaiming sidecars comes after adoption.
+		adopt(seq);
 		await this.reclaimSidecars(reclamations, context);
 		return seq;
 	}
@@ -375,10 +393,12 @@ export class JsonlStorage implements Storage {
 		return this.store.scanDocuments(query, limit, cursor, context);
 	}
 
-	async close(context: Context): Promise<void> {
-		if (this.closed) return;
-		this.closed = true;
-		await this.memory.close(context);
+	close(context: Context): Promise<void> {
+		if (this.closing === undefined) {
+			this.closed = true;
+			this.closing = this.admission.then(() => this.memory.close(context));
+		}
+		return this.closing;
 	}
 
 	private encodeCommit(seq: Seq, writes: readonly StorageWrite[]): EncodedCommit {

@@ -37,6 +37,12 @@ export function nativeSqliteExecutor(sql: NativeStorage["sql"], check: () => voi
 		run: async (query, ...params) => {
 			await all(query, ...params);
 		},
+		runCounted: async (query, ...params) => {
+			await all(query, ...params);
+			const result = (await all<{ count: number }>("SELECT changes() AS count"))[0];
+			if (result === undefined) throw new Error("SQLite change count is missing");
+			return result.count;
+		},
 	};
 }
 
@@ -69,13 +75,16 @@ export class NativeDatabase implements SqliteDatabase {
 	run(sql: string, ...params: SqliteValue[]): Promise<void> {
 		return this.enqueue(() => this.executor(() => {}).run(sql, ...params));
 	}
+	runCounted(sql: string, ...params: SqliteValue[]): Promise<number> {
+		return this.enqueue(() => this.executor(() => {}).runCounted(sql, ...params));
+	}
 	get<T extends object>(sql: string, ...params: SqliteValue[]): Promise<T | undefined> {
 		return this.enqueue(() => this.executor(() => {}).get<T>(sql, ...params));
 	}
 	all<T extends object>(sql: string, ...params: SqliteValue[]): Promise<T[]> {
 		return this.enqueue(() => this.executor(() => {}).all<T>(sql, ...params));
 	}
-	transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
+	transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>, afterCommit?: (value: T) => void): Promise<T> {
 		return this.enqueue(async () => {
 			let active = true;
 			const handle = this.executor(() => {
@@ -91,6 +100,7 @@ export class NativeDatabase implements SqliteDatabase {
 			// Explicit confirmation precedes portable Storage's adoption of IDs/publication.
 			// Failure here is an ordinary uncertain error, never a guaranteed StorageRejected.
 			await this.native.sync();
+			afterCommit?.(result);
 			return result;
 		});
 	}

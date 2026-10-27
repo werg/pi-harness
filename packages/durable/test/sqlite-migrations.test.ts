@@ -10,10 +10,11 @@ import {
 	CURRENT_SQLITE_SCHEMA_VERSION,
 	SQLITE_MIGRATIONS,
 	type SqliteMigration,
+	SqliteStorage,
 } from "../src/storage/sqlite/index.ts";
 import { openNodeSqliteDatabase, openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
-import { readJsonRow } from "../src/storage/sqlite/payload.ts";
-import { type EntryId, ROOT_CONVERSATION_ID } from "../src/types.ts";
+import { readJsonRow, writeJsonPayload } from "../src/storage/sqlite/payload.ts";
+import { type DocumentId, type EntryId, ROOT_CONVERSATION_ID } from "../src/types.ts";
 
 const directories = new Set<string>();
 
@@ -29,6 +30,115 @@ afterEach(async () => {
 });
 
 describe("durable SQLite migrations", () => {
+	it("reopens the persisted wake schedule and its publication acknowledgement", async () => {
+		const path = await databasePath();
+		const id = idFromNumber<DocumentId>(2);
+		const initial = await openNodeSqliteStorage(path);
+		await initial.commit(
+			[
+				{
+					type: "document.create",
+					record: { id, kind: "pi.wake", scope: { kind: "session" } },
+					content: { kind: "base", version: 1, value: { revision: 7, publishedRevision: 6, wakeAt: 12345 } },
+				},
+			],
+			() => {},
+			BACKGROUND_CONTEXT,
+		);
+		await initial.close(BACKGROUND_CONTEXT);
+		const reopened = await openNodeSqliteStorage(path);
+		try {
+			expect((await reopened.document(id, "current", BACKGROUND_CONTEXT))?.value).toEqual({
+				revision: 7,
+				publishedRevision: 6,
+				wakeAt: 12345,
+			});
+		} finally {
+			await reopened.close(BACKGROUND_CONTEXT);
+		}
+	});
+
+	it("keeps prefixed chunked schemas independent in one database", async () => {
+		const path = await databasePath();
+		const first = await openNodeSqliteStorage(path, { prefix: "one_" });
+		const second = await openNodeSqliteStorage(path, { prefix: "two_" });
+		try {
+			await first.commit(
+				[{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }],
+				() => {},
+				BACKGROUND_CONTEXT,
+			);
+			expect(await first.conversation(ROOT_CONVERSATION_ID, BACKGROUND_CONTEXT)).toEqual({
+				id: ROOT_CONVERSATION_ID,
+			});
+			expect(await second.conversation(ROOT_CONVERSATION_ID, BACKGROUND_CONTEXT)).toBeUndefined();
+			await second.commit(
+				[{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }],
+				() => {},
+				BACKGROUND_CONTEXT,
+			);
+			expect(await second.conversation(ROOT_CONVERSATION_ID, BACKGROUND_CONTEXT)).toEqual({
+				id: ROOT_CONVERSATION_ID,
+			});
+		} finally {
+			await first.close(BACKGROUND_CONTEXT);
+			await second.close(BACKGROUND_CONTEXT);
+		}
+	});
+
+	it("preserves chunked version 2 payloads across a failed schema transaction", async () => {
+		const database = await openNodeSqliteDatabase(await databasePath());
+		try {
+			await applySqliteMigrations(database);
+			await database.run(
+				"INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background) VALUES (3, 1, ?, 'waiting', 0, 0)",
+				JSON.stringify("old"),
+			);
+			const record = { id: 3, input: "🙂".repeat(600_000) };
+			await database.transaction((transaction) => writeJsonPayload("payload_chunks", transaction, 3, 0, record));
+			const before = await database.get("SELECT count(*) AS count FROM payload_chunks WHERE id = 3");
+			const failed: readonly SqliteMigration[] = [
+				...SQLITE_MIGRATIONS,
+				{ version: 3, statements: ["CREATE TABLE migration_probe (value TEXT)", "THIS IS NOT SQL"] },
+			];
+			await expect(applySqliteMigrations(database, failed)).rejects.toThrow();
+			expect(await database.get("SELECT version FROM durable_schema")).toEqual({ version: 2 });
+			expect(await database.get("SELECT status FROM tasks WHERE id = 3")).toEqual({ status: "waiting" });
+			expect(await database.get("SELECT count(*) AS count FROM payload_chunks WHERE id = 3")).toEqual(before);
+			expect(
+				JSON.parse(
+					(await readJsonRow<{ record: string }>(
+						"payload_chunks",
+						database,
+						"SELECT id FROM tasks WHERE id = ?",
+						[3],
+					))!.record,
+				),
+			).toEqual(record);
+		} finally {
+			await database.close();
+		}
+	});
+
+	it("rejects the unrelated inline version 2 schema without discarding its records", async () => {
+		const path = await databasePath();
+		const database = await openNodeSqliteDatabase(path);
+		await database.exec("CREATE TABLE durable_schema (singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL)");
+		await database.run("INSERT INTO durable_schema VALUES (1, 2)");
+		await database.exec("CREATE TABLE tasks (id INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+		await database.run("INSERT INTO tasks VALUES (3, ?)", JSON.stringify({ retained: true }));
+		await expect(SqliteStorage.open(database)).rejects.toThrow();
+		const reopened = await openNodeSqliteDatabase(path);
+		try {
+			expect(await reopened.get("SELECT version FROM durable_schema")).toEqual({ version: 2 });
+			expect(await reopened.get("SELECT record FROM tasks WHERE id = 3")).toEqual({
+				record: JSON.stringify({ retained: true }),
+			});
+		} finally {
+			await reopened.close();
+		}
+	});
+
 	it("rejects the pre-release inline-payload baseline without modifying its state", async () => {
 		const path = await databasePath();
 		const database = await openNodeSqliteDatabase(path);
@@ -152,6 +262,7 @@ describe("durable SQLite migrations", () => {
 					},
 				},
 			],
+			() => {},
 			BACKGROUND_CONTEXT,
 		);
 		await storage.close(BACKGROUND_CONTEXT);
@@ -183,7 +294,9 @@ describe("durable SQLite migrations", () => {
 		expect(await database.get("SELECT version FROM durable_schema WHERE singleton = 1")).toEqual({
 			version: nextVersion,
 		});
-		expect(await readJsonRow(database, "SELECT id, commit_seq FROM entries WHERE id = 2", [])).toEqual({
+		expect(
+			await readJsonRow("payload_chunks", database, "SELECT id, commit_seq FROM entries WHERE id = 2", []),
+		).toEqual({
 			id: 2,
 			record: JSON.stringify({
 				id: 2,

@@ -3,11 +3,23 @@ import { copyJson } from "@earendil-works/chord/json";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { defineDoc, defineDocFamily } from "../documents.ts";
 import type { Transaction } from "../session/transaction.ts";
-import type { EntryId, JsonObject, SubmissionId, SubmissionSettlement, TaskId, TaskRecord, Tx } from "../types.ts";
+import type {
+	CommitOptions,
+	EntryId,
+	JsonObject,
+	SubmissionId,
+	SubmissionSettlement,
+	TaskId,
+	TaskRecord,
+	Tx,
+} from "../types.ts";
 import { convertPartial } from "./generation.ts";
 import { jsonEqual } from "./json.ts";
 import type { SchedulerOutcome } from "./scheduler.ts";
 import type { CompactionReason, CompactionResult, GenerationRetrySelection, ToolDiagnostic } from "./types.ts";
+
+/** Progress is visible immediately and persisted together at the configured boundary. */
+export const PROGRESS_COMMIT: CommitOptions = { persistence: { kind: "deferred" } };
 
 /** What a running tool call publishes, shared by model-issued and nested calls. */
 type SlotProgress = {

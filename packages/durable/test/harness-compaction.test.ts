@@ -425,6 +425,20 @@ describe("manual compaction", () => {
 		await chat.harness.close(context);
 	});
 
+	// Regression coverage for #10424.
+	it("creates provider state before a legacy conversation's summarization request", async () => {
+		const chat = await open();
+		await history(chat);
+		await chat.root.commit((tx) => tx.retireDoc(ProviderDoc, chat.root.id), context);
+		expect(await chat.harness.snapshot(ProviderDoc, chat.root.id, context)).toBeUndefined();
+		chat.faux.summaries.push(summary());
+		expect((await result(chat, await chat.root.compact(undefined, context))).status).toBe("completed");
+		const stored = await chat.harness.snapshot(ProviderDoc, chat.root.id, context);
+		expect(stored?.sessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+		expect(chat.faux.summaryRequests[0]!.options?.sessionId).toBe(stored?.sessionId);
+		await chat.harness.close(context);
+	});
+
 	it("keeps working while busy and places the summary at the next final boundary", async () => {
 		const chat = await open();
 		await history(chat);
@@ -998,7 +1012,7 @@ describe("background threshold compaction", () => {
 		chat.setup.settings.compaction = BACKGROUND;
 		const events: AgentEvent[] = [];
 		const stream = await watchEvents(chat.harness, chat.root.id, context);
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			events.push(...batch);
 		});
 		chat.faux.summaries.push(failure("bad request"));
@@ -1167,7 +1181,7 @@ describe("blocking threshold compaction", () => {
 		chat.faux.summaries.push(gated(deferred(), summary(), reached));
 		const events: AgentEvent[] = [];
 		const stream = await watchEvents(chat.harness, chat.root.id, context);
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			events.push(...batch);
 		});
 		const input = await chat.root.submit({ type: "input", content: text("u4", 200) }, context);
@@ -1435,9 +1449,9 @@ describe("compaction estimates and interactions", () => {
 		// The parent is untouched.
 		expect((await kinds(chat.root)).includes("pi.compaction")).toBe(false);
 		// The fork's view keeps the parent entries the summary kept.
-		const state = await fork.viewState(context);
-		expect(state.value.entries).toEqual(view.entries);
-		state.dispose();
+		const watch = await fork.watch(context);
+		expect(watch.value.entries).toEqual(view.entries);
+		await watch.stop();
 		await chat.harness.close(context);
 	});
 
@@ -1558,7 +1572,7 @@ describe("compaction events and live status", () => {
 		chat.setup.settings.retry = { enabled: true, maxRetries: 2, baseDelayMs: 60_000 };
 		const events: AgentEvent[] = [];
 		const stream = await watchEvents(chat.harness, chat.root.id, context);
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			events.push(...batch);
 		});
 		chat.faux.summaries.push(failure("overloaded"));
@@ -1718,10 +1732,34 @@ describe("compaction recovery", () => {
 		chat.setup.settings.retry = { enabled: true, maxRetries: 2, baseDelayMs: 60_000 };
 		chat.faux.summaries.push(failure("overloaded"));
 		const id = await chat.root.compact(undefined, context);
-		await waitFor(async () => (await live(chat)).compactions?.[0]?.retry !== undefined);
-		expect((await chat.harness.getTask(id, context))?.state).toMatchObject({
-			checkpoint: { phase: "retry", attempt: 1 },
+		await waitFor(async () => {
+			const state = (await chat.harness.getTask(id, context))?.state;
+			return state?.status === "waiting" && state.condition.kind === "time";
 		});
+		const until = now + 60_000;
+		expect((await chat.harness.getTask(id, context))?.state).toMatchObject({
+			status: "waiting",
+			mode: "run",
+			checkpoint: { phase: "retry", attempt: 1, until },
+			condition: { kind: "time", until },
+		});
+		await chat.harness.close(context);
+		// Earlier versions slept inside a running `retry` phase: reopened before its time, it sleeps again.
+		const storage = await openNodeSqliteStorage(path);
+		const stored = await storage.task(id, context);
+		if (stored?.state.status !== "waiting") throw new Error("Expected the timed wait");
+		await storage.commit(
+			[{ type: "task", value: { ...stored, state: { status: "running", checkpoint: stored.state.checkpoint } } }],
+			() => {},
+			context,
+		);
+		await storage.close(context);
+		chat = await reopen(path, chat.setup, chat.faux);
+		await waitFor(async () => {
+			const state = (await chat.harness.getTask(id, context))?.state;
+			return state?.status === "waiting" && state.condition.kind === "time";
+		});
+		expect(chat.faux.summaryRequests).toHaveLength(1);
 		await chat.harness.close(context);
 		now += 120_000;
 		chat = await reopen(path, chat.setup, chat.faux);
@@ -1865,12 +1903,13 @@ describe("compaction and the inbox", () => {
 	it("keeps the kept entries mounted in the conversation view", async () => {
 		const chat = await open();
 		await history(chat);
-		const state = await chat.root.viewState(context);
+		const watch = await chat.root.watch(context);
+		watch.start(async () => {});
 		chat.faux.summaries.push(summary());
 		await result(chat, await chat.root.compact(undefined, context));
-		await waitFor(() => state.value.entries[0]?.kind === "pi.compaction");
-		expect(state.value.entries).toEqual((await chat.root.context(context)).entries);
-		state.dispose();
+		await waitFor(() => watch.value.entries[0]?.kind === "pi.compaction");
+		expect(watch.value.entries).toEqual((await chat.root.context(context)).entries);
+		await watch.stop();
 		await chat.harness.close(context);
 	});
 });
@@ -2001,7 +2040,7 @@ describe("compaction edge cases", () => {
 		await history(chat);
 		const events: AgentEvent[] = [];
 		const stream = await watchEvents(chat.harness, chat.root.id, context);
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			events.push(...batch);
 		});
 		chat.faux.summaries.push(summary());
@@ -2020,7 +2059,7 @@ describe("compaction edge cases", () => {
 		chat.setup.settings.compaction = BACKGROUND;
 		const events: AgentEvent[][] = [];
 		const stream = await watchEvents(chat.harness, chat.root.id, context);
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			events.push([...batch]);
 		});
 		// A new section makes the preparation commit append a system entry next to the compaction's status.
@@ -2331,7 +2370,7 @@ describe("blocked compaction", () => {
 			const events: AgentEvent[] = [];
 			const stream = await watchEvents(chat.harness, chat.root.id, context);
 			streams.push(stream);
-			stream.start(async (batch) => {
+			stream.start(async ({ value: batch }) => {
 				events.push(...batch);
 			});
 			const inspection = await chat.harness.inspect(context);
@@ -2391,7 +2430,7 @@ describe("blocked compaction", () => {
 			expect(replacementStream.snapshot.compactions).toEqual([
 				{ taskId: id, reason: "manual", blocking: false, attempt: 1 },
 			]);
-			replacementStream.start(async (batch) => {
+			replacementStream.start(async ({ value: batch }) => {
 				events.push(...batch);
 			});
 			harness.resume();
@@ -2436,6 +2475,55 @@ describe("context contributions", () => {
 		await result(chat, await chat.root.compact(undefined, context));
 		const prompt = userText(chat.faux.summaryRequests[0]!.messages[1]);
 		expect(prompt).toContain("<conversation>\n[User]: H\n\n[User]: a\n</conversation>");
+		await chat.harness.close(context);
+	});
+});
+
+// #10942: per-model compaction settings.
+describe("per-model compaction overrides", () => {
+	it("applies the current model's override to the blocking threshold", async () => {
+		for (const key of ["faux/faux-1", "faux/other"]) {
+			const chat = await open({ contextWindow: 1000 });
+			await history(chat);
+			// Harness-wide: blocking only above the full window; the override for faux-1 blocks above 700.
+			chat.setup.settings.compaction = {
+				...BLOCKING,
+				reserveTokens: 0,
+				modelOverrides: { [key]: { reserveTokens: 300 } },
+			};
+			chat.faux.summaries.push(summary());
+			await turn(chat, text("u4", 200), "a4");
+			expect(chat.faux.summaryRequests).toHaveLength(key === "faux/faux-1" ? 1 : 0);
+			await chat.harness.close(context);
+		}
+	});
+
+	it("applies the request model's override on a context overflow", async () => {
+		const chat = await open();
+		await history(chat);
+		chat.setup.settings.compaction = { ...MANUAL, modelOverrides: { "faux/faux-1": { enabled: true } } };
+		chat.faux.summaries.push(summary());
+		chat.faux.agent.push(failure(OVERFLOW), answer("fits"));
+		const input = await chat.root.submit({ type: "input", content: text("u4", 100) }, context);
+		expect((await input.wait(context)).status).toBe("done");
+		expect(chat.faux.summaryRequests).toHaveLength(1);
+		await chat.harness.close(context);
+	});
+
+	it("applies the model's override when a compaction selects and sizes its summary", async () => {
+		const chat = await open();
+		await history(chat);
+		chat.setup.settings.compaction = {
+			...MANUAL,
+			keepRecentTokens: 100_000,
+			modelOverrides: { "faux/faux-1": { keepRecentTokens: 150, reserveTokens: 500 } },
+		};
+		chat.faux.summaries.push(summary());
+		expect((await result(chat, await chat.root.compact(undefined, context))).status).toBe("completed");
+		// 0.8 * 500 from the override, below the model's 900.
+		expect(chat.faux.summaryRequests[0]!.options?.maxTokens).toBe(400);
+		const messages = (await chat.root.context(context)).messages;
+		expect(messages.slice(1).map(userText)).toEqual([text("u3", 100), text("a3", 100)]);
 		await chat.harness.close(context);
 	});
 });

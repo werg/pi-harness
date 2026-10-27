@@ -28,11 +28,13 @@ import { ensureProviderSessionId } from "./provider.ts";
 import { admitSubmission } from "./submissions.ts";
 import type {
 	CompactionHooks,
+	CompactionPolicy,
 	CompactionReason,
 	CompactionResult,
 	ContextView,
 	ConversationStreamOptions,
 	ModelRef,
+	Settings,
 } from "./types.ts";
 import { recordUsage } from "./usage.ts";
 
@@ -122,7 +124,7 @@ export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, 
 			const model = ref === undefined ? undefined : runtime.models.getModel(ref.provider, ref.modelId);
 			if (ref === undefined || model === undefined) return failNoModel(runtime, ref, context);
 			const descriptor = pinModel(model);
-			const policy = settings.compaction;
+			const policy = compactionPolicy(settings, ref);
 			const view = await runtime.context(conversationId, context);
 			const cut = selectCut(view, policy.keepRecentTokens);
 			if (cut === undefined) return complete(runtime, context);
@@ -181,7 +183,11 @@ export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, 
 			const response = await runtime.withModelRequest(
 				{ purpose: "compaction", operation: "complete", attempt, model, messages, cutoff: request.tail, options },
 				(capabilities, signal, prepared) =>
-					runtime.models.completeSimple(prepared.model, { messages }, { ...options, ...capabilities, signal }),
+					runtime.models.completeSimple(
+						prepared.model,
+						{ messages },
+						{ ...options, ...capabilities, telemetry: context.telemetry, signal },
+					),
 				context,
 			);
 			if (response.status === "waiting") {
@@ -215,7 +221,8 @@ export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, 
 				if (retry) {
 					const status = compactionStatus(live, runtime.taskId);
 					if (status !== undefined) status.retry = { at: until, error: message.errorMessage ?? "" };
-					return { status: "running", checkpoint: { phase: "retry", ...request, until } };
+					const checkpoint = { phase: "retry", ...request, until } as const;
+					return { status: "waiting", checkpoint, condition: { kind: "time", until } };
 				}
 				const text = summaryFailure(message);
 				failCompactionStatus(live, runtime.taskId, text);
@@ -225,6 +232,7 @@ export const CompactionTask = defineTask<CompactionInput, CompactionCheckpoint, 
 				};
 			}, context);
 		},
+		/** After the backoff's sleep; a run before `until` (an early wake, or a record of an earlier version) sleeps again. */
 		retry: async (task, runtime, context) => {
 			const { phase: _, until, ...request } = task.state.checkpoint;
 			if (runtime.now() < until) {
@@ -270,6 +278,18 @@ export async function createCompaction(
 	const status = { taskId, reason: input.reason, blocking: owner !== undefined, attempt: 1 };
 	addCompactionStatus(await tx.doc(LiveDoc, conversationId), status);
 	return taskId;
+}
+
+/** The compaction policy for `model`: its `modelOverrides` entry over the harness-wide policy, field by field. */
+export function compactionPolicy(settings: Settings, model: ModelRef): CompactionPolicy {
+	const { modelOverrides, ...policy } = settings.compaction;
+	const override = modelOverrides?.[`${model.provider}/${model.modelId}`];
+	return {
+		enabled: override?.enabled ?? policy.enabled,
+		reserveTokens: override?.reserveTokens ?? policy.reserveTokens,
+		keepRecentTokens: override?.keepRecentTokens ?? policy.keepRecentTokens,
+		backgroundTokens: override?.backgroundTokens ?? policy.backgroundTokens,
+	};
 }
 
 /**
@@ -453,13 +473,15 @@ async function placeSummary(
 	const result: CompactionResult =
 		current.owner === undefined
 			? {
-					submissionId: await admitSubmission(
-						tx,
-						runtime.conversationId,
-						{ type: "write", requestId: `compaction:${runtime.taskId}`, entry },
-						runtime.now(),
-						runtime.settings,
-					),
+					submissionId: (
+						await admitSubmission(
+							tx,
+							runtime.conversationId,
+							{ type: "write", requestId: `compaction:${runtime.taskId}`, entry },
+							runtime.now(),
+							runtime.settings,
+						)
+					).id,
 				}
 			: { entryId: (await tx.appendEntry(runtime.conversationId, entry)).id };
 	return { status: "terminal", outcome: { status: "completed", result } };

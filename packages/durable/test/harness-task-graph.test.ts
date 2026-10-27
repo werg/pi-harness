@@ -5,9 +5,11 @@ import type { JsonValue } from "@earendil-works/chord";
 import { applyImmutable, type Op } from "@earendil-works/chord/delta";
 import {
 	type ConversationId,
+	type ConversationView,
 	defineTask,
 	type EntryId,
 	MemoryStorage,
+	type Observer,
 	type TaskGraph,
 	type TaskId,
 } from "@earendil-works/pi-durable";
@@ -93,9 +95,9 @@ describe("task graph view", () => {
 		const root = await harness.root(context);
 		const seen: TaskGraph[] = [];
 		const observe = async () => {
-			const opened = await harness.taskGraph(context);
-			opened.subscribe((value, _context, delivery) => {
-				if (delivery.kind === "update") seen.push(value);
+			const opened = await harness.watchTaskGraph(context);
+			opened.start(async ({ value }) => {
+				seen.push(value);
 			});
 			return opened;
 		};
@@ -104,7 +106,7 @@ describe("task graph view", () => {
 		/** The advanced value equals a fresh build from Storage once the last observer left. */
 		const rebuild = async () => {
 			const advanced = graph.value;
-			graph.dispose();
+			await graph.stop();
 			graph = await observe();
 			expect(graph.value).not.toBe(advanced);
 			expect(graph.value).toEqual(advanced);
@@ -169,7 +171,7 @@ describe("task graph view", () => {
 		for (let index = 1; index < seen.length; index++) expect(seen[index]).not.toEqual(seen[index - 1]);
 		// The commit that created the two conversations published one revision setting them.
 		expect(seen.some((value) => value.tasks[String(parent)]?.conversations.length === 2)).toBe(true);
-		graph.dispose();
+		await graph.stop();
 		await harness.close(context);
 	});
 
@@ -203,7 +205,7 @@ describe("task graph view", () => {
 		await eventually(async () =>
 			(await first.harness.inspect(context)).tasks.every((task) => task.state.kind === "running"),
 		);
-		const running = await first.harness.taskGraph(context);
+		const running = await first.harness.watchTaskGraph(context);
 		expect(statuses(running.value)).toEqual({
 			[`test.graph-work#${foreground}`]: "running",
 			[`test.graph-work#${background}`]: "running",
@@ -223,7 +225,7 @@ describe("task graph view", () => {
 		// Exact frames: replaying their operations from the acquisition revision gives each delivered value.
 		let replica: JsonValue = watch.value as unknown as JsonValue;
 		const frames: (readonly Op[])[] = [];
-		watch.start(async (value, ops) => {
+		watch.start(async ({ value, ops }) => {
 			replica = applyImmutable(replica, ops);
 			expect(replica).toEqual(value);
 			frames.push(ops);
@@ -271,7 +273,8 @@ describe("task graph view", () => {
 		});
 		const { harness } = await openTasks(new MemoryStorage(), [Spawner]);
 		const root = await harness.root(context);
-		const graph = await harness.taskGraph(context);
+		const graph = await harness.watchTaskGraph(context);
+		graph.start(async () => {});
 		const id = await root.commit(async (tx) => {
 			const entry = await tx.appendEntry(root.id, { kind: "note" });
 			return tx.createTask(Spawner, { at: entry.id }, { ownership: { kind: "conversation" } });
@@ -280,10 +283,10 @@ describe("task graph view", () => {
 		await eventually(() => (graph.value.tasks[String(id)]?.conversations.length ?? 0) === 2);
 		const advanced = graph.value;
 		expect(advanced.tasks[String(id)]!.conversations).toEqual([...created].sort((a, b) => a - b));
-		graph.dispose();
-		const rebuilt = await harness.taskGraph(context);
+		await graph.stop();
+		const rebuilt = await harness.watchTaskGraph(context);
 		expect(rebuilt.value).toEqual(advanced);
-		rebuilt.dispose();
+		await rebuilt.stop();
 		gate.resolve();
 		await harness.waitForTask(id, context);
 		await harness.close(context);
@@ -307,13 +310,13 @@ describe("task graph view", () => {
 		await blocking;
 		await expect(cancelled).rejects.toThrow("cancelled");
 		// No observer kept the mount: each new observer builds a new revision.
-		const first = await harness.taskGraph(context);
+		const first = await harness.watchTaskGraph(context);
 		const value = first.value;
-		first.dispose();
-		const second = await harness.taskGraph(context);
+		await first.stop();
+		const second = await harness.watchTaskGraph(context);
 		expect(second.value).not.toBe(value);
 		expect(second.value).toEqual(value);
-		second.dispose();
+		await second.stop();
 		await harness.close(context);
 	});
 
@@ -337,12 +340,12 @@ describe("task graph view", () => {
 		const { harness } = await openTasks(new MemoryStorage(), [Memo]);
 		const root = await harness.root(context);
 		const id = await root.commit((tx) => tx.createTask(Memo, null, { ownership: { kind: "conversation" } }), context);
-		const first = await harness.taskGraph(context);
-		const second = await harness.taskGraph(context);
+		const first = await harness.watchTaskGraph(context);
+		const second = await harness.watchTaskGraph(context);
 		expect(second.value).toBe(first.value);
 		const updates: string[] = [];
-		first.subscribe((value, _context, delivery) => {
-			if (delivery.kind === "update") updates.push(value.tasks[String(id)]?.state.status ?? "gone");
+		first.start(async ({ value }) => {
+			updates.push(value.tasks[String(id)]?.state.status ?? "gone");
 		});
 		harness.resume();
 		await reached.promise;
@@ -354,13 +357,38 @@ describe("task graph view", () => {
 		await flush();
 		expect(updates).toEqual(["running", "gone"]);
 		const last = first.value;
-		first.dispose();
-		second.dispose();
+		await first.stop();
+		await second.stop();
 		// No observer is left, so the mount was dropped: a new observer builds a new revision.
-		const rebuilt = await harness.taskGraph(context);
+		const rebuilt = await harness.watchTaskGraph(context);
 		expect(rebuilt.value).toEqual(last);
 		expect(rebuilt.value).not.toBe(last);
-		rebuilt.dispose();
+		await rebuilt.stop();
+		await harness.close(context);
+	});
+
+	it("advances with the conversation view inside the one storage commit that changes both", async () => {
+		const storage = new ControlledStorage();
+		const { Parent, Child } = family(gatesNever());
+		const { harness } = await openTasks(storage, [Parent, Child]);
+		const root = await harness.root(context);
+		const seen: string[] = [];
+		const record = (name: string): Observer<ConversationView | TaskGraph> => ({
+			advance: () => {
+				seen.push(`${name} adopting=${storage.adopting}`);
+			},
+			end: () => {},
+		});
+		const view = await harness.observeConversation(root.id, record("view"), context);
+		const graph = await harness.observeTaskGraph(record("graph"), context);
+		await root.commit(async (tx) => {
+			await tx.appendEntry(root.id, { kind: "note" });
+			await tx.createTask(Parent, null, { ownership: { kind: "conversation" } });
+		}, context);
+		// Both inside the one adopt, in no promised order.
+		expect([...seen].sort()).toEqual(["graph adopting=true", "view adopting=true"]);
+		view.detach();
+		graph.detach();
 		await harness.close(context);
 	});
 });

@@ -27,7 +27,7 @@ import type {
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
-
+import { getIdentityHeaders } from "../utils/identity.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
 import { ownedSlice } from "../utils/text.ts";
@@ -196,6 +196,8 @@ function createEventConverter(model: Model<"pi-messages">) {
 
 	return (event: PiMessagesEvent): AssistantMessageEvent => {
 		if ("contentIndex" in event) {
+			// The index comes from the wire and keys the content array: `__proto__` would reach Array.prototype, and a huge
+			// index would make a sparse array of billions of holes. A start adds the next block; other events need one.
 			const index: unknown = event.contentIndex;
 			const limit = event.type.endsWith("_start") ? partial.content.length : partial.content.length - 1;
 			if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index > limit) {
@@ -407,12 +409,15 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			const response = await (options?.fetch ?? globalThis.fetch)(url, {
 				method: "POST",
-				headers: {
-					authorization: `Bearer ${apiKey}`,
-					accept: "text/event-stream",
-					"content-type": "application/json",
-					...providerHeadersToRecord(options?.headers),
-				},
+				headers: providerHeadersToRecord(
+					getIdentityHeaders(model, options?.identity),
+					{
+						authorization: `Bearer ${apiKey}`,
+						accept: "text/event-stream",
+						"content-type": "application/json",
+					},
+					options?.headers,
+				),
 				body: JSON.stringify(payload),
 				signal: options?.signal,
 			});

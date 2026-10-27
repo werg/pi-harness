@@ -65,3 +65,8 @@ export function closedError(session: { readonly failure: { readonly error: unkno
 	const failure = session.failure;
 	return failure === undefined ? new Error("Harness is closed") : new SessionFailed(failure.error);
 }
+
+/** `{ extension }` when the extension is known. */
+export function optionalExtension(extension: string | undefined): { readonly extension?: string } {
+	return extension === undefined ? {} : { extension };
+}

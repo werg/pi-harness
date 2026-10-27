@@ -4,7 +4,13 @@
 
 ### Fixed
 
+- Bounded Streamable HTTP error excerpts no longer retain the full response body.
+
 - Reject non-HTTP OAuth discovery and authorization URLs supplied by MCP servers instead of passing local-file or custom protocols to the platform URL handler.
+
+## [1.4.0] - 2026-10-21
+
+## [1.3.0] - 2026-10-15
 
 ## [1.2.0] - 2026-10-12
 

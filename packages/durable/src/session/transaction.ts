@@ -1,6 +1,8 @@
 import type { Context, Draft, JsonValue } from "@earendil-works/chord";
-import { type Change, type Op, type Prepared, type Tracker, track } from "@earendil-works/chord/delta";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { type Change, type Op, type PendingOps, type Prepared, type Tracker, track } from "@earendil-works/chord/delta";
 import { copyJson } from "@earendil-works/chord/json";
+import type { TelemetryCarrier } from "@earendil-works/pi-telemetry";
 import {
 	type AnyDocDefinition,
 	type AnyDocToken,
@@ -24,6 +26,7 @@ import type {
 	Cursor,
 	DocumentAddress,
 	DocumentCommitChange,
+	DocumentContent,
 	DocumentCopySource,
 	DocumentCreate,
 	DocumentId,
@@ -99,6 +102,28 @@ export type LoadedDocument = {
 	readonly tracker: Tracker<JsonObject>;
 };
 
+/**
+ * The changes of a cached incarnation that deferred commits adopted in memory and the Session has not stored yet
+ * (`CommitPersistence`), folded. The Session owns it; a commit that stores them takes them.
+ */
+export type HeldDocument = {
+	readonly loaded: LoadedDocument;
+	readonly pending: PendingOps;
+	/** Documents whose deferred changes must reach storage in the same transaction. */
+	group: ReadonlySet<DocumentId>;
+	readonly conversationId: ConversationId | undefined;
+	/** Set when a held commit selected a base (`checkpointWhen`): their store writes the whole value. */
+	base: boolean;
+};
+
+/** What adoption publishes: to the Session's own observers, and the stored changes to `subscribeCommits()`. */
+export type AdoptedDocuments = {
+	/** This commit's own changes, as memory adopted them. */
+	readonly observed: readonly DocumentCommitChange[];
+	/** What Storage got: `observed`, unless the commit also stored held changes, which precede its own. */
+	readonly stored: readonly DocumentCommitChange[];
+};
+
 /** Session services used by a transaction while it holds the mutation line. */
 export interface TransactionHost {
 	readonly storage: Storage;
@@ -127,6 +152,9 @@ type TransactionTask = {
 	write?: { readonly kind: "create" | "replace"; readonly record: AnyTaskRecord };
 	publicationConversationId?: ConversationId;
 };
+
+/** Internal run creation resolves submission carriers against staged records before reading storage. */
+export type TaskCreationOptions = TaskOptions & { readonly submissionIds?: readonly SubmissionId[] };
 
 /** Defaults a commit binds to: `tx.createTask()` conversation and the task attributed to appended entries. */
 export type TransactionScope = {
@@ -187,6 +215,11 @@ type DocumentPlan = {
 	};
 	/** Resolved before Storage admission so adoption performs no reads. */
 	conversationId?: ConversationId;
+	/**
+	 * Set when this commit also stores held changes of the incarnation (`takeHeld()`): the operations its stored change
+	 * publishes, held first, and whether it has a change of its own to show the Session's observers.
+	 */
+	held?: { readonly ops: readonly Op[]; readonly observed: boolean };
 };
 
 /**
@@ -197,7 +230,7 @@ type DocumentPlan = {
  */
 export class Transaction implements Tx {
 	readonly #host: TransactionHost;
-	readonly #context: Context;
+	#context: Context;
 	readonly #scope: TransactionScope;
 	readonly #pendingOperations = new Set<Promise<unknown>>();
 	#sealed = false;
@@ -218,6 +251,12 @@ export class Transaction implements Tx {
 
 	/** Write and publication plans of every staged incarnation, built during assembly. */
 	readonly #plans: DocumentPlan[] = [];
+	/** Held changes stored solely because they share an earlier deferred transaction. */
+	readonly #heldOnly: {
+		readonly hold: HeldDocument;
+		readonly content: DocumentContent;
+		readonly ops: readonly Op[];
+	}[] = [];
 	/** Every document acquisition or retirement marker in staging order. */
 	readonly #documents: DocumentEntry[] = [];
 	/** Latest transaction-local incarnation or retirement marker at each logical address. */
@@ -388,9 +427,23 @@ export class Transaction implements Tx {
 	createTask<I, S extends { phase: string }, R, H extends object>(
 		task: Task<I, S, R, H>,
 		input: I,
-		options: TaskOptions,
+		options: TaskCreationOptions,
 	): Promise<TaskId<R>> {
 		return this.#write(async () => {
+			if (options.submissionIds !== undefined) {
+				let trace: TaskOptions["trace"];
+				let links: TelemetryCarrier[] | undefined;
+				for (let index = 0; index < options.submissionIds.length; index++) {
+					const id = options.submissionIds[index]!;
+					const submission = this.#submissions.get(id) ?? (await this.#host.storage.submission(id, this.#context));
+					if (index === 0) trace = submission?.trace ?? "root";
+					else if (submission?.trace !== undefined) {
+						links ??= [];
+						links.push(submission.trace);
+					}
+				}
+				options = { ...options, trace, links };
+			}
 			const ownership = options.ownership;
 			let owner: AnyTaskRecord | undefined;
 			if (ownership.kind === "task") {
@@ -418,6 +471,11 @@ export class Transaction implements Tx {
 					kind: definition.name,
 					version: definition.version,
 					input,
+					trace:
+						options.trace === "root"
+							? undefined
+							: (options.trace ?? this.#context.telemetry.propagation?.inject(this.#context.telemetry)),
+					links: options.links,
 					...(owner === undefined ? {} : { owner: owner.id }),
 					background: options.background ?? false,
 					abortRequested: false,
@@ -580,7 +638,6 @@ export class Transaction implements Tx {
 		key: string,
 		seed: I,
 	): Promise<Draft<T>>;
-
 	doc(token: AnyDocToken, ...args: readonly unknown[]): Promise<Draft<JsonObject>> {
 		try {
 			this.#assertOpen();
@@ -744,6 +801,7 @@ export class Transaction implements Tx {
 		this.#sealed = true;
 		this.#abortChanges();
 		await Promise.allSettled(this.#pendingOperations);
+		this.#context = BACKGROUND_CONTEXT;
 	}
 
 	/**
@@ -755,6 +813,7 @@ export class Transaction implements Tx {
 		if (this.#pendingOperations.size > 0) {
 			this.#abortChanges();
 			await Promise.allSettled(this.#pendingOperations);
+			this.#context = BACKGROUND_CONTEXT;
 			throw new Error("Session commit callback settled before its pending Tx operations");
 		}
 		try {
@@ -766,6 +825,8 @@ export class Transaction implements Tx {
 		} catch (error) {
 			this.#abortChanges();
 			throw error;
+		} finally {
+			this.#context = BACKGROUND_CONTEXT;
 		}
 	}
 
@@ -774,9 +835,134 @@ export class Transaction implements Tx {
 		this.#abortChanges();
 	}
 
-	/** Adopt every prepared change by pointer swap after Storage success and describe the publication. */
-	adopt(seq: Seq): DocumentCommitChange[] {
+	/**
+	 * Internal: what a deferred commit holds in memory instead of storing (`CommitPersistence`), each changed incarnation
+	 * with its operations and whether they selected a base; `undefined` when the commit must be stored. It may be held
+	 * only when every write changes an existing task document or `latest`, `initial`-fork conversation document at its
+	 * stored version.
+	 */
+	holdable():
+		| {
+				readonly loaded: LoadedDocument;
+				readonly ops: readonly Op[];
+				readonly base: boolean;
+				readonly conversationId: ConversationId | undefined;
+		  }[]
+		| undefined {
+		if (this.#writes.some((write) => write.type !== "document.change")) return undefined;
+		const held = [];
+		for (const plan of this.#plans) {
+			const { content, change } = plan;
+			if (content === undefined && !plan.retire) continue;
+			if (plan.retire || change?.loaded === undefined || content?.type !== "document.change") return undefined;
+			const { loaded, prepared, version } = change;
+			const record = loaded.record;
+			if (
+				record.scope.kind !== "task" &&
+				(record.scope.kind !== "conversation" || record.history !== "latest" || record.fork !== "initial")
+			) {
+				return undefined;
+			}
+			// A migration stores a base at once.
+			if (loaded.storedVersion !== version) return undefined;
+			held.push({
+				loaded,
+				ops: prepared.ops,
+				base: content.content.kind === "base",
+				conversationId: plan.conversationId,
+			});
+		}
+		return held;
+	}
+
+	/**
+	 * Internal: adopt a held commit (`holdable()`) in memory only. Trackers advance by pointer swap; stored versions and
+	 * delta counts stay, as nothing was stored. Returns its publication for the Session's own observers.
+	 */
+	adoptHeld(): DocumentCommitChange[] {
 		const publications: DocumentCommitChange[] = [];
+		for (const plan of this.#plans) {
+			// Every plan of a held commit changes or reads a loaded incarnation (`holdable()`).
+			const { tracker, prepared, version, loaded } = plan.change!;
+			if (prepared.ops.length === 0) {
+				prepared.abort();
+				continue;
+			}
+			tracker.adopt(prepared);
+			const record = loaded!.record;
+			const conversationId = plan.conversationId;
+			publications.push({
+				type: "document",
+				record,
+				conversationId,
+				version,
+				value: prepared.value,
+				ops: prepared.ops,
+			});
+		}
+		return publications;
+	}
+
+	/**
+	 * Internal: store the held changes of every incarnation this commit reads or writes in front of its own, so a stored
+	 * document never misses an operation its later ones build on. Called right before Storage admission, after every
+	 * fallible step, because it empties the holds: a failure earlier keeps them. Returns the holds it took.
+	 */
+	takeHeld<H extends HeldDocument>(held: (id: DocumentId) => H | undefined): H[] {
+		const selected = new Set<H>();
+		for (const plan of this.#plans) {
+			if (!("createdAt" in plan.record)) continue;
+			const hold = held(plan.record.id);
+			if (hold === undefined) continue;
+			for (const id of hold.group) {
+				const member = held(id);
+				if (member === undefined) throw new Error(`Deferred document group lost member ${id}`);
+				selected.add(member);
+			}
+		}
+		const remaining = new Set(selected);
+		for (const plan of this.#plans) {
+			// A new incarnation holds nothing yet.
+			if (!("createdAt" in plan.record)) continue;
+			const hold = held(plan.record.id);
+			if (hold === undefined || !remaining.delete(hold)) continue;
+			const own = plan.content?.type === "document.change" ? plan.content : undefined;
+			const change = plan.change;
+			const value = change?.prepared.value ?? hold.loaded.tracker.value;
+			const stored = storeHeld(hold, change?.prepared.ops ?? EMPTY_OPERATIONS, value, hold.loaded.valueVersion);
+			// A base this commit selected or must write covers what was held.
+			const content = own?.content.kind === "base" ? own.content : stored.content;
+			const write = { type: "document.change", id: plan.record.id, content } as const;
+			if (own !== undefined) this.#writes[this.#writes.indexOf(own)] = write;
+			else this.#insertBeforeRetirement(write);
+			if (!plan.retire) plan.held = { ops: stored.ops, observed: own !== undefined };
+			plan.content = write;
+			// A document this commit only read may not have had its owner resolved during assembly.
+			plan.conversationId ??= hold.conversationId;
+		}
+		for (const hold of remaining) {
+			const { record, tracker, valueVersion } = hold.loaded;
+			const stored = storeHeld(hold, EMPTY_OPERATIONS, tracker.value, valueVersion);
+			this.#insertBeforeRetirement({ type: "document.change", id: record.id, content: stored.content });
+			this.#heldOnly.push({ hold, ...stored });
+		}
+		return [...selected];
+	}
+
+	/** Stage a content write for an incarnation, before its retirement when it retires. */
+	#insertBeforeRetirement(write: Extract<StorageWrite, { readonly type: "document.change" }>): void {
+		const at = this.#writes.findIndex(
+			(candidate) => candidate.type === "document.retire" && candidate.id === write.id,
+		);
+		if (at < 0) this.#writes.push(write);
+		else this.#writes.splice(at, 0, write);
+	}
+
+	/** Adopt every prepared change by pointer swap after Storage success and describe the publication. */
+	adopt(seq: Seq): AdoptedDocuments {
+		const publications: DocumentCommitChange[] = [];
+		// Only when the commit stored held changes: then what Storage got differs from what memory adopted.
+		let stored: DocumentCommitChange[] | undefined;
 		for (const plan of this.#plans) {
 			const committed = "createdAt" in plan.record;
 			let record: DocumentRecord = committed ? (plan.record as DocumentRecord) : { ...plan.record, createdAt: seq };
@@ -804,31 +990,37 @@ export class Transaction implements Tx {
 					});
 				}
 			}
-			const conversationId = plan.conversationId;
-			if (plan.retire) {
-				if (committed) this.#host.evict(plan.addressId, record.id);
-				const retired = { version: undefined, value: null, ops: EMPTY_OPERATIONS };
-				publications.push({ type: "document", record, conversationId, ...retired });
-			} else if (plan.content?.type === "document.copy") {
-				publications.push({
-					type: "document.copy",
-					record,
-					conversationId: conversationId!,
-					source: plan.content.source,
-				});
-			} else if (change !== undefined && publishes(plan)) {
-				const ops = change.loaded === undefined ? EMPTY_OPERATIONS : change.prepared.ops;
-				publications.push({
+			if (plan.retire && committed) this.#host.evict(plan.addressId, record.id);
+			const publication = describe(plan, record);
+			if (publication === undefined) continue;
+			const held = plan.held;
+			if (held === undefined) {
+				publications.push(publication);
+				stored?.push(publication);
+				continue;
+			}
+			stored ??= [...publications];
+			if (held.observed) publications.push(publication);
+			// Only a document change of a loaded incarnation carries held operations.
+			stored.push(publication.type === "document" ? { ...publication, ops: held.ops } : publication);
+		}
+		if (this.#heldOnly.length > 0) {
+			stored ??= [...publications];
+			for (const { hold, content, ops } of this.#heldOnly) {
+				const { record, tracker, valueVersion } = hold.loaded;
+				if (content.kind === "base") hold.loaded.deltasSinceBase = 0;
+				else hold.loaded.deltasSinceBase++;
+				stored.push({
 					type: "document",
 					record,
-					conversationId,
-					version: change.version,
-					value: change.prepared.value,
+					conversationId: hold.conversationId,
+					version: valueVersion,
+					value: tracker.value,
 					ops,
 				});
 			}
 		}
-		return publications;
+		return { observed: publications, stored: stored ?? publications };
 	}
 
 	async #assemble(): Promise<StorageWrite[]> {
@@ -1116,6 +1308,38 @@ function planDocument(document: DocumentEntry): DocumentPlan | undefined {
 			return { ...plan, record: loaded.record, change, ...(content === undefined ? {} : { content }) };
 		}
 	}
+}
+
+/** The publication of one adopted plan, if it publishes (`publishes()`), with `record` as committed. */
+function describe(plan: DocumentPlan, record: DocumentRecord): DocumentCommitChange | undefined {
+	const conversationId = plan.conversationId;
+	if (plan.retire)
+		return { type: "document", record, conversationId, version: undefined, value: null, ops: EMPTY_OPERATIONS };
+	if (plan.content?.type === "document.copy") {
+		return { type: "document.copy", record, conversationId: conversationId!, source: plan.content.source };
+	}
+	const change = plan.change;
+	if (change === undefined || !publishes(plan)) return undefined;
+	const ops = change.loaded === undefined ? EMPTY_OPERATIONS : change.prepared.ops;
+	return { type: "document", record, conversationId, version: change.version, value: change.prepared.value, ops };
+}
+
+/**
+ * Take a hold's changes after `ops`, a commit's own on top of them, as one stored content for an incarnation now at
+ * `value`, and the operations a reader of the stored state applies to reach it: the folded ones, or a root replacement
+ * after the queue overflowed, which stores a base, as does a hold whose commits selected one.
+ */
+export function storeHeld(
+	hold: HeldDocument,
+	ops: readonly Op[],
+	value: JsonObject,
+	version: number,
+): { readonly content: DocumentContent; readonly ops: readonly Op[] } {
+	hold.pending.push(ops);
+	const taken = hold.pending.take();
+	if (taken.kind === "replace") return { content: { version, kind: "base", value }, ops: [["r", value]] };
+	if (hold.base) return { content: { version, kind: "base", value }, ops: taken.ops };
+	return { content: { version, kind: "delta", ops: taken.ops }, ops: taken.ops };
 }
 
 /**

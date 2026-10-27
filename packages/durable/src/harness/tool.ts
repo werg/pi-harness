@@ -1,12 +1,22 @@
 import type { Context, Draft, JsonRepresentation, JsonValue } from "@earendil-works/chord";
 import { awaitWithContext } from "@earendil-works/chord/context";
-import { overlap } from "@earendil-works/chord/delta";
+import { overlap, ownedSlice } from "@earendil-works/chord/delta";
 import { copyJson } from "@earendil-works/chord/json";
+import {
+	boundOutput,
+	OutputBuffer,
+	type OutputCheckpoint,
+	type OutputLimits,
+	PROGRESS_BYTES_PER_SECOND,
+	Progress,
+	type ProgressClock,
+} from "@earendil-works/chord/output";
 import type { ImageContent, TextContent, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { Compile } from "typebox/compile";
 import { defineDoc, defineDocFamily } from "../documents.ts";
 import { AssistantEntry, DirectToolCallEntry, DirectToolResultEntry, ToolResultEntry } from "../entries.ts";
+import type { ExecutionEnv } from "../env/index.ts";
 import { errorMessage } from "../errors.ts";
 import { defineTask } from "../tasks.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, utf8ByteLength } from "../truncate.ts";
@@ -24,6 +34,7 @@ import type {
 	Tx,
 	TypedEntry,
 } from "../types.ts";
+import { toolExtension } from "./agent.ts";
 import { bindTool, toolMatches } from "./binding.ts";
 import { assignJson, snapshotError } from "./json.ts";
 import {
@@ -32,18 +43,11 @@ import {
 	LiveDoc,
 	type NestedToolSlot,
 	type NestedToolSummary,
+	PROGRESS_COMMIT,
 	removeNestedSlots,
 	type ToolSlot,
 	toolSlot,
 } from "./live.ts";
-import {
-	boundOutput,
-	OutputBuffer,
-	type OutputCheckpoint,
-	type OutputLimits,
-	PROGRESS_BYTES_PER_SECOND,
-	Progress,
-} from "./output.ts";
 import type {
 	NestedToolExecutionResult,
 	ToolBinding,
@@ -57,6 +61,7 @@ import type {
 	ToolRegistration,
 } from "./types.ts";
 import { recordUsage } from "./usage.ts";
+import { optionalExtension } from "./util.ts";
 
 export type DirectToolCall = { readonly id: string; readonly name: string; readonly arguments: JsonObject };
 export type ToolTaskInput =
@@ -134,6 +139,8 @@ export const NestedCallDoc = defineDocFamily<NestedCallState, null>({
 	scope: "task",
 	family: true,
 	initial: () => ({}),
+	// The document retires with its task.
+	checkpointWhen: () => false,
 });
 
 type Runtime = TaskRuntime<ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, ToolHooks>;
@@ -325,7 +332,10 @@ async function parkBinding(
 
 /** Resolve the exact original source; direct calls never claim provider authorship. */
 async function readCall(runtime: Runtime, input: ToolTaskInput, context: Context): Promise<ToolHookCall> {
-	if (input.kind === "nested") return { ...input.call, parent: { taskId: input.parent, callId: input.parentCallId } };
+	if (input.kind === "nested") {
+		context.telemetry.setAttributes({ "tool.name": input.call.name, "tool.call_id": input.call.id });
+		return { ...input.call, parent: { taskId: input.parent, callId: input.parentCallId } };
+	}
 	if (input.kind === "direct") {
 		const entry = await runtime.entry(DirectToolCallEntry, input.entryId, context);
 		const call = entry?.data?.call;
@@ -342,6 +352,10 @@ async function readCall(runtime: Runtime, input: ToolTaskInput, context: Context
 				)
 			: undefined;
 	if (call === undefined) throw new Error(`Entry ${input.assistant} has no tool call ${input.callId}`);
+	context.telemetry.setAttributes({
+		"tool.name": call.name,
+		"tool.call_id": call.id,
+	});
 	return call;
 }
 
@@ -433,7 +447,9 @@ async function run(
 	const assertLive = (): void => {
 		if (ended) throw new Error(`Tool call ${call.id} has settled`);
 	};
-	const api: Omit<ToolExecutionApi, "env"> = {
+	/** Built for this call, below, so a rerun after recovery gets the conversation's environment at that time. */
+	let env: ExecutionEnv | undefined;
+	const api: ToolExecutionApi = {
 		taskId: runtime.taskId,
 		conversationId: runtime.conversationId,
 		callId: call.id,
@@ -443,7 +459,13 @@ async function run(
 		continuation,
 		registry: runtime.registry,
 		agent: runtime.agent,
-		models: runtime.models,
+		get models() {
+			return runtime.models;
+		},
+		get env() {
+			return env;
+		},
+		now: () => runtime.now(),
 		output: (chunk, skipped) => {
 			assertLive();
 			if (reported.output.push(chunk, skipped)) progress.mark();
@@ -476,12 +498,16 @@ async function run(
 			committed.catch(() => {});
 			return awaitWithContext(committed, detailsContext);
 		},
-		commit: async (change, commitContext) => {
+		commit: async (change, commitContext, options) => {
 			let result: Awaited<ReturnType<typeof change>> | undefined;
-			await runtime.commit(async (tx) => {
-				result = await change(tx);
-				return undefined;
-			}, commitContext);
+			await runtime.commit(
+				async (tx) => {
+					result = await change(tx);
+					return undefined;
+				},
+				commitContext,
+				options,
+			);
 			return result as Awaited<ReturnType<typeof change>>;
 		},
 		retainContinuation: async (candidate, change, commitContext) => {
@@ -553,21 +579,10 @@ async function run(
 	// Execution time of this attempt; a rerun after recovery measures only itself.
 	let durationMs: number | undefined;
 	try {
-		// Built for this call, so a rerun after recovery gets the conversation's environment at that time.
-		const env = await runtime.env(context);
+		env = await runtime.env(context);
 		const startedAt = performance.now();
 		try {
-			result = await (cancelling ? tool.cancel! : tool.execute)(
-				args,
-				{
-					...api,
-					env,
-					get executionData() {
-						return binding.data === undefined ? undefined : immutableData(copyJson(binding.data));
-					},
-				},
-				context,
-			);
+			result = await (cancelling ? tool.cancel! : tool.execute)(args, api, context);
 			if ("wait" in result && tool.cancel === undefined)
 				throw new Error(`External tool ${call.name} has no cancellation contract`);
 		} finally {
@@ -680,6 +695,25 @@ async function checkpointProgress(
 }
 
 /**
+ * The Harness clock and timers for progress pacing. After the invocation ends nothing more commits, and the clock
+ * answers with the last time it read.
+ */
+function progressClock(runtime: Runtime): ProgressClock {
+	let last = 0;
+	return {
+		now: () => {
+			try {
+				last = runtime.now();
+			} catch {
+				// The invocation ended.
+			}
+			return last;
+		},
+		setTimer: (callback, delayMs) => runtime.setTimer(callback, delayMs),
+	};
+}
+
+/**
  * Throttled commits of what the tool reported into its slot, in `pi.live.tools` or `pi.live.nestedTools`, each writing
  * only what changed since the last one; none when `enabled` is false.
  */
@@ -705,31 +739,35 @@ function publishProgress(runtime: Runtime, reported: Reported, enabled: boolean,
 			}
 			if (detailsChanged) bytes += utf8ByteLength(JSON.stringify(current.details ?? null));
 			if (added.length > 0) bytes += utf8ByteLength(JSON.stringify(added));
-			await runtime.commit(async (tx) => {
-				const progress = await tx.doc(ToolProgressDoc, runtime.taskId);
-				assignJson(progress as unknown as Record<string, JsonValue>, "output", outputCheckpoint);
-				progress.droppedBytes = snapshot.droppedBytes;
-				progress.droppedLines = snapshot.droppedLines;
-				if (detailsChanged && current.details !== undefined)
-					assignJson(progress as unknown as Record<string, JsonValue>, "details", current.details);
-				for (const diagnostic of added) progress.diagnostics.push(diagnostic);
-				const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
-				if (slot === undefined) return undefined;
-				// REMINDER: assign `output` as one string field. Chord then diffs it into an append, or a trim plus an
-				// append for a sliding tail; replacing the slot object would record the whole window on every commit.
-				if ((slot.output ?? "") !== snapshot.text) slot.output = snapshot.text;
-				if (snapshot.droppedBytes > 0) slot.droppedBytes = snapshot.droppedBytes;
-				if (snapshot.droppedLines > 0) slot.droppedLines = snapshot.droppedLines;
-				// Diff details leaf by leaf and append new diagnostics, so each commit writes only what changed.
-				if (detailsChanged && current.details !== undefined) {
-					assignJson(slot as unknown as Record<string, JsonValue>, "details", current.details);
-				}
-				if (added.length > 0) {
-					if (slot.diagnostics === undefined) slot.diagnostics = [];
-					for (const diagnostic of added) slot.diagnostics.push(diagnostic);
-				}
-				return undefined;
-			}, context);
+			await runtime.commit(
+				async (tx) => {
+					const progress = await tx.doc(ToolProgressDoc, runtime.taskId);
+					assignJson(progress as unknown as Record<string, JsonValue>, "output", outputCheckpoint);
+					progress.droppedBytes = snapshot.droppedBytes;
+					progress.droppedLines = snapshot.droppedLines;
+					if (detailsChanged && current.details !== undefined)
+						assignJson(progress as unknown as Record<string, JsonValue>, "details", current.details);
+					for (const diagnostic of added) progress.diagnostics.push(diagnostic);
+					const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
+					if (slot === undefined) return undefined;
+					// REMINDER: assign `output` as one string field. Chord then diffs it into an append, or a trim plus an
+					// append for a sliding tail; replacing the slot object would record the whole window on every commit.
+					if ((slot.output ?? "") !== snapshot.text) slot.output = snapshot.text;
+					if (snapshot.droppedBytes > 0) slot.droppedBytes = snapshot.droppedBytes;
+					if (snapshot.droppedLines > 0) slot.droppedLines = snapshot.droppedLines;
+					// Diff details leaf by leaf and append new diagnostics, so each commit writes only what changed.
+					if (detailsChanged && current.details !== undefined) {
+						assignJson(slot as unknown as Record<string, JsonValue>, "details", current.details);
+					}
+					if (added.length > 0) {
+						if (slot.diagnostics === undefined) slot.diagnostics = [];
+						for (const diagnostic of added) slot.diagnostics.push(diagnostic);
+					}
+					return undefined;
+				},
+				context,
+				PROGRESS_COMMIT,
+			);
 			written = current;
 			return bytes;
 		},
@@ -738,6 +776,7 @@ function publishProgress(runtime: Runtime, reported: Reported, enabled: boolean,
 			if (!runtime.signal.aborted) runtime.report(error);
 		},
 		runtime.settings.progress.outputIntervalMs,
+		progressClock(runtime),
 	);
 }
 
@@ -784,7 +823,12 @@ async function finalResult(
 		} else {
 			// The model never sees structured output, so its call stands; the host learns of the broken tool.
 			final = rest;
-			runtime.report(new Error(broken));
+			// Only names the extension: a failed resolution leaves the report without the name.
+			const extension = await runtime.agent(context).then(
+				(agent) => toolExtension(agent, tool.name),
+				() => undefined,
+			);
+			runtime.report(new Error(broken), { type: "extension", ...optionalExtension(extension) });
 		}
 	}
 	// Programs get the tool's own value: without a schema, its output. The model reads only `output`, so model-issued
@@ -960,6 +1004,7 @@ async function startNestedCall(
 	const tool = (await runtime.agent(context)).callable.find((candidate) => candidate.name === name);
 	const binding = tool === undefined ? null : bindTool(tool, runtime.settings.toolExecution);
 	let id: TaskId<ToolTaskResult> | undefined;
+	let replayed = false;
 	await runtime.commit(async (tx) => {
 		// Opened, or created empty for a key not made yet.
 		const state = await tx.doc(NestedCallDoc, runtime.taskId, key, null);
@@ -972,6 +1017,7 @@ async function startNestedCall(
 				jsonEqual(input.call.arguments as JsonValue, call.arguments as JsonValue);
 			if (!same) throw new Error(`Nested call ${call.id} was already made with another tool or other arguments`);
 			id = existing as TaskId<ToolTaskResult>;
+			replayed = state.result !== undefined;
 			return undefined;
 		}
 		const input: ToolTaskInput = {
@@ -1003,6 +1049,9 @@ async function startNestedCall(
 		id = created;
 		return undefined;
 	}, context);
+	if (replayed) {
+		context.telemetry.addEvent("pi.durable.replay", { "tool.name": name });
+	}
 	return id!;
 }
 
@@ -1082,9 +1131,12 @@ function truncated(
 /** Error text a nested call's summary keeps. */
 const MAX_SUMMARY_ERROR_CHARS = 500;
 
-/** How a nested call ended, for its slot: error text, from its diagnostics or else its `output`, bounded. */
+/**
+ * How a nested call ended, for its slot: error text, from its diagnostics or else its `output`, bounded. The bound is a
+ * copy, so the slot never keeps a large output alive through a slice of it.
+ */
 function summaryOf(result: NestedToolExecutionResult, output: Content): NestedToolSummary {
-	const error = result.isError ? errorTextOf(result, output).slice(0, MAX_SUMMARY_ERROR_CHARS) : "";
+	const error = result.isError ? ownedSlice(errorTextOf(result, output), 0, MAX_SUMMARY_ERROR_CHARS) : "";
 	return {
 		isError: result.isError,
 		...(result.durationMs === undefined ? {} : { durationMs: result.durationMs }),

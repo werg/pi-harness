@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { withAbortSignal } from "@earendil-works/chord/context";
 import {
 	ConversationBusy,
 	defineDoc,
@@ -336,7 +337,7 @@ describe("transactional submission preparation", () => {
 					return { kind: "joined" };
 				},
 			},
-			{ ...context, abortSignal: controller.signal },
+			withAbortSignal(controller.signal, context),
 		);
 		try {
 			await entered.promise;

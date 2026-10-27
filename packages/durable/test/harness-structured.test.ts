@@ -135,6 +135,7 @@ const Unregistered = defineTask<NodeInput, { phase: "run" }, string>({
 });
 
 const TaskNotes = defineDoc<{ text: string }>({
+	checkpointWhen: () => false,
 	kind: "test.task-notes",
 	version: 1,
 	scope: "task",
@@ -1407,7 +1408,7 @@ describe("tool rounds", () => {
 		opened = harness;
 		const stream = await watchEvents(harness, root.id, context);
 		const events: AgentEvent[] = [];
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			events.push(...batch);
 		});
 		await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
@@ -1433,6 +1434,9 @@ describe("tool rounds", () => {
 			},
 		});
 		const setup = { ...base, models };
+		// The partial is stored at once, so the failed final commit leaves it for the reopened run to convert; held, it would
+		// be lost with the failed Session.
+		setup.settings.progress = { persistWithinMs: 0 };
 		addTask(setup.registry, Node);
 		let opened: Harness | undefined;
 		addHooks(setup.registry, GenerationTask, {
@@ -1452,7 +1456,8 @@ describe("tool rounds", () => {
 		class Failing extends ControlledStorage {
 			override async commit(
 				writes: Parameters<MemoryStorage["commit"]>[0],
-				ctx: Parameters<MemoryStorage["commit"]>[1],
+				adopt: Parameters<MemoryStorage["commit"]>[1],
+				ctx: Parameters<MemoryStorage["commit"]>[2],
 			) {
 				const finalizes = writes.some(
 					(write) => write.type === "task" && write.value.id === reject && write.value.state.status === "terminal",
@@ -1461,7 +1466,7 @@ describe("tool rounds", () => {
 					reject = undefined;
 					throw failure;
 				}
-				return super.commit(writes, ctx);
+				return super.commit(writes, adopt, ctx);
 			}
 		}
 		const storage = new Failing();
@@ -1869,7 +1874,7 @@ describe("tool rounds and events", () => {
 	async function listen(harness: Harness, conversation: Conversation) {
 		const stream = await watchEvents(harness, conversation.id, context);
 		const events: AgentEvent[] = [];
-		stream.start(async (batch) => {
+		stream.start(async ({ value: batch }) => {
 			events.push(...batch);
 		});
 		return { stream, events };

@@ -50,6 +50,8 @@ function scenario(stage: "execute" | "environment" | "agent" | "cancel", replay:
 	const cancellations: unknown[] = [];
 	const details: Promise<unknown>[] = [];
 	const state = { now: 1000, observing: false, repaired: false };
+	// Tests jump `state.now` to make waits due; real elapsed time keeps the clock moving so progress pacing comes due.
+	const started = performance.now();
 	const tool = defineTool({
 		name: "owned-operation",
 		description: "Attach to an admitted external operation",
@@ -116,7 +118,7 @@ function scenario(stage: "execute" | "environment" | "agent" | "cancel", replay:
 				models: setup.models,
 				registry: setup.registry,
 				settings: setup.settings,
-				now: () => state.now,
+				now: () => state.now + Math.floor(performance.now() - started),
 				env: () => {
 					if (stage === "environment" && state.observing && !state.repaired) throw original;
 					return undefined;

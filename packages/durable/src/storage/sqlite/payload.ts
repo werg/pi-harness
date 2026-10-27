@@ -15,6 +15,7 @@ type ChunkRow = {
 
 /** Hydrate a bounded, indexed selection in one statement, preserving its snapshot and avoiding per-record queries. */
 export async function readJsonRows<T extends object>(
+	table: string,
 	executor: SqliteExecutor,
 	selection: string,
 	params: readonly SqliteValue[],
@@ -25,7 +26,7 @@ export async function readJsonRows<T extends object>(
 		`WITH selected AS (${selection})
 		SELECT selected.*, chunks.ordinal AS chunk_ordinal, chunks.byte_length AS chunk_length,
 			chunks.data AS chunk_data
-		FROM selected LEFT JOIN payload_chunks AS chunks
+		FROM selected LEFT JOIN ${table} AS chunks
 			ON chunks.id = selected.id AND chunks.revision = ${revision ? "selected.payload_revision" : "0"}
 		ORDER BY ${revision ? "selected.payload_revision" : "selected.id"} ${options.descending ? "DESC" : "ASC"}, chunks.ordinal`,
 		...params,
@@ -59,16 +60,17 @@ export async function readJsonRows<T extends object>(
 
 /** Replace a complete JSON value in the caller's transaction, using the same representation at every size. */
 export async function writeJsonPayload(
+	table: string,
 	executor: SqliteExecutor,
 	id: number,
 	revision: number,
 	value: unknown,
 ): Promise<void> {
 	const bytes = encoder.encode(JSON.stringify(value));
-	await executor.run("DELETE FROM payload_chunks WHERE id = ? AND revision = ?", id, revision);
+	await executor.run(`DELETE FROM ${table} WHERE id = ? AND revision = ?`, id, revision);
 	for (let offset = 0, ordinal = 0; offset < bytes.length; offset += SQLITE_PAYLOAD_CHUNK_BYTES, ordinal++) {
 		await executor.run(
-			"INSERT INTO payload_chunks (id, revision, ordinal, byte_length, data) VALUES (?, ?, ?, ?, ?)",
+			`INSERT INTO ${table} (id, revision, ordinal, byte_length, data) VALUES (?, ?, ?, ?, ?)`,
 			id,
 			revision,
 			ordinal,
@@ -79,10 +81,11 @@ export async function writeJsonPayload(
 }
 
 export async function readJsonRow<T extends object>(
+	table: string,
 	executor: SqliteExecutor,
 	selection: string,
 	params: readonly SqliteValue[],
 	options: { readonly revision?: boolean; readonly descending?: boolean } = {},
 ): Promise<T | undefined> {
-	return (await readJsonRows<T>(executor, selection, params, options))[0];
+	return (await readJsonRows<T>(table, executor, selection, params, options))[0];
 }

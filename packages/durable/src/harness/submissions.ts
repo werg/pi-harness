@@ -1,16 +1,15 @@
 import type { Context, JsonRepresentation } from "@earendil-works/chord";
+import { withTelemetry } from "@earendil-works/chord/context";
 import { copyJson } from "@earendil-works/chord/json";
+import {
+	createTypedSpanStarter,
+	NOOP_TELEMETRY_CONTEXT,
+	type TelemetryContext,
+	type TelemetrySpan,
+} from "@earendil-works/pi-telemetry";
 import { ConversationBusy } from "../errors.ts";
-import type { SessionImpl } from "../session/session.ts";
-import type {
-	CommitPublication,
-	ConversationId,
-	JsonObject,
-	Storage,
-	SubmissionId,
-	SubmissionRecord,
-	Tx,
-} from "../types.ts";
+import type { ObservedCommit, SessionImpl } from "../session/session.ts";
+import type { ConversationId, JsonObject, Storage, SubmissionId, SubmissionRecord, Tx } from "../types.ts";
 import { startRun } from "./generation.ts";
 import {
 	appendInput,
@@ -25,13 +24,16 @@ import {
 	removeInboxItem,
 } from "./inbox.ts";
 import { LiveDoc } from "./live.ts";
+import { DURABLE_TELEMETRY_SCHEMA } from "./telemetry.ts";
 import type { InputEntry, SettledSubmissionRecord, Submission, SubmissionDraft, UserInput } from "./types.ts";
 import { closedError, Waiters } from "./util.ts";
 
 type AbortResult = "aborted" | "already_placed" | "settled";
+type Admission = { readonly id: SubmissionId; readonly status: "queued" | "placed" | "done" };
 
 /** Admission, waits, and withdrawal of the durable submissions of one Harness. */
 export class Submissions {
+	readonly #telemetry: TelemetryContext;
 	readonly #session: SessionImpl;
 	readonly #storage: Storage;
 	readonly #now: () => number;
@@ -48,7 +50,9 @@ export class Submissions {
 		now: () => number,
 		queueModes: () => QueueModes,
 		resume: () => void,
+		telemetry: TelemetryContext = NOOP_TELEMETRY_CONTEXT,
 	) {
+		this.#telemetry = telemetry;
 		this.#session = session;
 		this.#storage = storage;
 		this.#now = now;
@@ -64,12 +68,30 @@ export class Submissions {
 	/** Admit a submission in one commit; see `admitSubmission()`. */
 	async submit(conversationId: ConversationId, draft: SubmissionDraft, context: Context): Promise<Submission> {
 		this.#resume();
-		const id = await this.#session.commitWith(
-			(tx) => admitSubmission(tx, conversationId, draft, this.#now(), this.#queueModes()),
-			context,
-			{ conversationId },
+		const parent = draft.type === "input" ? this.#telemetry : context.telemetry;
+		return createTypedSpanStarter(parent, [DURABLE_TELEMETRY_SCHEMA])(
+			"pi.durable.submit",
+			{
+				"submission.type": draft.type,
+				"conversation.id": conversationId,
+			},
+			async (span) => {
+				if (draft.type === "input") span.addLink({ context: context.telemetry });
+				try {
+					const { id, status } = await this.#session.commitWith(
+						(tx) => admitSubmission(tx, conversationId, draft, this.#now(), this.#queueModes(), span),
+						withTelemetry(span, context),
+						{ conversationId },
+					);
+					span.setAttributes({ "submission.id": id, result: status });
+					return new SubmissionHandle(id, this);
+				} catch (error) {
+					// Error text may contain caller content. Record only the status.
+					span.setStatus({ status: "error" });
+					throw error;
+				}
+			},
 		);
-		return new SubmissionHandle(id, this);
 	}
 
 	/** Handle for an existing submission, or `undefined`. */
@@ -119,7 +141,7 @@ export class Submissions {
 		}, context);
 	}
 
-	#observe(publication: CommitPublication): void {
+	#observe(publication: ObservedCommit): void {
 		for (const change of publication.changes) {
 			if (change.type !== "submission" || !isSettled(change.value)) continue;
 			this.#waiters.resolve(change.value.id, change.value);
@@ -181,7 +203,8 @@ export async function admitSubmission(
 	draft: SubmissionDraft,
 	now: number,
 	queueModes: QueueModes,
-): Promise<SubmissionId> {
+	span?: TelemetrySpan,
+): Promise<Admission> {
 	if (draft.type === "input" && draft.entry !== undefined) checkInputEntry(draft.entry);
 	if (draft.requestId !== undefined) {
 		const existing = await tx.submissionByRequest(conversationId, draft.requestId);
@@ -189,10 +212,15 @@ export async function admitSubmission(
 			if (existing.type !== draft.type) {
 				throw new Error(`Request ${draft.requestId} already identifies a submission of type ${existing.type}`);
 			}
-			return existing.id;
+			return { id: existing.id, status: existing.status === "unanswered" ? "done" : existing.status };
 		}
 	}
-	const requestId = draft.requestId === undefined ? {} : { requestId: draft.requestId };
+	const trace = span?.propagation?.inject(span);
+	const fields = {
+		conversationId,
+		...(draft.requestId === undefined ? {} : { requestId: draft.requestId }),
+		...(trace === undefined ? {} : { trace }),
+	};
 	if (
 		draft.type === "write" &&
 		typeof draft.entry !== "function" &&
@@ -200,16 +228,25 @@ export async function admitSubmission(
 		!hasQueuedReset((await tx.doc(InboxDoc, conversationId)).items)
 	) {
 		const entry = await tx.appendEntry(conversationId, draft.entry);
-		const write = { conversationId, ...requestId, type: "write", status: "done", entry: entry.id } as const;
-		return (await tx.createSubmission(write)).id;
+		const write = { ...fields, type: "write", status: "done", entry: entry.id } as const;
+		return { id: (await tx.createSubmission(write)).id, status: "done" };
 	}
 	const live = await tx.doc(LiveDoc, conversationId);
 	const busy = live.run !== undefined;
+	if (
+		draft.type === "input" &&
+		draft.whenBusy === "steer" &&
+		live.run !== undefined &&
+		span?.propagation !== undefined
+	) {
+		const run = await tx.task(live.run.taskId);
+		if (run?.trace !== undefined) span.addLink({ context: span.propagation.extract(run.trace) });
+	}
 	if (busy && draft.type === "input" && draft.whenBusy === "reject") throw new ConversationBusy(conversationId);
 	// A boundary reads the table, so it is prepared before the first table write; a busy one needs none.
 	const boundary = busy ? undefined : await prepareBoundary(tx, conversationId, queueModes);
 	// Reserve the genuine native identity before product preparation; only the final candidate is committed.
-	const { id } = await tx.createSubmission({ conversationId, ...requestId, type: draft.type, status: "queued" });
+	const { id } = await tx.createSubmission({ ...fields, type: draft.type, status: "queued" });
 	const prepared =
 		draft.type === "write"
 			? {
@@ -227,7 +264,7 @@ export async function admitSubmission(
 	) {
 		const entry = await tx.appendEntry(conversationId, prepared.entry);
 		tx.placeSubmission(id, entry.id);
-		return id;
+		return { id, status: "done" };
 	}
 	if (boundary === undefined || boundary.inbox.items.length > 0) {
 		// Hosts may leave optional fields `undefined`; drafts take strict JSON.
@@ -243,20 +280,20 @@ export async function admitSubmission(
 				draft.type !== "input" || draft.entry === undefined ? {} : { entry: pickInputEntry(draft.entry) };
 			items.push({ id, mode, content, ...entry });
 		}
-		if (boundary === undefined) return id;
+		if (boundary === undefined) return { id, status: "queued" };
 		const { users } = await applyBoundary(tx, boundary, "final", now);
 		if (users.length > 0) await startRun(tx, conversationId, live, users);
-		return id;
+		return { id, status: draft.type === "write" ? "done" : users.at(-1) === id ? "placed" : "queued" };
 	}
 	if (prepared.type === "write") {
 		if (isStale(boundary, prepared.entry)) {
 			const stale = { status: "unanswered", reason: "stale" } as const;
 			tx.settleSubmission(id, stale);
-			return id;
+			return { id, status: "done" };
 		}
 		const entry = await tx.appendEntry(conversationId, prepared.entry);
 		tx.placeSubmission(id, entry.id);
-		return id;
+		return { id, status: "done" };
 	}
 	const entry = await appendInput(
 		tx,
@@ -267,5 +304,5 @@ export async function admitSubmission(
 	);
 	tx.placeSubmission(id, entry.id);
 	await startRun(tx, conversationId, live, [id]);
-	return id;
+	return { id, status: "placed" };
 }

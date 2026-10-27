@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { OutputBuffer } from "@earendil-works/chord/output";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, Type } from "@earendil-works/pi-ai";
 import {
 	acceptReceipt,
@@ -17,7 +18,6 @@ import {
 	type WakeSchedule,
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { OutputBuffer } from "../src/harness/output.ts";
 import { SessionImpl } from "../src/session/session.ts";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { waitFor } from "./chat-support.ts";

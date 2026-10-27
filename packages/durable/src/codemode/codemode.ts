@@ -35,6 +35,7 @@
  * call with an error result.
  */
 import type { Context, JsonValue } from "@earendil-works/chord";
+import { ownedSlice } from "@earendil-works/chord/delta";
 import { copyJson } from "@earendil-works/chord/json";
 import type { TextContent } from "@earendil-works/pi-ai";
 import {
@@ -127,6 +128,8 @@ export const CodemodeRunDoc = defineDoc<RunState>({
 	version: 1,
 	scope: "task",
 	initial: () => ({}),
+	// The document retires with its task.
+	checkpointWhen: () => false,
 });
 
 type JournalEntry = {
@@ -151,6 +154,8 @@ export const CodemodeJournalDoc = defineDoc<JournalState>({
 	version: 1,
 	scope: "task",
 	initial: () => ({ entries: [] }),
+	// The document retires with its task.
+	checkpointWhen: () => false,
 });
 
 /**
@@ -164,6 +169,7 @@ export const CodemodeStoreDoc = defineDoc<{ values: Record<string, JsonValue> }>
 	history: "rewindable",
 	fork: "asOf",
 	initial: () => ({ values: {} }),
+	checkpointWhen: (_value, _ops, { deltasSinceBase }) => deltasSinceBase >= 64,
 });
 
 /** One tool call a script made, as the code mode call's details show it. */
@@ -194,7 +200,8 @@ const ARGS_PREVIEW_CHARS = 200;
 const ERROR_PREVIEW_CHARS = 500;
 
 function cut(text: string, max: number): string {
-	return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+	// A copy: the row outlives the arguments or error text it previews.
+	return text.length > max ? `${ownedSlice(text, 0, max - 3)}...` : text;
 }
 
 /** A function scripts call as a top-level global; its result is journaled. */
@@ -396,7 +403,7 @@ class CodemodeCall {
 			}
 			entry.tools.push(tool.name);
 		}
-		const now = Date.now();
+		const now = api.now();
 		const seed = crypto.getRandomValues(new Uint32Array(1))[0]!;
 		type Found =
 			| { done: ToolExecutionResult }
@@ -449,7 +456,7 @@ class CodemodeCall {
 				),
 			);
 		}
-		const remaining = this.start.deadline === undefined ? undefined : this.start.deadline - Date.now();
+		const remaining = this.start.deadline === undefined ? undefined : this.start.deadline - this.api.now();
 		if (remaining !== undefined && remaining <= 0) {
 			return this.decide(errorResult(`Script timed out: its deadline passed while it was interrupted.`));
 		}
@@ -547,7 +554,7 @@ class CodemodeCall {
 		const details = this.details();
 		const formatted = await formatResult(result, {
 			generatedImages: this.generatedImages,
-			wallMs: Date.now() - this.start.startedAt,
+			wallMs: this.api.now() - this.start.startedAt,
 			maxOutputTokens: this.start.maxOutputTokens,
 			calls: details.calls,
 			limits: OUTPUT_LIMITS,
@@ -800,7 +807,9 @@ class CodemodeCall {
 					}));
 		running.then(
 			(done) => {
-				this.queue.push({ id: call.id, at: Date.now(), ...done });
+				// A result after the outcome is decided has nowhere to go, and the call's API has ended.
+				if (this.stopped) return;
+				this.queue.push({ id: call.id, at: this.api.now(), ...done });
 				void this.pump();
 			},
 			(error: unknown) => {

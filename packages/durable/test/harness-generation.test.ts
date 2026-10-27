@@ -3,12 +3,12 @@ import {
 	fauxAssistantMessage,
 	type Message,
 	type Models,
+	PI_ATTRIBUTION,
 	type SimpleStreamOptions,
 	type SystemMessage,
 } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
-	type CommitPublication,
 	type Conversation,
 	createRegistry,
 	defineDoc,
@@ -29,8 +29,8 @@ import { describe, expect, it } from "vitest";
 import { resolveSettings } from "../src/harness/agent.ts";
 import type { SessionImpl } from "../src/session/session.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat, textOf, unanswered, waitFor } from "./chat-support.ts";
-import { addSection } from "./harness-support.ts";
-import { ControlledStorage, context } from "./session-support.ts";
+import { addHooks, addSection } from "./harness-support.ts";
+import { ControlledStorage, context, observeCommits } from "./session-support.ts";
 
 const ERROR_503 = fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 Service Unavailable" });
 
@@ -75,7 +75,7 @@ function invalidFinalStream(): ReturnType<Models["streamSimple"]> {
 
 function livePublications(harness: Harness): LiveState[] {
 	const values: LiveState[] = [];
-	harness.subscribeCommits((publication: CommitPublication) => {
+	observeCommits(harness, (publication) => {
 		for (const change of publication.changes) {
 			if (change.type === "document" && change.record.kind === "pi.live" && change.value !== null) {
 				values.push(change.value as LiveState);
@@ -398,6 +398,43 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
+	it("records the requested thinking level on answers, streamed and polled", async () => {
+		const setup = chatSetup({ deferred: { pendingFetches: 1, pollAfterMs: 1 } });
+		setup.faux.setResponses([fauxAssistantMessage("streamed"), fauxAssistantMessage("polled")]);
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const answer = async (content: string) => {
+			const settled = await (await root.submit({ type: "input", content }, context)).wait(context);
+			if (settled.status !== "done" || settled.type !== "input") throw new Error(`Unexpected ${settled.status}`);
+			return (await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), context))?.model?.[0];
+		};
+		await root.configure({ thinkingLevel: "high" }, context);
+		expect(await answer("one")).toMatchObject({ thinkingLevel: "high" });
+		setup.settings.stream = { deferred: true };
+		expect(await answer("two")).toMatchObject({ thinkingLevel: "high" });
+		expect(setup.faux.state.deferredFetchCount).toBe(2);
+		await harness.close(context);
+	});
+
+	it("attributes model requests to pi by default and merges the Harness identity over it", async () => {
+		const seen: (SimpleStreamOptions["identity"] | undefined)[] = [];
+		const capture = (_context: unknown, options?: SimpleStreamOptions) => {
+			seen.push(options?.identity);
+			return fauxAssistantMessage("ok");
+		};
+		const acme = { name: "acme", url: "https://acme.example" };
+		for (const identity of [undefined, { userAgent: "short" as const, attribution: acme }]) {
+			const setup = chatSetup();
+			setup.identity = identity;
+			setup.faux.setResponses([capture]);
+			const { harness, root } = await openChat(new MemoryStorage(), setup);
+			harness.resume();
+			await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+			await harness.close(context);
+		}
+		expect(seen).toEqual([{ attribution: PI_ATTRIBUTION }, { attribution: acme, userAgent: "short" }]);
+	});
+
 	// Regression coverage for #10424.
 	it("keeps provider session IDs request-local across concurrent conversations", async () => {
 		const setup = chatSetup();
@@ -520,13 +557,16 @@ describe("generation", () => {
 			stream: {},
 			retry: { enabled: true, maxRetries: 3, baseDelayMs: 2000, maxAgentDelayMs: 60000 },
 			compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000, backgroundTokens: 32768 },
-			progress: { partialIntervalMs: 100, outputIntervalMs: 100 },
+			progress: { partialIntervalMs: 100, outputIntervalMs: 100, persistWithinMs: 1_000 },
 			toolExecution: "parallel",
 			steeringMode: "one-at-a-time",
 			followUpMode: "one-at-a-time",
 			contextRetentionMs: 600_000,
 			documentRetentionMs: expect.any(Number),
+			afterFailedRun: "keep",
 		});
+		expect(resolveSettings(undefined)).not.toHaveProperty("restartLimit");
+		expect(resolveSettings({ afterFailedRun: "withdraw" }).afterFailedRun).toBe("withdraw");
 		expect(resolveSettings({ retry: { enabled: false }, compaction: { backgroundTokens: 0 } })).toMatchObject({
 			retry: { enabled: false, maxRetries: 3, baseDelayMs: 2000 },
 			compaction: { enabled: true, backgroundTokens: 0 },
@@ -534,6 +574,7 @@ describe("generation", () => {
 		expect(resolveSettings({ progress: { outputIntervalMs: 500 } }).progress).toEqual({
 			partialIntervalMs: 100,
 			outputIntervalMs: 500,
+			persistWithinMs: 1_000,
 		});
 	});
 
@@ -564,8 +605,95 @@ describe("generation", () => {
 		expect(await publishedPartial({ progress: { partialIntervalMs: 5000 } })).toBe(false);
 	});
 
+	it("propagates a failed partial commit and joins the cancelled model stream", async () => {
+		const storage = new ControlledStorage();
+		const failure = new Error("partial commit failed");
+		const aborted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const base = chatSetup();
+		const stream: Models["streamSimple"] = (_model, _input, options) => {
+			const signal = options?.signal;
+			if (signal === undefined) throw new Error("Model request has no cancellation signal");
+			const events = async function* () {
+				storage.failNextCommit(failure);
+				yield { type: "start", partial: fauxAssistantMessage("partial", { stopReason: "pending" }) };
+				await new Promise<void>((resolve) => {
+					if (signal.aborted) resolve();
+					else signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				aborted.resolve();
+				await release.promise;
+			};
+			return {
+				[Symbol.asyncIterator]: events,
+				result: async () => fauxAssistantMessage([], { stopReason: "aborted" }),
+			} as unknown as ReturnType<Models["streamSimple"]>;
+		};
+		const setup: ChatSetup = {
+			...base,
+			settings: { progress: { partialIntervalMs: 0 } },
+			models: withStream(base.models, stream),
+		};
+		const { harness, root } = await openChat(storage, setup);
+		try {
+			harness.resume();
+			const submission = await root.submit({ type: "input", content: "hi" }, context);
+			const failed = expect(submission.wait(context)).rejects.toMatchObject({
+				name: "SessionFailed",
+				cause: failure,
+			});
+			await aborted.promise;
+			const closing = harness.close(context);
+			let closed = false;
+			void closing.then(() => {
+				closed = true;
+			});
+			await Promise.resolve();
+			expect(closed).toBe(false);
+			release.resolve();
+			await closing;
+			await failed;
+			expect(await harness.closed).toEqual({ reason: "failed", error: failure });
+		} finally {
+			release.resolve();
+			await harness.close(context);
+		}
+	});
+
+	it("applies the failed-run policy when a retry selection is invalid", async () => {
+		const setup = chatSetup();
+		setup.settings.afterFailedRun = "withdraw";
+		const reached = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		setup.faux.setResponses([
+			async () => {
+				reached.resolve();
+				await release.promise;
+				return ERROR_503;
+			},
+		]);
+		addHooks(setup.registry, GenerationTask, {
+			afterResponse: (_message, _runtime, _context, request) => ({
+				retry: { model: { provider: request.model.provider, modelId: request.model.id } },
+			}),
+		});
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		try {
+			const first = await root.submit({ type: "input", content: "first" }, context);
+			await reached.promise;
+			const queued = await root.submit({ type: "input", content: "second", whenBusy: "followUp" }, context);
+			release.resolve();
+			expect(await first.wait(context)).toMatchObject({ status: "unanswered", reason: "model_error" });
+			expect(await queued.wait(context)).toMatchObject({ status: "unanswered", reason: "run_failed" });
+		} finally {
+			release.resolve();
+			await harness.close(context);
+		}
+	});
+
 	it("renders sections that read conversation documents through input.read", async () => {
 		const Agent = defineDoc<{ cwd: string; kind: string }>({
+			checkpointWhen: () => false,
 			kind: "test.agent",
 			version: 1,
 			scope: "conversation",

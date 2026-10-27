@@ -1,5 +1,5 @@
-import { defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
+import { defineDoc, defineDocFamily } from "../src/documents.ts";
 import { context, createConversation, documentChanges, flush, openTestSession } from "./session-support.ts";
 
 type State = { value: number; retained: { label: string } };

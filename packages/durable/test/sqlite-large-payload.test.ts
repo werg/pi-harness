@@ -64,6 +64,7 @@ describe("SQLite large payload ownership", () => {
 					{ type: "task", value: task(large) },
 					{ type: "document.create", record, content: { kind: "base", version: 1, value: { large } } },
 				],
+				() => {},
 				context,
 			);
 			const second = await storage.commit(
@@ -74,6 +75,7 @@ describe("SQLite large payload ownership", () => {
 						content: { kind: "delta", version: 1, ops: [["s", ["large"], `${large}new`]] },
 					},
 				],
+				() => {},
 				context,
 			);
 			await storage.commit(
@@ -89,6 +91,7 @@ describe("SQLite large payload ownership", () => {
 						source: { id: documentId, at: first },
 					},
 				],
+				() => {},
 				context,
 			);
 			await storage.close(context);
@@ -129,6 +132,7 @@ describe("SQLite large payload ownership", () => {
 						content: { kind: "base", version: 1, value: { large } },
 					},
 				],
+				() => {},
 				context,
 			);
 			const db = new DatabaseSync(path);
@@ -138,7 +142,7 @@ describe("SQLite large payload ownership", () => {
 					`CREATE TRIGGER reject_chunk BEFORE INSERT ON payload_chunks WHEN NEW.id = 3 AND NEW.ordinal = 1 BEGIN SELECT RAISE(ABORT, 'chunk admission rejected'); END`,
 				);
 				await expect(
-					storage.commit([{ type: "task", value: task(`${large}replacement`) }], context),
+					storage.commit([{ type: "task", value: task(`${large}replacement`) }], () => {}, context),
 				).rejects.toThrow("chunk admission rejected");
 				expect((await storage.task(taskId, context))?.input).toBe(large);
 				db.exec("DROP TRIGGER reject_chunk");
@@ -151,6 +155,7 @@ describe("SQLite large payload ownership", () => {
 							content: { kind: "base", version: 1, value: { small: true } },
 						},
 					],
+					() => {},
 					context,
 				);
 				expect(db.prepare("SELECT count(*) AS chunks FROM payload_chunks WHERE id = 3").get()).toEqual({
@@ -159,7 +164,7 @@ describe("SQLite large payload ownership", () => {
 				expect(
 					db.prepare("SELECT count(*) AS chunks FROM payload_chunks WHERE id = 6 AND revision > 0").get(),
 				).toEqual({ chunks: 1 });
-				await storage.commit([{ type: "document.retire", id: latestId }], context);
+				await storage.commit([{ type: "document.retire", id: latestId }], () => {}, context);
 				expect(
 					db.prepare("SELECT count(*) AS chunks FROM payload_chunks WHERE id = 6 AND revision > 0").get(),
 				).toEqual({ chunks: 0 });

@@ -124,7 +124,7 @@ export interface WatchTarget {
  * - `error`: the watcher stopped, for example because the watched tree grew past the environment's limit; no calls
  *   follow.
  */
-export type WatchChange = { paths: string[] } | { overflow: true } | { error: FileError };
+export type FileChange = { paths: string[] } | { overflow: true } | { error: FileError };
 
 export interface FileWatcher {
 	/**
@@ -257,11 +257,11 @@ export interface FileSystem {
 	/**
 	 * Report changes to files and directories, for hosts that load resources from the environment. When the returned
 	 * watcher exists, coverage is established: a host that watches before it loads cannot miss a change made during the
-	 * load. See `WatchChange` for what is reported and `FileWatcher.mode` for how reliably.
+	 * load. See `FileChange` for what is reported and `FileWatcher.mode` for how reliably.
 	 */
 	watch(
 		targets: readonly WatchTarget[],
-		onChange: (change: WatchChange) => void,
+		onChange: (change: FileChange) => void,
 		context: Context,
 	): Promise<Result<FileWatcher, FileError>>;
 	canonicalPath(path: string, context: Context): Promise<Result<string, FileError>>;
@@ -334,6 +334,7 @@ export interface ShellOutputWindow {
  * Output an environment omitted, measured on the decoded text `onOutput` would have received: every U+FFFD counts as
  * three bytes, and no sanitizing is applied.
  */
+/** The shape of `OutputSkip` from `@earendil-works/chord/output`, which `OutputBuffer.push()` accepts. */
 export interface ShellOutputSkip {
 	/** UTF-8 byte length of the omitted text. */
 	bytes: number;

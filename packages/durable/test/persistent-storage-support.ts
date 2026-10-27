@@ -36,14 +36,14 @@ export async function createPersistentStorage(): Promise<{
 		let next: { error: unknown } | undefined;
 		let rejectCommit: ((writes: readonly StorageWrite[]) => unknown | undefined) | undefined;
 		let rejectMint: (() => unknown | undefined) | undefined;
-		backend.commit = async (writes, ctx) => {
+		backend.commit = async (writes, adopt, ctx) => {
 			commits.push(structuredClone(writes));
 			const pending = next;
 			next = undefined;
 			if (pending !== undefined) throw pending.error;
 			const error = rejectCommit?.(writes);
 			if (error !== undefined) throw error;
-			return commit(writes, ctx);
+			return commit(writes, adopt, ctx);
 		};
 		backend.mintId = async <I extends Id<string>>() => {
 			const error = rejectMint?.();

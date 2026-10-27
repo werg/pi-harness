@@ -1,3 +1,4 @@
+export type { NativeWatchChange, WatchChange, WatchEnd, WatchHandle } from "@earendil-works/chord";
 export { defineDoc, defineDocFamily } from "./documents.ts";
 export {
 	AssistantEntry,
@@ -10,7 +11,7 @@ export {
 	ToolResultEntry,
 	UserEntry,
 } from "./entries.ts";
-export { ConversationBusy, ReadAfterWrite, SessionFailed, StorageRequestError } from "./errors.ts";
+export { ConversationBusy, ReadAfterWrite, ReadOnlySession, SessionFailed, StorageRequestError } from "./errors.ts";
 export {
 	AgentDoc,
 	configure,
@@ -40,7 +41,7 @@ export {
 	type GenerationResult,
 	GenerationTask,
 } from "./harness/generation.ts";
-export { Harness } from "./harness/harness.ts";
+export { DEFAULT_HARNESS_IDENTITY, Harness } from "./harness/harness.ts";
 export { InboxDoc, type InboxItem, type InboxState } from "./harness/inbox.ts";
 export type { PinnedMessages, PinnedModel } from "./harness/json.ts";
 export {
@@ -59,7 +60,9 @@ export {
 } from "./harness/live.ts";
 export { ProviderDoc, type ProviderState } from "./harness/provider.ts";
 export { createRegistry } from "./harness/registry.ts";
+export type { BlockedReason } from "./harness/scheduler.ts";
 export type { TaskGraph, TaskGraphNode, TaskGraphState, TaskGraphWatch } from "./harness/task-graph.ts";
+export { DURABLE_TELEMETRY_SCHEMA } from "./harness/telemetry.ts";
 export {
 	createDirectToolTask,
 	type DirectToolCall,
@@ -72,6 +75,7 @@ export {
 	type ToolTaskResult,
 } from "./harness/tool.ts";
 export type {
+	AfterFailedRun,
 	Agent,
 	AgentChange,
 	AgentState,
@@ -80,6 +84,7 @@ export type {
 	CompactionPolicy,
 	CompactionReason,
 	CompactionResult,
+	CompactionSettings,
 	ContextView,
 	Conversation,
 	ConversationAbortOptions,
@@ -152,6 +157,8 @@ export { defineTask } from "./tasks.ts";
 export type {
 	CheckpointInfo,
 	CommitChange,
+	CommitOptions,
+	CommitPersistence,
 	CommitPublication,
 	CommonDocDefinition,
 	ContextEdit,
@@ -186,15 +193,21 @@ export type {
 	EntryQuery,
 	EntryRecord,
 	HookRunner,
+	HostCallback,
 	Id,
 	JoinPolicy,
 	JsonObject,
 	LatestConversationSemantics,
 	NextTaskState,
+	Observation,
+	Observer,
 	Page,
 	PhaseHandler,
 	QueuedInputRevision,
 	QueuedInputRevisionResult,
+	ReportFrom,
+	ReportInfo,
+	ReportTask,
 	RewindableConversationDocFamilyToken,
 	RewindableConversationDocToken,
 	RewindableConversationSemantics,
@@ -205,6 +218,7 @@ export type {
 	SessionDocFamilyToken,
 	SessionDocToken,
 	SessionEnd,
+	SetTimer,
 	Storage,
 	StorageWrite,
 	StoredDocument,
@@ -231,7 +245,5 @@ export type {
 	Tx,
 	TypedEntry,
 	TypedEntryDraft,
-	WatchEnd,
-	WatchHandle,
 } from "./types.ts";
 export { ROOT_CONVERSATION_ID } from "./types.ts";

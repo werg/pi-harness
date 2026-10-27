@@ -1,4 +1,4 @@
-import type { TelemetryContext } from "@earendil-works/pi-telemetry";
+import type { TelemetrySpan } from "@earendil-works/pi-telemetry";
 import type { AnthropicOptions } from "./api/anthropic-messages.ts";
 import type { AzureOpenAIResponsesOptions } from "./api/azure-openai-responses.ts";
 import type { BedrockOptions } from "./api/bedrock-converse-stream.ts";
@@ -29,6 +29,7 @@ import type {
 } from "./providers/model-schema.ts";
 import type { AssistantMessageDiagnostic } from "./utils/diagnostics.ts";
 import type { AssistantMessageEventStream } from "./utils/event-stream.ts";
+import type { ClientIdentity } from "./utils/identity.ts";
 
 export type {
 	AnthropicAllowedFallbackModel,
@@ -158,8 +159,8 @@ export interface ProviderResponse {
 /** Authentication, HTTP transport, and lifecycle callbacks shared by provider requests. */
 export interface ProviderRequestOptions<TModel = Model<Api>> {
 	signal?: AbortSignal;
-	/** Explicit parent context for telemetry produced by this logical request. */
-	telemetryContext?: TelemetryContext;
+	/** Explicit parent span for telemetry produced by this logical request. */
+	telemetry?: TelemetrySpan;
 	apiKey?: string;
 	/** Credential method when authentication is injected by a trusted transport. */
 	authType?: "api_key" | "oauth";
@@ -193,6 +194,11 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	 * A null value suppresses a provider/API default header with the same name.
 	 */
 	headers?: ProviderHeaders;
+	/**
+	 * How the request identifies the calling app: `User-Agent` and provider attribution headers.
+	 * Absent fields use pi-ai's defaults: a detailed `User-Agent` and no attribution.
+	 */
+	identity?: ClientIdentity;
 	/**
 	 * HTTP request timeout in milliseconds for providers/SDKs that support it.
 	 * For example, OpenAI and Anthropic SDK clients default to 10 minutes.

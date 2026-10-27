@@ -1,11 +1,27 @@
 import type { AttachedReplicatedState, Context, JsonValue } from "@earendil-works/chord";
 import { withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import { copyJson } from "@earendil-works/chord/json";
+import type { Models } from "@earendil-works/pi-ai";
+import {
+	type ClientIdentity,
+	mergeClientIdentity,
+	PI_ATTRIBUTION,
+	withClientIdentity,
+} from "@earendil-works/pi-ai/utils/identity";
+import {
+	createTypedMetrics,
+	NOOP_TELEMETRY_CONTEXT,
+	NOOP_TELEMETRY_METRICS,
+	type SpanAttributes,
+	type TelemetryContext,
+} from "@earendil-works/pi-telemetry";
 import { ResetEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
 import { contained, SessionImpl } from "../session/session.ts";
 import type { Transaction } from "../session/transaction.ts";
+import { hostTimers } from "../timers.ts";
 import type {
+	CommitOptions,
 	ConversationId,
 	ConversationOwnership,
 	ConversationRecord,
@@ -13,7 +29,10 @@ import type {
 	EntryId,
 	EntryQuery,
 	EntryRecord,
+	Observation,
+	Observer,
 	Page,
+	ReportInfo,
 	Storage,
 	SubmissionId,
 	TaskId,
@@ -34,6 +53,7 @@ import { BUILTIN_TASKS } from "./registry.ts";
 import { type InvocationBinding, TaskScheduler } from "./scheduler.ts";
 import { Submissions } from "./submissions.ts";
 import { type TaskGraph, TaskGraphView, type TaskGraphWatch } from "./task-graph.ts";
+import { DURABLE_TELEMETRY_SCHEMA } from "./telemetry.ts";
 import { createDirectToolTask, type DirectToolCall, type ToolTaskResult } from "./tool.ts";
 import type {
 	Agent,
@@ -51,6 +71,7 @@ import type {
 	HarnessCommit,
 	HarnessInspection,
 	HarnessOptions,
+	HarnessSettings,
 	Harness as HarnessType,
 	RegistrySnapshot,
 	SettledTask,
@@ -142,8 +163,8 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 		await this.#host.submissions.submit(this.id, { type: "write", entry }, context);
 	}
 
-	commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T> {
-		return this.#host.harness.commitWith(change, context, { conversationId: this.id });
+	commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context, options?: CommitOptions): Promise<T> {
+		return this.#host.harness.commitWith(change, context, { conversationId: this.id }, options);
 	}
 
 	context(context: Context, options?: { readonly at?: EntryId }): Promise<ContextView> {
@@ -173,7 +194,7 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 		return exportConversationHistory(this.#host.harness, this.#host.storage, this.id, at, context);
 	}
 
-	abort(context: Context, options?: ConversationAbortOptions): Promise<void> {
+	async abort(context: Context, options?: ConversationAbortOptions): Promise<void> {
 		this.#host.tasks.resume();
 		return this.#host.tasks.abortConversation(this.id, options?.background === true, context);
 	}
@@ -200,35 +221,66 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 	}
 }
 
+/** Request identity of a Harness's model requests: pi-ai's defaults with provider attribution to pi. */
+export const DEFAULT_HARNESS_IDENTITY: ClientIdentity = { attribution: PI_ATTRIBUTION };
+
+/**
+ * `HarnessOptions.models` as a function with `HarnessOptions.identity` applied. A plain `Models` is wrapped once; a
+ * function's result is wrapped at each call.
+ */
+function currentModels(models: HarnessOptions["models"], identity: ClientIdentity | undefined): () => Models {
+	const merged = mergeClientIdentity(DEFAULT_HARNESS_IDENTITY, identity) ?? DEFAULT_HARNESS_IDENTITY;
+	if (typeof models === "function") return () => withClientIdentity(models(), merged);
+	const wrapped = withClientIdentity(models, merged);
+	return () => wrapped;
+}
+
+/** `HarnessOptions.settings` as a function: plain settings, or none, are returned at every call. */
+function currentSettings(settings: HarnessOptions["settings"]): () => HarnessSettings | undefined {
+	return typeof settings === "function" ? settings : () => settings;
+}
+
 /** Session kernel extended with conversation handles and a registry. */
 class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements HarnessType {
 	readonly #options: HarnessOptions<Tool>;
-	readonly #report: (error: unknown) => void;
+	readonly #hostSettings: () => HarnessSettings | undefined;
+	readonly #report: (error: unknown, info: ReportInfo, context?: Context) => void;
 	readonly #host: ConversationHost<Tool>;
 	readonly #tasks: TaskScheduler;
 	readonly #submissions: Submissions;
 	readonly #taskGraph: TaskGraphView;
 
 	constructor(rawStorage: Storage, options: HarnessOptions<Tool>, context: Context) {
-		const report = safeReport(options.onReport);
+		const report = safeReport(options.onReport, options.telemetry ?? NOOP_TELEMETRY_CONTEXT);
 		const now = safeNow(options.now, report);
-		// Read at each use, as all settings are, but only this field: it is read on every commit.
-		super(rawStorage, now, () => options.settings?.documentRetentionMs);
+		const hostSettings = currentSettings(options.settings);
+		// Read at each use, as all settings are, but only these fields: they are read on every commit.
+		super(
+			rawStorage,
+			now,
+			() => hostSettings()?.documentRetentionMs,
+			options.setTimer,
+			options.readOnly === true,
+			() => hostSettings()?.progress?.persistWithinMs,
+		);
 		// Every component reads and writes through the Session's failure guard: `rawStorage` serves only `super()`.
 		const storage = this.storage;
 		this.#options = options;
 		this.#report = report;
-		const settings = () => resolveSettings(options.settings);
+		this.#hostSettings = hostSettings;
+		const settings = () => resolveSettings(hostSettings());
 		this.#tasks = new TaskScheduler({
+			telemetry: options.telemetry,
 			session: this,
 			storage,
 			registry: options.registry,
-			models: options.models,
 			modelRequests: options.modelRequests,
+			models: currentModels(options.models, options.identity),
 			agent: (id, snapshot, callContext) => this.resolveAgent(id, snapshot as RegistrySnapshot<Tool>, callContext),
 			settings,
 			env: (id, callContext) => this.buildEnv(id, callContext),
 			now,
+			timers: hostTimers(options.setTimer, (error) => report(error, { type: "host_error", callback: "setTimer" })),
 			report: this.#report,
 			publishWake: options.publishWake,
 			settleOutcome: settleSchedulerOutcome,
@@ -238,9 +290,13 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 				return record === undefined ? undefined : boundConversation(id, binding, this.#submissions, this.#tasks);
 			},
 			context: withoutAbortSignal(context),
+			readOnly: options.readOnly === true,
 		});
-		this.#submissions = new Submissions(this, storage, now, settings, () => this.#tasks.resume());
-		this.#taskGraph = new TaskGraphView(this, storage);
+		this.#submissions = new Submissions(this, storage, now, settings, () => this.#tasks.resume(), options.telemetry);
+		this.#taskGraph = new TaskGraphView(this, storage, {
+			blocked: (record) => this.#tasks.blockedReason(record),
+			subscribeBlocked: (listener) => this.#tasks.subscribeBlocked(listener),
+		});
 		this.#host = {
 			harness: this,
 			storage,
@@ -260,7 +316,9 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 	): Promise<Agent<Tool>> {
 		const registry = snapshot ?? this.#options.registry.snapshot();
 		const state = await this.snapshot(AgentDoc, id, context);
-		return resolveAgent(state, registry, resolveSettings(this.#options.settings), this.#report);
+		return resolveAgent(state, registry, resolveSettings(this.#hostSettings()), (error, extension) =>
+			this.#report(error, { type: "extension_error", conversationId: id, extension }, context),
+		);
 	}
 
 	invokeTool(
@@ -270,12 +328,14 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 		options?: { readonly background?: boolean },
 	): Promise<TaskId<ToolTaskResult>> {
 		const snapshot = this.#options.registry.snapshot();
-		const settings = resolveSettings(this.#options.settings);
+		const settings = resolveSettings(this.#hostSettings());
 		return this.commitWith(
 			async (tx) => {
 				if (!(await tx.conversation(conversationId)))
 					throw new Error(`Conversation ${conversationId} does not exist`);
-				const agent = resolveAgent(await tx.doc(AgentDoc, conversationId), snapshot, settings, this.#report);
+				const agent = resolveAgent(await tx.doc(AgentDoc, conversationId), snapshot, settings, (error, extension) =>
+					this.#report(error, { type: "extension_error", conversationId, extension }, context),
+				);
 				const tool = agent.tools.find((tool) => tool.name === call.name);
 				if (!tool) throw new Error(`Tool ${call.name} is not selected for conversation ${conversationId}`);
 				return createDirectToolTask(tx, conversationId, call, bindTool(tool, settings.toolExecution), {
@@ -380,7 +440,7 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 				const live = await tx.doc(LiveDoc, conversationId);
 				if (live.run === undefined) {
 					const boundary = await prepareBoundary(tx, conversationId, {
-						...resolveSettings(this.#options.settings),
+						...resolveSettings(this.#hostSettings()),
 						followUpMode: "one-at-a-time",
 					});
 					const { users } = await applyBoundary(tx, boundary, "final", this.#host.now());
@@ -438,7 +498,7 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 		return this.#tasks.waitForTask(id, context) as Promise<SettledTask<R>>;
 	}
 
-	waitForIdle(context: Context): Promise<void> {
+	async waitForIdle(context: Context): Promise<void> {
 		this.#tasks.resume();
 		return this.#tasks.waitForIdle(undefined, context);
 	}
@@ -462,6 +522,20 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 
 	watchTaskGraph(context: Context): Promise<TaskGraphWatch> {
 		return this.#taskGraph.watch(context);
+	}
+
+	async observeTaskGraph(observer: Observer<TaskGraph>, context: Context): Promise<Observation<TaskGraph>> {
+		this.assertUsable();
+		return this.#taskGraph.observe(observer, context);
+	}
+
+	async observeConversation(
+		id: ConversationId,
+		observer: Observer<ConversationView>,
+		context: Context,
+	): Promise<Observation<ConversationView>> {
+		this.assertUsable();
+		return this.#host.views.observe(id, observer, context);
 	}
 
 	root(
@@ -494,8 +568,8 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 		);
 	}
 
-	override report(error: unknown): void {
-		this.#report(error);
+	override report(error: unknown, info: ReportInfo = { type: "listener_error" }, context?: Context): void {
+		this.#report(error, info, context);
 	}
 
 	/** Signal and join task invocations after the close listeners and before Storage closes; writes no task outcome. */
@@ -540,20 +614,59 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 	}
 }
 
-/** `onReport` that cannot fail: it is the last place an error goes, so its own throw or rejection is dropped. */
-function safeReport(onReport: ((error: unknown) => void) | undefined): (error: unknown) => void {
-	return (error) =>
+/**
+ * Report to `onReport`, then count it and record its event. Never throws, since reports also come from inside Storage's
+ * `adopt`: a throwing `onReport` is dropped, and so is a throwing metric or event, as reporting it would report again.
+ */
+function safeReport(
+	onReport: ((error: unknown, info: ReportInfo) => void) | undefined,
+	telemetry: TelemetryContext,
+): (error: unknown, info: ReportInfo, context?: Context) => void {
+	const reports = createTypedMetrics(telemetry.metrics ?? NOOP_TELEMETRY_METRICS, [DURABLE_TELEMETRY_SCHEMA]).counter(
+		"pi.durable.reports",
+	);
+	return (error, info, context) => {
 		contained(
-			() => onReport?.(error),
+			() => onReport?.(error, info),
 			() => {},
 		);
+		const attributes: SpanAttributes = {
+			type: info.type,
+		};
+		switch (info.type) {
+			case "task_faulted":
+			case "task_outdated":
+				attributes.reason = info.reason;
+				attributes.extension = info.extension;
+				attributes["task.id"] = info.task.id;
+				break;
+			case "migration_failed":
+			case "task_error":
+			case "extension_error":
+				attributes.extension = info.extension;
+				attributes["task.id"] = info.task?.id;
+				break;
+			case "host_error":
+				attributes["task.id"] = info.task?.id;
+				break;
+		}
+		try {
+			reports.add(1, { type: info.type });
+			context?.telemetry.addEvent("pi.durable.report", attributes);
+		} catch {
+			// Dropped: see above.
+		}
+	};
 }
 
 /**
  * The host clock, falling back to `Date.now` when it throws: a broken clock must not stop commits. The first throw is
  * reported; the clock is read in every task change, so later ones are not.
  */
-export function safeNow(now: (() => number) | undefined, report: (error: unknown) => void): () => number {
+export function safeNow(
+	now: (() => number) | undefined,
+	report: (error: unknown, info: ReportInfo) => void,
+): () => number {
 	if (now === undefined) return Date.now;
 	let reported = false;
 	return () => {
@@ -563,7 +676,7 @@ export function safeNow(now: (() => number) | undefined, report: (error: unknown
 			// Set first: a report handler that reads the clock again must not report again.
 			if (!reported) {
 				reported = true;
-				report(error);
+				report(error, { type: "host_error", callback: "now" });
 			}
 			return Date.now();
 		}

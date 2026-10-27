@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createContextKey, withContextValue } from "@earendil-works/chord/context";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
@@ -182,7 +183,7 @@ describe("transactional harness preparation", () => {
 	it("provides a detached deeply frozen snapshot once and schedules hook-created tasks without reentering", async () => {
 		const storage = new ControlledStorage();
 		let observed: HarnessCommit | undefined;
-		const callContext = { ...context, marker: "caller context" };
+		const callContext = withContextValue(createContextKey<string>("marker"), "caller context", context);
 		const config = options(async (tx, staged, ctx) => {
 			if (!staged.entries.some((entry) => entry.kind === "source")) return;
 			expect(ctx).toBe(callContext);
@@ -225,7 +226,8 @@ describe("transactional harness preparation", () => {
 				{ kind: "source", data: { text: "original" } },
 				{ kind: "derived" },
 			]);
-			const batch = storage.commits.at(-1)!;
+			// The source commit's batch; the background task it created may commit after it.
+			const batch = storage.commits.find((writes) => writes.some((write) => write.type === "entry"))!;
 			expect(batch.filter((write) => write.type === "entry")).toHaveLength(2);
 			expect(batch.filter((write) => write.type === "task")).toHaveLength(2);
 			expect(batch.some((write) => write.type === "document.create" && write.record.kind === "pi.wake")).toBe(true);

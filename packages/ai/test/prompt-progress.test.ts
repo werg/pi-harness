@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { stream } from "../src/api/openai-completions.ts";
-import { AssistantMessageFrameEncoder, reduceAssistantMessageFrames } from "../src/utils/assistant-message-frame.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const model = {
@@ -68,13 +67,8 @@ describe("native completion prompt progress", () => {
 		expect(events[0]?.type).toBe("start");
 		expect(result.content).toEqual([{ type: "text", text: "Real answer" }]);
 		expect(result.stopReason).toBe("stop");
-		const encoder = new AssistantMessageFrameEncoder();
-		const frames = events.map((event) => encoder.encode(event)).filter((frame) => frame !== undefined);
-		expect(frames.filter((frame) => frame.type === "prompt_progress")).toEqual([
-			{ type: "prompt_progress", total: 100, cache: 10, processed: 20 },
-			{ type: "prompt_progress", total: 100, cache: 10, processed: 30 },
-		]);
-		expect(reduceAssistantMessageFrames(frames)?.content).toEqual(result.content);
+		expect(result).not.toHaveProperty("prompt_progress");
+		expect(events.find((event) => event.type === "done")).toMatchObject({ message: result });
 	});
 
 	it("does not request llama-specific progress from another provider", async () => {
@@ -83,8 +77,9 @@ describe("native completion prompt progress", () => {
 		expect(result.stopReason).toBe("stop");
 	});
 
-	it("preserves malformed tool arguments when progress frames are replayed", async () => {
+	it("preserves malformed tool arguments in the completed stream after prompt progress", async () => {
 		const { events, result } = await collect([
+			progress(20),
 			{
 				id: "request-owned",
 				choices: [
@@ -107,8 +102,8 @@ describe("native completion prompt progress", () => {
 		]);
 		const call = result.content[0];
 		expect(call).toMatchObject({ type: "toolCall", arguments: {}, argumentsError: expect.any(String) });
-		const encoder = new AssistantMessageFrameEncoder();
-		const frames = events.map((event) => encoder.encode(event)).filter((frame) => frame !== undefined);
-		expect(reduceAssistantMessageFrames(frames)?.content).toEqual(result.content);
+		expect(events.find((event) => event.type === "prompt_progress")).toMatchObject({ processed: 20 });
+		expect(events.find((event) => event.type === "toolcall_end")).toMatchObject({ toolCall: call });
+		expect(events.find((event) => event.type === "done")).toMatchObject({ message: result });
 	});
 });

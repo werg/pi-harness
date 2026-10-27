@@ -1,6 +1,6 @@
 import { Type } from "typebox";
 import { expect, test } from "vitest";
-import { type BehaviorOf, cell, copyJson, createHost, type InputOf, method, remote } from "../src/index.ts";
+import { copyJson, createHost, hostNamed, type ImplementationOf, type InputOf, method, remote } from "../src/index.ts";
 
 type ReadonlyJson =
 	| null
@@ -29,6 +29,7 @@ const Json = Type.Unsafe<ReadonlyJson>(
 const ReadonlyContract = remote("test.readonly-json", {
 	version: 1,
 	input: Json,
+	host: hostNamed("host"),
 	variants: { json: { state: { value: Json }, methods: { echo: method(Json, Json) } } },
 });
 
@@ -38,16 +39,17 @@ test("accepts recursive readonly JSON through schema contracts without unbounded
 	});
 	const input: InputOf<typeof ReadonlyContract> = value;
 	const host = createHost({
+		self: { kind: "host" },
 		onError: (error) => {
 			throw error;
 		},
 	});
 	try {
-		host.serve(ReadonlyContract, (initial, _principal, self): BehaviorOf<typeof ReadonlyContract> => {
-			const state = self.state({ value: cell(Json, initial) });
-			return { kind: "json", value: state.value, echo: (args) => args };
+		host.serve(ReadonlyContract, (initial, _principal, self): ImplementationOf<typeof ReadonlyContract> => {
+			const state = self.state("value", Json, initial);
+			return { variant: "json", value: state, echo: (args) => args };
 		});
-		const handle = host.get(ReadonlyContract, input);
+		const handle = host.hold(ReadonlyContract, input);
 		await handle.ready;
 		expect(handle.value.value).toEqual(value);
 		expect(await handle.echo(value)).toEqual(value);
