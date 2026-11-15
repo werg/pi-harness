@@ -1,5 +1,14 @@
 export type { SqliteDatabase, SqliteExecutor, SqliteValue } from "@earendil-works/chord/sqlite";
 export {
+	applyCompositeSqliteMigrationsInTransaction,
+	type CommittingSqliteDatabase,
+	type CompositeRoute,
+	CompositeSqliteStorage,
+	type CompositeSqliteStorageOptions,
+	DEFAULT_LOCAL_PREFIX,
+	defaultDocumentRoute,
+} from "./composite.ts";
+export {
 	applySqliteMigrations,
 	applySqliteMigrationsForSchema,
 	applySqliteMigrationsInTransaction,

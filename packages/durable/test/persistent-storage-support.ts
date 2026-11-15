@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Id, Storage, StorageWrite } from "@earendil-works/pi-durable";
-import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import { openNodeCompositeSqliteStorage, openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { context } from "./session-support.ts";
 
 export type PersistentControlledStorage = Storage & {
@@ -28,7 +28,11 @@ export async function createPersistentStorage(): Promise<{
 	const path = join(directory, "session.sqlite");
 	const opened = new Set<Storage>();
 	const reopen = async (): Promise<PersistentControlledStorage> => {
-		const backend = await openNodeSqliteStorage(path);
+		// PI_DURABLE_PERSISTENT_STORAGE=composite runs every persistent suite on the split (versioned + local) store.
+		const backend =
+			process.env.PI_DURABLE_PERSISTENT_STORAGE === "composite"
+				? await openNodeCompositeSqliteStorage(path)
+				: await openNodeSqliteStorage(path);
 		opened.add(backend);
 		const commit = backend.commit.bind(backend);
 		const mint = backend.mintId.bind(backend);
