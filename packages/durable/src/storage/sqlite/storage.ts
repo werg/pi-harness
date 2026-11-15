@@ -215,6 +215,12 @@ export class SqliteStorage implements Storage {
 		};
 	}
 
+	/** The greatest entry ID this table set stores (0 when it stores none). */
+	async highestEntryId(executor: SqliteExecutor = this.db): Promise<number> {
+		const row = await executor.get<IdRow>(`SELECT id FROM ${this.schema.tables.entries} ORDER BY id DESC LIMIT 1`);
+		return row?.id ?? 0;
+	}
+
 	/** The record type that owns `id` in this table set, if any. */
 	async recordType(executor: SqliteExecutor, id: Id<string>): Promise<TableName | undefined> {
 		return (

@@ -81,7 +81,14 @@ const artifacts = [];
 for (const [directory, upstream, name] of packages) {
 	const packageRoot = join(root, "packages", directory);
 	await rm(join(packageRoot, "dist"), { recursive: true, force: true });
-	if (directory === "ai") process.stdout.write(run(process.execPath, ["--experimental-strip-types", "scripts/check-model-data.ts"], packageRoot));
+	if (directory === "ai") {
+		// A Node without built-in TypeScript support (a distribution build) runs the check through jiti.
+		const checkScript = ["scripts/check-model-data.ts"];
+		const [command, ...args] = process.features.typescript
+			? [process.execPath, "--experimental-strip-types", ...checkScript]
+			: [join(root, "node_modules/.bin/jiti"), ...checkScript];
+		process.stdout.write(run(command, args, packageRoot));
+	}
 	process.stdout.write(run(process.execPath, [join(root, "node_modules/typescript/bin/tsc"), "-p", "tsconfig.build.json"], packageRoot));
 	if (directory === "ai") await cp(join(packageRoot, "src/providers/data"), join(packageRoot, "dist/providers/data"), { recursive: true });
 	const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));

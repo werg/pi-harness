@@ -63,9 +63,15 @@ export type CompositeSqliteStorageOptions = {
 	readonly documentRoute?: (create: DocumentCreate) => CompositeRoute;
 	/**
 	 * The commit a storage transaction ends with: the version-control commit message for the writes it stored at `seq`,
-	 * or null for none. Absent, no transaction commits. The database must be a {@link CommittingSqliteDatabase}.
+	 * or null for none. `entryHigh` is the greatest entry ID the versioned set stores once this transaction is stored, so
+	 * a commit can name how much of the conversation it holds. Absent, no transaction commits. The database must be a
+	 * {@link CommittingSqliteDatabase}.
 	 */
-	readonly commit?: (writes: readonly StorageWrite[], seq: Seq) => string | null;
+	readonly commit?: (
+		writes: readonly StorageWrite[],
+		seq: Seq,
+		state: { readonly entryHigh: number },
+	) => string | null;
 };
 
 /**
@@ -111,6 +117,7 @@ export class CompositeSqliteStorage implements Storage {
 	readonly #local: SqliteStorage;
 	readonly #options: CompositeSqliteStorageOptions;
 	#nextId: number;
+	#entryHigh: number;
 	#closed = false;
 	#closing: Promise<void> | undefined;
 	readonly #documentRoutes = new Map<DocumentId, CompositeRoute>();
@@ -120,12 +127,14 @@ export class CompositeSqliteStorage implements Storage {
 		versioned: SqliteStorage,
 		local: SqliteStorage,
 		nextId: number,
+		entryHigh: number,
 		options: CompositeSqliteStorageOptions,
 	) {
 		this.#db = db;
 		this.#versioned = versioned;
 		this.#local = local;
 		this.#nextId = nextId;
+		this.#entryHigh = entryHigh;
 		this.#options = options;
 	}
 
@@ -152,7 +161,14 @@ export class CompositeSqliteStorage implements Storage {
 					});
 				}
 			}
-			return new CompositeSqliteStorage(db, versioned, local, counters.nextId, options);
+			return new CompositeSqliteStorage(
+				db,
+				versioned,
+				local,
+				counters.nextId,
+				await versioned.highestEntryId(),
+				options,
+			);
 		} catch (error) {
 			try {
 				await db.close();
@@ -176,6 +192,9 @@ export class CompositeSqliteStorage implements Storage {
 						: write.value.id;
 			if (id !== undefined) candidateNextId = Math.max(candidateNextId, id + 1);
 		}
+		let writtenEntryHigh = this.#entryHigh;
+		for (const write of writes)
+			if (write.type === "entry") writtenEntryHigh = Math.max(writtenEntryHigh, write.value.id);
 		const commit = this.#options.commit;
 		return this.#db.transaction(
 			async (transaction) => {
@@ -193,10 +212,11 @@ export class CompositeSqliteStorage implements Storage {
 			},
 			(seq) => {
 				this.#nextId = Math.max(this.#nextId, candidateNextId);
+				this.#entryHigh = writtenEntryHigh;
 				for (const [id, route] of routed.created) this.#documentRoutes.set(id, route);
 				adopt(seq);
 			},
-			commit === undefined ? undefined : { commit: (seq) => commit(writes, seq) },
+			commit === undefined ? undefined : { commit: (seq) => commit(writes, seq, { entryHigh: writtenEntryHigh }) },
 		);
 	}
 

@@ -335,9 +335,9 @@ describe("CompositeSqliteStorage commit policy", () => {
 		);
 		await database.transaction((transaction) => applyCompositeSqliteMigrationsInTransaction(transaction));
 		const storage = await CompositeSqliteStorage.open(database, {
-			commit: (writes, seq) =>
+			commit: (writes, seq, state) =>
 				writes.some((write) => write.type === "entry" && write.value.kind === "turn.closed")
-					? `agent: turn closed at ${seq}`
+					? `agent: turn closed at ${seq} entries<=${state.entryHigh}`
 					: null,
 		});
 		openStorages.add(storage);
@@ -345,7 +345,7 @@ describe("CompositeSqliteStorage commit policy", () => {
 		const seq = await storage.commit([entry(3, "turn.closed")], adopt, context);
 		await storage.commit([{ type: "task", value: task(4) }], adopt, context);
 		expect(database.requests.at(-3)).toEqual({ commit: null });
-		expect(database.requests.at(-2)).toEqual({ commit: `agent: turn closed at ${seq}` });
+		expect(database.requests.at(-2)).toEqual({ commit: `agent: turn closed at ${seq} entries<=3` });
 		expect(database.requests.at(-1)).toEqual({ commit: null });
 	});
 });
