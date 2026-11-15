@@ -350,6 +350,33 @@ describe("CompositeSqliteStorage commit policy", () => {
 	});
 });
 
+describe("a fork of the store", () => {
+	it("finds its local tables in place and its local schema-version row gone, and applies the schema again over them", async () => {
+		const path = await temporaryPath();
+		const first = await openComposite(path);
+		await first.close(context);
+		const raw = new DatabaseSync(path);
+		// What a fork leaves: the local tables' definitions, none of their rows (the version and the counters included).
+		raw.exec("DELETE FROM vsl_durable_schema; DELETE FROM vsl_durable_metadata");
+		raw.close();
+		const database = await openNodeSqliteDatabase(path);
+		await database.transaction((transaction) => applyCompositeSqliteMigrationsInTransaction(transaction));
+		await database.close();
+		const verify = new DatabaseSync(path, { readOnly: true });
+		try {
+			expect(verify.prepare("SELECT version FROM vsl_durable_schema").get()).toEqual({ version: 2 });
+			expect(verify.prepare("SELECT next_id, next_seq FROM vsl_durable_metadata").get()).toEqual({
+				next_id: "2",
+				next_seq: 1,
+			});
+		} finally {
+			verify.close();
+		}
+		const reopened = await openComposite(path);
+		expect(await reopened.mintId<EntryId>()).toBeGreaterThanOrEqual(2);
+	});
+});
+
 describe("defaultDocumentRoute", () => {
 	it("versions what a fork inherits and keeps the rest local", () => {
 		const conversation = { kind: "conversation", conversationId: ROOT_CONVERSATION_ID } as const;

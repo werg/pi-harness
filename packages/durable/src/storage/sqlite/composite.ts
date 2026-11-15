@@ -28,7 +28,7 @@ import type {
 	TaskRecord,
 } from "../../types.ts";
 import type { SqliteDatabase, SqliteExecutor } from "./database.ts";
-import { applySqliteMigrationsInTransaction, createSqliteMigrations } from "./migrations.ts";
+import { applySqliteMigrationsInTransaction, createSqliteMigrations, type SqliteMigration } from "./migrations.ts";
 import { createSqliteSchema } from "./schema.ts";
 import { SqliteStorage } from "./storage.ts";
 
@@ -94,7 +94,24 @@ export async function applyCompositeSqliteMigrationsInTransaction(
 	const versioned = createSqliteSchema();
 	const local = createSqliteSchema(localPrefix);
 	await applySqliteMigrationsInTransaction(transaction, createSqliteMigrations(versioned), versioned);
-	await applySqliteMigrationsInTransaction(transaction, createSqliteMigrations(local), local);
+	await applySqliteMigrationsInTransaction(transaction, idempotentMigrations(createSqliteMigrations(local)), local);
+}
+
+/**
+ * The migrations of the local set, written to run again over tables that exist. A fork of the store empties the
+ * local tables but keeps their definitions, so its local schema-version row is gone while its tables are not: the
+ * local set starts again from version zero and finds every table in place.
+ */
+function idempotentMigrations(migrations: readonly SqliteMigration[]): readonly SqliteMigration[] {
+	return migrations.map((migration) => ({
+		version: migration.version,
+		statements: migration.statements.map((statement) =>
+			statement
+				.replace(/^\s*CREATE TABLE /u, "CREATE TABLE IF NOT EXISTS ")
+				.replace(/^\s*CREATE INDEX /u, "CREATE INDEX IF NOT EXISTS ")
+				.replace(/^\s*INSERT INTO /u, "INSERT OR IGNORE INTO "),
+		),
+	}));
 }
 
 /**
