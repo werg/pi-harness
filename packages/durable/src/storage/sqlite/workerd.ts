@@ -105,10 +105,11 @@ export class NativeDatabase implements SqliteDatabase {
 					active = false;
 				}
 			};
-			const result =
+			const result = await this.#admitted(() =>
 				options?.commit === undefined
-					? await this.native.transaction(run)
-					: await this.native.transaction(run, { commit: options.commit });
+					? this.native.transaction(run)
+					: this.native.transaction(run, { commit: options.commit }),
+			);
 			// Explicit confirmation precedes portable Storage's adoption of IDs/publication.
 			// Failure here is an ordinary uncertain error, never a guaranteed StorageRejected.
 			await this.native.sync();
@@ -116,6 +117,24 @@ export class NativeDatabase implements SqliteDatabase {
 			return result;
 		});
 	}
+	/**
+	 * Run a native transaction, asking again when the host refused it before it ran. A cell takes its input gate for a
+	 * transaction; a continuation of an event that ended, running while another block holds the gate, is refused with
+	 * "the cell event ended before it could acquire an input gate" and nothing has executed, so asking again from a
+	 * new turn is safe. A version-controlled cell commits slower than a plain one, so the windows overlap there.
+	 */
+	async #admitted<T>(transaction: () => Promise<T>): Promise<T> {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				return await transaction();
+			} catch (error) {
+				const refused = error instanceof Error && error.message.includes("before it could acquire an input gate");
+				if (!refused || attempt >= 8) throw error;
+				await new Promise<void>((resolve) => setTimeout(resolve, 2 * (attempt + 1)));
+			}
+		}
+	}
+
 	close(): Promise<void> {
 		const result = this.tail.then(async () => {
 			if (this.closed) return;
