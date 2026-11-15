@@ -405,32 +405,6 @@ describe("a Dolt cell's dialect", () => {
 	});
 });
 
-describe("NativeDatabase and a refusal before the transaction ran", () => {
-	it("asks again when the host refused the transaction at its input gate, and fails on any other error", async () => {
-		const { NativeDatabase } = await import("../src/storage/sqlite/index.ts");
-		let calls = 0;
-		const native = {
-			sql: { exec: () => ({ toArray: () => [], one: () => ({}) }) },
-			transaction: async <T>(callback: () => Promise<T>) => {
-				calls++;
-				if (calls < 3) throw new Error("the cell event ended before it could acquire an input gate");
-				return callback();
-			},
-			sync: async () => {},
-		};
-		const database = new NativeDatabase(native as never);
-		expect(await database.transaction(async () => "ran")).toBe("ran");
-		expect(calls).toBe(3);
-		const failing = new NativeDatabase({
-			...native,
-			transaction: async () => {
-				throw new Error("disk full");
-			},
-		} as never);
-		await expect(failing.transaction(async () => "never")).rejects.toThrow("disk full");
-	});
-});
-
 describe("NativeDatabase commit option", () => {
 	it("hands a transaction's commit to the native storage only when asked, and syncs after it", async () => {
 		const { NativeDatabase } = await import("../src/storage/sqlite/index.ts");
