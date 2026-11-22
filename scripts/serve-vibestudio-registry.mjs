@@ -70,14 +70,19 @@ createServer(async (request, response) => {
 		const headers = { accept: request.headers.accept ?? "application/json" };
 		const remote = await fetch(`${upstream}${url.pathname}${url.search}`, { headers });
 		if (!entry) {
+			const body = Buffer.from(await remote.arrayBuffer());
 			response.writeHead(remote.status, { "content-type": remote.headers.get("content-type") ?? "application/json" });
-			response.end(Buffer.from(await remote.arrayBuffer()));
+			response.end(body);
 			return;
 		}
 		const document = remote.ok ? await remote.json() : undefined;
 		response.writeHead(200, { "content-type": "application/json" });
 		response.end(JSON.stringify(packument(entry, document)));
 	} catch (error) {
+		if (response.headersSent) {
+			response.destroy();
+			return;
+		}
 		response.writeHead(502, { "content-type": "text/plain" });
 		response.end(String(error));
 	}
