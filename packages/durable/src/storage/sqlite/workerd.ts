@@ -8,7 +8,11 @@ export interface NativeStorage {
 			...values: (null | string | number | ArrayBuffer)[]
 		): { toArray(): Record<string, unknown>[]; one(): Record<string, unknown> };
 	};
-	transaction<T>(callback: () => Promise<T>): Promise<T>;
+	/**
+	 * `commit` is a version-control engine's option (a Dolt cell's `transaction(fn, { commit })`): the writes and a
+	 * commit are one durable step. It is passed only when the caller asks for one.
+	 */
+	transaction<T>(callback: () => Promise<T>, options?: { readonly commit?: (value: T) => string | null }): Promise<T>;
 	sync(): Promise<void>;
 }
 
@@ -84,19 +88,27 @@ export class NativeDatabase implements SqliteDatabase {
 	all<T extends object>(sql: string, ...params: SqliteValue[]): Promise<T[]> {
 		return this.enqueue(() => this.executor(() => {}).all<T>(sql, ...params));
 	}
-	transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>, afterCommit?: (value: T) => void): Promise<T> {
+	transaction<T>(
+		callback: (transaction: SqliteExecutor) => Promise<T>,
+		afterCommit?: (value: T) => void,
+		options?: { readonly commit?: (value: T) => string | null },
+	): Promise<T> {
 		return this.enqueue(async () => {
 			let active = true;
 			const handle = this.executor(() => {
 				if (!active) throw new Error("SQLite transaction handle is no longer active");
 			});
-			const result = await this.native.transaction(async () => {
+			const run = async (): Promise<T> => {
 				try {
 					return await callback(handle);
 				} finally {
 					active = false;
 				}
-			});
+			};
+			const result =
+				options?.commit === undefined
+					? await this.native.transaction(run)
+					: await this.native.transaction(run, { commit: options.commit });
 			// Explicit confirmation precedes portable Storage's adoption of IDs/publication.
 			// Failure here is an ordinary uncertain error, never a guaranteed StorageRejected.
 			await this.native.sync();

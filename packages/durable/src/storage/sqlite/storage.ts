@@ -153,11 +153,99 @@ export class SqliteStorage implements Storage {
 	private closing: Promise<void> | undefined;
 	private admittedReads = 0;
 	private readsDrained: (() => void) | undefined;
+	/** False for a table set a `CompositeSqliteStorage` drives: the composite owns the connection. */
+	private readonly ownsDatabase: boolean;
 
-	private constructor(db: SqliteDatabase, schema: SqliteSchema, nextId: number) {
+	private constructor(db: SqliteDatabase, schema: SqliteSchema, nextId: number, ownsDatabase = true) {
 		this.db = db;
 		this.schema = schema;
 		this.nextId = nextId;
+		this.ownsDatabase = ownsDatabase;
+	}
+
+	/**
+	 * Attach to one table set of a database that a `CompositeSqliteStorage` owns. The set's schema was initialized by the
+	 * caller; this storage never closes the connection and never mints IDs or sequences: the composite hands it both.
+	 */
+	static async attach(db: SqliteDatabase, options: SqliteStorageOptions = {}): Promise<SqliteStorage> {
+		const schema = createSqliteSchema(options.prefix);
+		await db.exec(`SELECT id, revision, ordinal, byte_length, data FROM ${schema.tables.payloadChunks} LIMIT 0`);
+		const metadata = await db.get<MetadataRow>(
+			`SELECT next_id, next_seq FROM ${schema.tables.durableMetadata} WHERE singleton = 1`,
+		);
+		if (metadata === undefined) throw new Error("Durable SQLite metadata is missing");
+		return new SqliteStorage(db, schema, Number(metadata.next_id), false);
+	}
+
+	/** The table set's own counters, as stored. */
+	async counters(executor: SqliteExecutor = this.db): Promise<{ readonly nextId: number; readonly nextSeq: number }> {
+		const metadata = await executor.get<MetadataRow>(
+			`SELECT next_id, next_seq FROM ${this.schema.tables.durableMetadata} WHERE singleton = 1`,
+		);
+		if (metadata === undefined) throw new Error("Durable SQLite metadata is missing");
+		return { nextId: Number(metadata.next_id), nextSeq: metadata.next_seq };
+	}
+
+	/** Persist the counters; used only by the table set that holds the composite's metadata. */
+	async setCounters(executor: SqliteExecutor, nextId: number, nextSeq: number): Promise<void> {
+		await executor.run(
+			`UPDATE ${this.schema.tables.durableMetadata} SET next_id = ?, next_seq = ? WHERE singleton = 1`,
+			String(nextId),
+			nextSeq,
+		);
+	}
+
+	/** The greatest record ID and the greatest commit sequence this table set stores (0 when empty). */
+	async highWater(executor: SqliteExecutor = this.db): Promise<{ readonly id: number; readonly seq: number }> {
+		const id = await executor.get<{ readonly high: number | null }>(
+			`SELECT MAX(id) AS high FROM ${this.schema.tables.recordIds}`,
+		);
+		const entry = await executor.get<{ readonly high: number | null }>(
+			`SELECT commit_seq AS high FROM ${this.schema.tables.entries} ORDER BY id DESC LIMIT 1`,
+		);
+		const revision = await executor.get<{ readonly high: number | null }>(
+			`SELECT MAX(seq) AS high FROM ${this.schema.tables.documentRevisions}`,
+		);
+		const created = await executor.get<{ readonly created: number | null; readonly retired: number | null }>(
+			`SELECT MAX(created_at) AS created, MAX(retired_at) AS retired FROM ${this.schema.tables.documents}`,
+		);
+		return {
+			id: id?.high ?? 0,
+			seq: Math.max(entry?.high ?? 0, revision?.high ?? 0, created?.created ?? 0, created?.retired ?? 0),
+		};
+	}
+
+	/** The greatest entry ID this table set stores (0 when it stores none). */
+	async highestEntryId(executor: SqliteExecutor = this.db): Promise<number> {
+		const row = await executor.get<IdRow>(`SELECT id FROM ${this.schema.tables.entries} ORDER BY id DESC LIMIT 1`);
+		return row?.id ?? 0;
+	}
+
+	/** The record type that owns `id` in this table set, if any. */
+	async recordType(executor: SqliteExecutor, id: Id<string>): Promise<TableName | undefined> {
+		return (
+			await executor.get<RecordIdRow>(`SELECT record_type FROM ${this.schema.tables.recordIds} WHERE id = ?`, id)
+		)?.record_type;
+	}
+
+	/** Whether this table set holds the document incarnation. */
+	async hasDocument(id: DocumentId): Promise<boolean> {
+		return (
+			(await this.db.get<IdRow>(`SELECT id FROM ${this.schema.tables.documents} WHERE id = ?`, id)) !== undefined
+		);
+	}
+
+	/**
+	 * Apply one commit's writes for this table set inside the caller's transaction, at the caller's sequence. The
+	 * composite checks nothing across table sets: a record ID is unique because one counter minted it.
+	 */
+	async applyWrites(transaction: SqliteExecutor, writes: readonly StorageWrite[], seq: Seq): Promise<void> {
+		this.assertOpen();
+		const documentActions = this.prepareDocumentActions(writes);
+		await this.checkGlobalIds(transaction, writes);
+		await this.checkDocumentActions(transaction, documentActions);
+		for (const write of writes) await this.applyTableWrite(transaction, write, seq);
+		await this.applyDocumentActions(transaction, documentActions, seq);
 	}
 
 	/** Open an owned database after its schema has been initialized by the caller. */
@@ -638,7 +726,7 @@ export class SqliteStorage implements Storage {
 				this.readsDrained = resolve;
 			});
 		}
-		await this.db.close();
+		if (this.ownsDatabase) await this.db.close();
 	}
 
 	/**

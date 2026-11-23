@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(process.argv[2] ?? join(root, ".artifacts/vibestudio"));
-const version = "1.2.0-vibestudio.3";
+// The distribution version; a local build for another consumer sets VIBESTUDIO_PI_VERSION (it never publishes).
+const version = process.env.VIBESTUDIO_PI_VERSION ?? "1.2.0-vibestudio.3";
 const packages = [
 	["telemetry", "@earendil-works/pi-telemetry", "@panticonic/pi-telemetry"],
 	["chord", "@earendil-works/chord", "@panticonic/pi-chord"],
@@ -80,7 +81,14 @@ const artifacts = [];
 for (const [directory, upstream, name] of packages) {
 	const packageRoot = join(root, "packages", directory);
 	await rm(join(packageRoot, "dist"), { recursive: true, force: true });
-	if (directory === "ai") process.stdout.write(run(process.execPath, ["--experimental-strip-types", "scripts/check-model-data.ts"], packageRoot));
+	if (directory === "ai") {
+		// A Node without built-in TypeScript support (a distribution build) runs the check through jiti.
+		const checkScript = ["scripts/check-model-data.ts"];
+		const [command, ...args] = process.features.typescript
+			? [process.execPath, "--experimental-strip-types", ...checkScript]
+			: [join(root, "node_modules/.bin/jiti"), ...checkScript];
+		process.stdout.write(run(command, args, packageRoot));
+	}
 	process.stdout.write(run(process.execPath, [join(root, "node_modules/typescript/bin/tsc"), "-p", "tsconfig.build.json"], packageRoot));
 	if (directory === "ai") await cp(join(packageRoot, "src/providers/data"), join(packageRoot, "dist/providers/data"), { recursive: true });
 	const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- `CompositeSqliteStorage`: one store over two table sets in one database, so a version-control engine (a Dolt cell) can commit, fork and rewind the conversation and leave the rest alone. Conversations, entries and the conversation documents a fork inherits (`fork` of `"current"` or `"asOf"`) are **versioned** (the default table names); tasks, submissions and every other document are **local** (the `vsl_` prefix, which a Dolt cell declares local). The `documentRoute` option decides a document's set from its create record. The ID and sequence counters live in the local set, so an ID is never reused after a rewind of the versioned set and two forks never share a counter; a fork's empty local set restarts them above what the versioned set stores. One commit writes both sets in one database transaction. `applyCompositeSqliteMigrationsInTransaction()` creates both sets; `openNodeCompositeSqliteStorage()` opens one on Node SQLite.
+- A `commit(writes, seq)` policy on the composite, and a `commit` option on `NativeDatabase.transaction()` and `NativeStorage.transaction()`: a storage transaction can end in the engine's commit (a Dolt cell's `transaction(fn, { commit })`), so the writes and the commit are one durable step.
+- `SqliteStorage.attach()`, `counters()`, `highWater()`, `recordType()`, `hasDocument()` and `applyWrites()`: what the composite needs of one table set.
+
 ### Breaking Changes
 
 - Upstream restart-count parking and `restartLimit` are omitted: an interrupted task recovers from its committed checkpoint rather than being faulted or parked after an arbitrary number of restarts.

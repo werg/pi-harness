@@ -5725,6 +5725,24 @@ Schema shape, WAL checkpoint cadence, and synchronous defaults are backend
 implementation choices validated by conformance, reopen, query-plan, and storage
 benchmarks.
 
+#### 11.2.1 Composite SQLite storage
+
+`CompositeSqliteStorage` keeps two table sets of the SQLite layout in one database, for a host whose database is
+version-controlled (a Dolt cell), so that the host can commit, fork and rewind the conversation and leave the rest
+alone. The **versioned** set (the default names) holds conversations, entries and the documents that are
+conversation knowledge; the **local** set (the `vsl_` prefix) holds tasks, submissions and every other document. A
+document is versioned when its scope is a conversation and its `fork` is `"current"` or `"asOf"`
+(`defaultDocumentRoute`); a host may supply another rule per create record. A task is an operation in flight and is
+never knowledge.
+
+One Session commit is still one database transaction across both sets. The ID and the sequence counters belong to
+the local set and are the composite's alone: neither a rewind of the versioned set nor a fork (which starts the local
+rows empty) lowers or shares them, and a store whose local counters never counted restarts them above the highest ID
+and sequence the versioned set stores. The local set's migrations run again over tables that exist, because a fork
+keeps their definitions and loses their rows. `commit(writes, seq, { entryHigh })` names the version-control commit a
+transaction ends with (or none); `NativeDatabase.transaction(fn, afterCommit, { commit })` hands it to the host's
+transaction option, so the writes and the commit are one durable step.
+
 ### 11.3 JSONL
 
 JSONL depends on the portable `FileSystem` capability, not the broader

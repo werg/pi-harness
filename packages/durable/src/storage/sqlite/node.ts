@@ -1,5 +1,10 @@
 import { validateSqliteSchemaPrefix } from "@earendil-works/chord/sqlite";
 import { type NodeSqliteDatabaseOptions, openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
+import {
+	applyCompositeSqliteMigrationsInTransaction,
+	CompositeSqliteStorage,
+	type CompositeSqliteStorageOptions,
+} from "./composite.ts";
 import { applySqliteMigrationsForSchema } from "./migrations.ts";
 import { createSqliteSchema } from "./schema.ts";
 import { SqliteStorage, type SqliteStorageOptions } from "./storage.ts";
@@ -32,4 +37,29 @@ export async function openNodeSqliteStorage(
 		throw error;
 	}
 	return SqliteStorage.open(database, { prefix });
+}
+
+/**
+ * Open or create file-backed durable storage split into a versioned and a local table set
+ * ({@link CompositeSqliteStorage}). Node's SQLite has no version-control engine, so this opener takes no commit policy.
+ */
+export async function openNodeCompositeSqliteStorage(
+	path: string,
+	options: Omit<CompositeSqliteStorageOptions, "commit"> & NodeSqliteDatabaseOptions = {},
+): Promise<CompositeSqliteStorage> {
+	const { localPrefix, documentRoute, ...databaseOptions } = options;
+	const database = await openNodeSqliteDatabase(path, databaseOptions);
+	try {
+		await database.transaction((transaction) =>
+			applyCompositeSqliteMigrationsInTransaction(transaction, localPrefix),
+		);
+	} catch (error) {
+		try {
+			await database.close();
+		} catch (closeError) {
+			throw new AggregateError([error, closeError], "SQLite initialization and close failed");
+		}
+		throw error;
+	}
+	return CompositeSqliteStorage.open(database, { localPrefix, documentRoute });
 }
